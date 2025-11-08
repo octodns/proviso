@@ -1,12 +1,51 @@
 from operator import attrgetter
+from sys import version_info
 
 import httpx
+from packaging.markers import default_environment
 from packaging.metadata import Metadata
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 from resolvelib import AbstractProvider, BaseReporter, Resolver as ResolveLibResolver
-from unearth import PackageFinder
+from unearth import PackageFinder, TargetPython
+
+
+def parse_python_version(version_str):
+    """Parse a Python version string to a tuple.
+
+    Args:
+        version_str: Version string like "3.9", "3.10.5", "3.11.0"
+
+    Returns:
+        Tuple of integers like (3, 9) or (3, 10, 5)
+    """
+    parts = version_str.split('.')
+    return tuple(int(part) for part in parts)
+
+
+def format_python_version_for_markers(version_tuple):
+    """Format a version tuple for use in marker evaluation.
+
+    Args:
+        version_tuple: Tuple like (3, 9) or (3, 10, 5)
+
+    Returns:
+        Dict with 'python_version' and 'python_full_version' keys
+    """
+    # python_version is major.minor (e.g., "3.9")
+    python_version = f"{version_tuple[0]}.{version_tuple[1]}"
+
+    # python_full_version includes patch if available
+    if len(version_tuple) >= 3:
+        python_full_version = f"{version_tuple[0]}.{version_tuple[1]}.{version_tuple[2]}"
+    else:
+        python_full_version = f"{python_version}.0"
+
+    return {
+        'python_version': python_version,
+        'python_full_version': python_full_version,
+    }
 
 
 class Candidate:
@@ -37,9 +76,21 @@ class Candidate:
 class PyPIProvider(AbstractProvider):
     """Provider that queries PyPI for packages and their dependencies."""
 
-    def __init__(self, finder):
+    def __init__(self, finder, python_version=None):
         self.finder = finder
         self._dependencies_cache = {}
+
+        # Build environment for marker evaluation
+        if python_version:
+            # Start with default environment and override Python version
+            version_tuple = parse_python_version(python_version)
+            version_info_dict = format_python_version_for_markers(version_tuple)
+
+            self.environment = default_environment()
+            self.environment.update(version_info_dict)
+        else:
+            # Use current environment
+            self.environment = None
 
     def identify(self, requirement_or_candidate):
         """Return the package name as the identifier."""
@@ -114,9 +165,18 @@ class PyPIProvider(AbstractProvider):
         # Extract dependencies from metadata
         dependencies = []
         for req in metadata.requires_dist or []:
-            # Evaluate markers for current environment
-            if req.marker is None or req.marker.evaluate():
+            # Evaluate markers for target environment
+            if req.marker is None:
+                # No marker means always included
                 dependencies.append(req)
+            elif self.environment is None:
+                # No custom environment, use default
+                if req.marker.evaluate():
+                    dependencies.append(req)
+            else:
+                # Use custom environment for evaluation
+                if req.marker.evaluate(environment=self.environment):
+                    dependencies.append(req)
 
         self._dependencies_cache[cache_key] = dependencies
         return dependencies
@@ -125,16 +185,26 @@ class PyPIProvider(AbstractProvider):
 class Resolver:
     """Resolves package dependencies using PyPI."""
 
-    def __init__(self, index_urls=None):
+    def __init__(self, index_urls=None, python_version=None):
         """Initialize the resolver.
 
         Args:
             index_urls: List of package index URLs. Defaults to PyPI.
+            python_version: Target Python version string (e.g., "3.9", "3.10.5").
+                          Defaults to current Python version.
         """
         if index_urls is None:
             index_urls = ['https://pypi.org/simple/']
 
-        self.finder = PackageFinder(index_urls=index_urls)
+        self.python_version = python_version
+
+        # Create TargetPython if a specific version is requested
+        target_python = None
+        if python_version:
+            version_tuple = parse_python_version(python_version)
+            target_python = TargetPython(py_ver=version_tuple)
+
+        self.finder = PackageFinder(index_urls=index_urls, target_python=target_python)
 
     def resolve(self, requirements):
         """Resolve dependencies for the given requirements.
@@ -148,7 +218,7 @@ class Resolver:
         Raises:
             resolvelib.ResolutionImpossible: If resolution fails
         """
-        provider = PyPIProvider(self.finder)
+        provider = PyPIProvider(self.finder, python_version=self.python_version)
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)
 
