@@ -31,6 +31,7 @@ setup(
     author='Ross McFarland',
     author_email='rwmcfa1@gmail.com',
     description=description,
+    entry_points={'console_scripts': ('proviso = proviso.main:main',)},
     extras_require={
         'dev': tests_require
         + (
@@ -39,7 +40,6 @@ setup(
             # own PR. This will basically happen yearly
             # https://black.readthedocs.io/en/stable/the_black_code_style/index.html#stability-policy
             'black>=25.0.0,<26.0.0',
-            'build>=0.7.0',
             'changelet',
             'isort>=5.11.5',
             'pyflakes>=2.2.0',
@@ -49,8 +49,10 @@ setup(
         'test': tests_require,
     },
     install_requires=(
-        'octodns>=1.5.0',
-        # TODO: other requirements
+        'build>=0.7.0',
+        'resolvelib>=1.0.0',
+        'setuptools>=40.8.0',
+        'unearth>=0.17.0',
     ),
     license='MIT',
     long_description=long_description,
@@ -58,7 +60,6 @@ setup(
     name='proviso',
     packages=find_packages(),
     python_requires='>=3.9',
-    tests_require=tests_require,
     url='https://github.com/octodns/proviso',
     version=version(),
 )
