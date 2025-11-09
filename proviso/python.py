@@ -45,6 +45,8 @@ class Python:
                 active_releases.append(release)
 
         # Sort by version number (oldest to newest)
-        active_releases.sort(key=lambda r: tuple(map(int, r['cycle'].split('.'))))
+        active_releases.sort(
+            key=lambda r: tuple(map(int, r['cycle'].split('.')))
+        )
 
         return active_releases

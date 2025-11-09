@@ -53,48 +53,30 @@ class TestPythonVersionParsing(TestCase):
 
 
 class TestResolverWithPythonVersion(TestCase):
-    def test_resolver_init_without_python_version(self):
-        """Test Resolver initialization without python_version."""
+    def test_resolver_init(self):
+        """Test Resolver initialization."""
         resolver = Resolver()
-        self.assertIsNone(resolver.python_version)
-        self.assertIsNotNone(resolver.finder)
-
-    def test_resolver_init_with_python_version(self):
-        """Test Resolver initialization with python_version."""
-        resolver = Resolver(python_version='3.9')
-        self.assertEqual(resolver.python_version, '3.9')
-        self.assertIsNotNone(resolver.finder)
-
-    @patch('proviso.resolver.PackageFinder')
-    def test_resolver_creates_target_python(self, mock_finder_class):
-        """Test that Resolver creates TargetPython when python_version is specified."""
-        from unearth import TargetPython
-
-        mock_finder = MagicMock()
-        mock_finder_class.return_value = mock_finder
-
-        resolver = Resolver(python_version='3.9')
-
-        # Verify PackageFinder was called with target_python
-        call_args = mock_finder_class.call_args
-        self.assertIn('target_python', call_args.kwargs)
-
-        target_python = call_args.kwargs['target_python']
-        self.assertIsInstance(target_python, TargetPython)
-        self.assertEqual(target_python.py_ver, (3, 9))
+        self.assertIsNotNone(resolver._session)
+        self.assertIsNotNone(resolver.index_urls)
 
 
 class TestPyPIProviderEnvironment(TestCase):
     def test_provider_without_python_version(self):
         """Test PyPIProvider without custom python_version uses default environment."""
-        finder = MagicMock()
-        provider = PyPIProvider(finder)
+        session = MagicMock()
+        provider = PyPIProvider(
+            session, index_urls=['https://pypi.org/simple/']
+        )
         self.assertIsNone(provider.environment)
 
     def test_provider_with_python_version(self):
         """Test PyPIProvider with custom python_version creates custom environment."""
-        finder = MagicMock()
-        provider = PyPIProvider(finder, python_version='3.9')
+        session = MagicMock()
+        provider = PyPIProvider(
+            session,
+            index_urls=['https://pypi.org/simple/'],
+            python_version='3.9',
+        )
 
         self.assertIsNotNone(provider.environment)
         self.assertEqual(provider.environment['python_version'], '3.9')
@@ -102,10 +84,12 @@ class TestPyPIProviderEnvironment(TestCase):
 
     def test_provider_marker_evaluation_with_custom_environment(self):
         """Test that markers are evaluated with custom environment."""
-        from packaging.metadata import Metadata
-
-        finder = MagicMock()
-        provider = PyPIProvider(finder, python_version='3.9')
+        session = MagicMock()
+        provider = PyPIProvider(
+            session,
+            index_urls=['https://pypi.org/simple/'],
+            python_version='3.9',
+        )
 
         # Create a mock package with metadata that has version-specific dependencies
         mock_package = MagicMock()
@@ -114,7 +98,7 @@ class TestPyPIProviderEnvironment(TestCase):
 
         mock_result = MagicMock()
         mock_result.best = mock_package
-        finder.find_best_match.return_value = mock_result
+        provider.finder.find_best_match = MagicMock(return_value=mock_result)
 
         # Create metadata with a requirement that has a python_version marker
         metadata_text = """Metadata-Version: 2.1
@@ -139,7 +123,14 @@ Requires-Dist: typing-extensions; python_version < "3.10"
             self.assertEqual(dependencies[0].name, 'typing-extensions')
 
         # Now test with Python 3.11 where typing-extensions should be excluded
-        provider_311 = PyPIProvider(finder, python_version='3.11')
+        provider_311 = PyPIProvider(
+            session,
+            index_urls=['https://pypi.org/simple/'],
+            python_version='3.11',
+        )
+        provider_311.finder.find_best_match = MagicMock(
+            return_value=mock_result
+        )
 
         with patch('httpx.get') as mock_get:
             mock_response = MagicMock()
@@ -222,13 +213,21 @@ class TestExtrasFiltering(TestCase):
     def test_marker_evaluation_combined_markers(self):
         """Test requirements with combined extra and python_version markers."""
         # Requirement with both extra and python_version markers
-        req = Requirement('typing-extensions>=4.0; extra == "dev" and python_version < "3.10"')
+        req = Requirement(
+            'typing-extensions>=4.0; extra == "dev" and python_version < "3.10"'
+        )
 
         # Should evaluate to True when both conditions match
-        self.assertTrue(req.marker.evaluate({'extra': 'dev', 'python_version': '3.9'}))
+        self.assertTrue(
+            req.marker.evaluate({'extra': 'dev', 'python_version': '3.9'})
+        )
 
         # Should evaluate to False when extra doesn't match
-        self.assertFalse(req.marker.evaluate({'extra': 'test', 'python_version': '3.9'}))
+        self.assertFalse(
+            req.marker.evaluate({'extra': 'test', 'python_version': '3.9'})
+        )
 
         # Should evaluate to False when python_version doesn't match
-        self.assertFalse(req.marker.evaluate({'extra': 'dev', 'python_version': '3.11'}))
+        self.assertFalse(
+            req.marker.evaluate({'extra': 'dev', 'python_version': '3.11'})
+        )

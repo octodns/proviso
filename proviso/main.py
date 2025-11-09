@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
+from collections import defaultdict
 from os import getcwd
-from pprint import pprint
 
 from proviso.builder import Builder
 from proviso.python import Python
@@ -8,16 +8,13 @@ from proviso.resolver import Resolver
 
 
 def main():
-    parser = ArgumentParser(description='Extract project metadata and resolve dependencies')
+    parser = ArgumentParser(
+        description='Extract project metadata and resolve dependencies'
+    )
     parser.add_argument(
         '--directory',
         default=getcwd(),
         help='Project root directory (default: current directory)',
-    )
-    parser.add_argument(
-        '--python-version',
-        default=None,
-        help='Target Python version for resolution (e.g., "3.9", "3.10.5"). Defaults to current Python version.',
     )
     parser.add_argument(
         '--extras',
@@ -43,7 +40,9 @@ def main():
     extras = set(e.strip() for e in args.extras.split(',') if e.strip())
 
     # Parse python versions from command line
-    python_versions = [v.strip() for v in args.python_versions.split(',') if v.strip()]
+    python_versions = [
+        v.strip() for v in args.python_versions.split(',') if v.strip()
+    ]
 
     # If no python versions specified, use active versions from endoflife.date
     if not python_versions:
@@ -52,7 +51,7 @@ def main():
 
     # Filter requirements based on extras
     requirements = []
-    for req in (metadata.requires_dist or []):
+    for req in metadata.requires_dist or []:
         if req.marker is None:
             # No marker - always include
             requirements.append(req)
@@ -69,16 +68,47 @@ def main():
     if requirements:
         print(f'Runtime requirements: {[str(r) for r in requirements]}')
         print()
-        print('Resolving dependencies...')
 
-        # Resolve dependencies
-        resolver = Resolver(python_version=args.python_version)
-        resolved = resolver.resolve(requirements)
+        # Create one resolver instance (shared cache across all Python versions)
+        resolver = Resolver()
 
-        print()
-        print('Resolved dependencies:')
-        for name, info in sorted(resolved.items()):
-            print(f'  {name}: {info["version"]}')
+        # Collect versions: versions[package][version] = set(python_versions)
+        versions = defaultdict(lambda: defaultdict(set))
+
+        # Resolve for each Python version
+        for python_version in python_versions:
+            print(f'Python {python_version}:')
+            print('  Resolving dependencies...')
+
+            try:
+                resolved = resolver.resolve(
+                    requirements, python_version=python_version
+                )
+
+                print(f'  Resolved {len(resolved)} dependencies')
+
+                # Accumulate into versions dict
+                for name, info in resolved.items():
+                    versions[name][info['version']].add(python_version)
+            except Exception as e:
+                print(f'  Error: {e}')
+
+            print()
+
+        python_versions = set(python_versions)
+
+        # Print the collected versions
+        for pkg, vers in versions.items():
+            for ver, pythons in vers.items():
+                if pythons == python_versions:
+                    # same pkg ver for all pythons
+                    print(f'{pkg}=={ver}')
+                else:
+                    # need python_version markers
+                    markers = ' or '.join(
+                        f"python_version='{p}'" for p in pythons
+                    )
+                    print(f'{pkg}=={ver}; {markers}')
     else:
         print('No runtime requirements to resolve')
 

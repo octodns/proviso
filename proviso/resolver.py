@@ -1,5 +1,4 @@
 from operator import attrgetter
-from sys import version_info
 
 import httpx
 from packaging.markers import default_environment
@@ -7,8 +6,39 @@ from packaging.metadata import Metadata
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
-from resolvelib import AbstractProvider, BaseReporter, Resolver as ResolveLibResolver
+from resolvelib import AbstractProvider, BaseReporter
+from resolvelib import Resolver as ResolveLibResolver
 from unearth import PackageFinder, TargetPython
+from unearth.auth import MultiDomainBasicAuth
+from unearth.fetchers import DEFAULT_SECURE_ORIGINS
+
+
+class CachingClient(httpx.Client):
+    """httpx.Client wrapper that implements the Fetcher protocol for unearth with caching."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cache = {}
+
+    def get(self, url, **kwargs):
+        """Override get() to add simple caching."""
+        # Create cache key from URL and relevant kwargs
+        cache_key = (url, tuple(sorted(kwargs.get('headers', {}).items())))
+
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        response = super().get(url, **kwargs)
+        self._cache[cache_key] = response
+        return response
+
+    def get_stream(self, url, *, headers=None):
+        """Required by Fetcher protocol."""
+        return self.stream('GET', url, headers=headers)
+
+    def iter_secure_origins(self):
+        """Required by Fetcher protocol."""
+        yield from DEFAULT_SECURE_ORIGINS
 
 
 def parse_python_version(version_str):
@@ -38,7 +68,9 @@ def format_python_version_for_markers(version_tuple):
 
     # python_full_version includes patch if available
     if len(version_tuple) >= 3:
-        python_full_version = f"{version_tuple[0]}.{version_tuple[1]}.{version_tuple[2]}"
+        python_full_version = (
+            f"{version_tuple[0]}.{version_tuple[1]}.{version_tuple[2]}"
+        )
     else:
         python_full_version = f"{python_version}.0"
 
@@ -76,14 +108,24 @@ class Candidate:
 class PyPIProvider(AbstractProvider):
     """Provider that queries PyPI for packages and their dependencies."""
 
-    def __init__(self, finder, python_version=None):
-        self.finder = finder
+    def __init__(self, session, index_urls, python_version=None):
+        self.session = session
         self._dependencies_cache = {}
+
+        # Create TargetPython if a specific version is requested
+        target_python = None
+        if python_version:
+            version_tuple = parse_python_version(python_version)
+            target_python = TargetPython(py_ver=version_tuple)
+
+        # Create PackageFinder with the target Python version
+        self.finder = PackageFinder(
+            session=session, index_urls=index_urls, target_python=target_python
+        )
 
         # Build environment for marker evaluation
         if python_version:
             # Start with default environment and override Python version
-            version_tuple = parse_python_version(python_version)
             version_info_dict = format_python_version_for_markers(version_tuple)
 
             self.environment = default_environment()
@@ -98,10 +140,15 @@ class PyPIProvider(AbstractProvider):
             return canonicalize_name(requirement_or_candidate.name)
         return requirement_or_candidate.name
 
-    def get_preference(self, identifier, resolutions, candidates, information, backtrack_causes):
+    def get_preference(
+        self, identifier, resolutions, candidates, information, backtrack_causes
+    ):
         """Return preference for resolving this requirement."""
         # Simpler preference: prefer already resolved packages, then by number of candidates
-        return (identifier not in resolutions, len(list(candidates.get(identifier, []))))
+        return (
+            identifier not in resolutions,
+            len(list(candidates.get(identifier, []))),
+        )
 
     def find_matches(self, identifier, requirements, incompatibilities):
         """Find all candidates that match the given requirements."""
@@ -124,7 +171,9 @@ class PyPIProvider(AbstractProvider):
             # Check if this version satisfies all requirements
             if all(version in r.specifier for r in reqs):
                 # Check if it's not in incompatibilities
-                if version not in [c.version for c in incompatibilities.get(identifier, [])]:
+                if version not in [
+                    c.version for c in incompatibilities.get(identifier, [])
+                ]:
                     candidates.append(Candidate(identifier, version))
 
         # Return candidates sorted by version (newest first)
@@ -144,7 +193,9 @@ class PyPIProvider(AbstractProvider):
             return self._dependencies_cache[cache_key]
 
         # Find the package to get its metadata
-        result = self.finder.find_best_match(f"{candidate.name}=={candidate.version}")
+        result = self.finder.find_best_match(
+            f"{candidate.name}=={candidate.version}"
+        )
 
         if not result.best:
             self._dependencies_cache[cache_key] = []
@@ -154,7 +205,14 @@ class PyPIProvider(AbstractProvider):
 
         # Fetch metadata from dist_info_link if available
         if package.link.dist_info_link:
-            response = httpx.get(package.link.dist_info_link.url)
+            url = package.link.dist_info_link.url
+
+            # Fetch (session caches if it's a CachingClient)
+            if self.session:
+                response = self.session.get(url)
+            else:
+                response = httpx.get(url)
+
             # Disable validation to handle metadata version mismatches
             metadata = Metadata.from_email(response.text, validate=False)
         else:
@@ -185,32 +243,28 @@ class PyPIProvider(AbstractProvider):
 class Resolver:
     """Resolves package dependencies using PyPI."""
 
-    def __init__(self, index_urls=None, python_version=None):
+    def __init__(self, index_urls=None):
         """Initialize the resolver.
 
         Args:
             index_urls: List of package index URLs. Defaults to PyPI.
-            python_version: Target Python version string (e.g., "3.9", "3.10.5").
-                          Defaults to current Python version.
         """
         if index_urls is None:
             index_urls = ['https://pypi.org/simple/']
 
-        self.python_version = python_version
+        self.index_urls = index_urls
 
-        # Create TargetPython if a specific version is requested
-        target_python = None
-        if python_version:
-            version_tuple = parse_python_version(python_version)
-            target_python = TargetPython(py_ver=version_tuple)
+        # Create cached HTTP client shared across all resolutions
+        self._session = CachingClient()
+        self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
 
-        self.finder = PackageFinder(index_urls=index_urls, target_python=target_python)
-
-    def resolve(self, requirements):
+    def resolve(self, requirements, python_version=None):
         """Resolve dependencies for the given requirements.
 
         Args:
             requirements: List of packaging.requirements.Requirement objects
+            python_version: Target Python version string (e.g., "3.9", "3.10.5").
+                          Defaults to current Python version.
 
         Returns:
             Dict mapping package names to metadata dicts with 'version' and 'extras'
@@ -218,7 +272,11 @@ class Resolver:
         Raises:
             resolvelib.ResolutionImpossible: If resolution fails
         """
-        provider = PyPIProvider(self.finder, python_version=self.python_version)
+        provider = PyPIProvider(
+            session=self._session,
+            index_urls=self.index_urls,
+            python_version=python_version,
+        )
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)
 
