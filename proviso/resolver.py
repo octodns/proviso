@@ -22,14 +22,20 @@ class CachingClient(httpx.Client):
 
     def get(self, url, **kwargs):
         """Override get() to add simple caching."""
-        # Create cache key from URL and relevant kwargs
-        cache_key = (url, tuple(sorted(kwargs.get('headers', {}).items())))
 
+        # Create cache key from URL, lots of assumptions here, e.g. headers
+        # don't matter that should hold for our use cases
+        cache_key = url
+
+        # Check memory cache first
         if cache_key in self._cache:
             return self._cache[cache_key]
 
+        # Not in cache, fetch from network
         response = super().get(url, **kwargs)
+
         self._cache[cache_key] = response
+
         return response
 
     def get_stream(self, url, *, headers=None):
@@ -51,7 +57,7 @@ def parse_python_version(version_str):
         Tuple of integers like (3, 9) or (3, 10, 5)
     """
     parts = version_str.split('.')
-    return tuple(int(part) for part in parts)
+    return tuple(part for part in parts)
 
 
 def format_python_version_for_markers(version_tuple):
