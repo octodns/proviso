@@ -10,35 +10,11 @@ from proviso.python import Python
 from proviso.resolver import Resolver
 
 
-def main():
-    parser = ArgumentParser(
-        description='Extract project metadata and resolve dependencies'
-    )
-    parser.add_argument(
-        '--directory',
-        default=getcwd(),
-        help='Project root directory (default: current directory)',
-    )
-    parser.add_argument(
-        '--extras',
-        default=None,
-        help='Comma-separated list of extras to include (e.g., "dev,test"). Defaults to all defined extras extras.',
-    )
-    parser.add_argument(
-        '--python-versions',
-        default=None,
-        help='Comma-separated list of Python versions (e.g., "3.9,3.10,3.11"). Defaults to currently active versions per endoflife.date.',
-    )
-
-    args = parser.parse_args()
-
-    # Expand user path (e.g., ~ -> /home/username)
-    directory = expanduser(args.directory)
-
-    # Build project metadata
+def build_project_metadata(directory):
+    """Build project metadata and handle exceptions."""
     builder = Builder(directory)
     try:
-        metadata = builder.metadata
+        return builder.metadata
     except BuildBackendException as e:
         cpe = e.exception
         print(
@@ -57,22 +33,9 @@ captured stderr:
         )
         exit(1)
 
-    # Parse extras from command line
-    if args.extras is None:
-        extras = metadata.provides_extra
-    else:
-        extras = set(e.strip() for e in args.extras.split(',') if e.strip())
 
-    # Parse python versions from command line
-    if args.python_versions is None:
-        # If no python versions specified, use active versions from endoflife.date
-        python = Python()
-        python_versions = [release['cycle'] for release in python.active]
-    else:
-        python_versions = [
-            v.strip() for v in args.python_versions.split(',') if v.strip()
-        ]
-
+def format_and_print_metadata(metadata, extras, python_versions):
+    """Format and print project metadata."""
     print(
         f'''Project: {metadata.name} {metadata.version}
   extras: {', '.join(extras)} 
@@ -80,6 +43,9 @@ captured stderr:
 '''
     )
 
+
+def get_requirements_with_extras(metadata, extras):
+    """Get requirements including extras."""
     requires_dist = metadata.requires_dist or []
 
     # base runtime direct requirements
@@ -91,13 +57,13 @@ captured stderr:
             if r.marker and r.marker.evaluate({'extra': extra})
         )
 
-    versions = find_requirements(requirements, python_versions=python_versions)
+    return requirements
 
-    # with open(filename) as fh:
-    if True:
-        from sys import stdout
 
-        fh = stdout
+def write_requirements_to_file(versions, python_versions):
+    """Write resolved requirements to file."""
+    filename = '/tmp/requirements.txt'
+    with open(filename, 'w') as fh:  # Changed to 'w' mode for writing
         for pkg, vers in sorted(versions.items()):
             for ver, pythons in vers.items():
                 # same pkg ver for all pythons
@@ -150,6 +116,58 @@ def find_requirements(requirements, python_versions):
     python_versions = set(python_versions)
 
     return versions
+
+
+def main():
+    parser = ArgumentParser(
+        description='Extract project metadata and resolve dependencies'
+    )
+    parser.add_argument(
+        '--directory',
+        default=getcwd(),
+        help='Project root directory (default: current directory)',
+    )
+    parser.add_argument(
+        '--extras',
+        default=None,
+        help='Comma-separated list of extras to include (e.g., "dev,test"). Defaults to all defined extras extras.',
+    )
+    parser.add_argument(
+        '--python-versions',
+        default=None,
+        help='Comma-separated list of Python versions (e.g., "3.9,3.10,3.11"). Defaults to currently active versions per endoflife.date.',
+    )
+
+    args = parser.parse_args()
+
+    # Expand user path (e.g., ~ -> /home/username)
+    directory = expanduser(args.directory)
+
+    # Build project metadata
+    metadata = build_project_metadata(directory)
+
+    # Parse extras from command line
+    if args.extras is None:
+        extras = metadata.provides_extra
+    else:
+        extras = set(e.strip() for e in args.extras.split(',') if e.strip())
+
+    if args.python_versions is None:
+        # If no python versions specified, use active versions from endoflife.date
+        python = Python()
+        python_versions = [release['cycle'] for release in python.active]
+    else:
+        python_versions = [
+            v.strip() for v in args.python_versions.split(',') if v.strip()
+        ]
+
+    format_and_print_metadata(metadata, extras, python_versions)
+
+    requirements = get_requirements_with_extras(metadata, extras)
+
+    versions = find_requirements(requirements, python_versions=python_versions)
+
+    write_requirements_to_file(versions, python_versions)
 
 
 if __name__ == '__main__':

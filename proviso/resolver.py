@@ -10,80 +10,8 @@ from resolvelib import AbstractProvider, BaseReporter
 from resolvelib import Resolver as ResolveLibResolver
 from unearth import PackageFinder, TargetPython
 from unearth.auth import MultiDomainBasicAuth
-from unearth.fetchers import DEFAULT_SECURE_ORIGINS
 
-
-class CachingClient(httpx.Client):
-    """httpx.Client wrapper that implements the Fetcher protocol for unearth with caching."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._cache = {}
-
-    def get(self, url, **kwargs):
-        """Override get() to add simple caching."""
-
-        # Create cache key from URL, lots of assumptions here, e.g. headers
-        # don't matter that should hold for our use cases
-        cache_key = url
-
-        # Check memory cache first
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-
-        # Not in cache, fetch from network
-        response = super().get(url, **kwargs)
-
-        self._cache[cache_key] = response
-
-        return response
-
-    def get_stream(self, url, *, headers=None):
-        """Required by Fetcher protocol."""
-        return self.stream('GET', url, headers=headers)
-
-    def iter_secure_origins(self):
-        """Required by Fetcher protocol."""
-        yield from DEFAULT_SECURE_ORIGINS
-
-
-def parse_python_version(version_str):
-    """Parse a Python version string to a tuple.
-
-    Args:
-        version_str: Version string like "3.9", "3.10.5", "3.11.0"
-
-    Returns:
-        Tuple of integers like (3, 9) or (3, 10, 5)
-    """
-    parts = version_str.split('.')
-    return tuple(part for part in parts)
-
-
-def format_python_version_for_markers(version_tuple):
-    """Format a version tuple for use in marker evaluation.
-
-    Args:
-        version_tuple: Tuple like (3, 9) or (3, 10, 5)
-
-    Returns:
-        Dict with 'python_version' and 'python_full_version' keys
-    """
-    # python_version is major.minor (e.g., "3.9")
-    python_version = f"{version_tuple[0]}.{version_tuple[1]}"
-
-    # python_full_version includes patch if available
-    if len(version_tuple) >= 3:
-        python_full_version = (
-            f"{version_tuple[0]}.{version_tuple[1]}.{version_tuple[2]}"
-        )
-    else:
-        python_full_version = f"{python_version}.0"
-
-    return {
-        'python_version': python_version,
-        'python_full_version': python_full_version,
-    }
+from .utils import CachingClient, format_python_version_for_markers
 
 
 class Candidate:
@@ -121,8 +49,7 @@ class PyPIProvider(AbstractProvider):
         # Create TargetPython if a specific version is requested
         target_python = None
         if python_version:
-            version_tuple = parse_python_version(python_version)
-            target_python = TargetPython(py_ver=version_tuple)
+            target_python = TargetPython(py_ver=Version(python_version).release)
 
         # Create PackageFinder with the target Python version
         self.finder = PackageFinder(
@@ -132,7 +59,7 @@ class PyPIProvider(AbstractProvider):
         # Build environment for marker evaluation
         if python_version:
             # Start with default environment and override Python version
-            version_info_dict = format_python_version_for_markers(version_tuple)
+            version_info_dict = format_python_version_for_markers(python_version)
 
             self.environment = default_environment()
             self.environment.update(version_info_dict)
