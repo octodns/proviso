@@ -12,6 +12,7 @@ from proviso.main import (
     find_requirements,
     format_and_print_metadata,
     get_requirements_with_extras,
+    parse_and_validate_args,
     write_requirements_to_file,
 )
 
@@ -208,6 +209,237 @@ class TestFindRequirements(TestCase):
                 self.assertIn('1.1.0', result['package'])
                 self.assertEqual(['3.9'], result['package']['1.0.0'])
                 self.assertEqual(['3.10'], result['package']['1.1.0'])
+
+
+class TestParseAndValidateArgs(TestCase):
+    def test_default_extras(self):
+        """Test that extras default to all available extras."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = ['dev', 'test', 'docs']
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9,3.10'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.argv', ['proviso']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        self.assertEqual(['dev', 'test', 'docs'], result['extras'])
+
+    def test_custom_extras(self):
+        """Test parsing custom extras from command line."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = ['dev', 'test', 'docs']
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = 'dev,test'
+        mock_args.python_versions = '3.9,3.10'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.argv', ['proviso']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        self.assertEqual({'dev', 'test'}, result['extras'])
+
+    def test_invalid_extras_exits(self):
+        """Test that invalid extras cause exit."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = ['dev', 'test']
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = 'dev,invalid'
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.exit') as mock_exit:
+            with patch('proviso.main.log') as mock_log:
+                parse_and_validate_args(mock_metadata, mock_args)
+
+                mock_log.error.assert_called_once()
+                error_msg = mock_log.error.call_args[0][0]
+                self.assertIn('invalid', error_msg)
+                mock_exit.assert_called_once_with(1)
+
+    def test_default_python_versions(self):
+        """Test that Python versions default to active versions."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = None
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.Python') as mock_python_class:
+            mock_python = MagicMock()
+            mock_python.active = [
+                {'cycle': '3.9'},
+                {'cycle': '3.10'},
+                {'cycle': '3.11'},
+            ]
+            mock_python_class.return_value = mock_python
+
+            with patch('proviso.main.argv', ['proviso']):
+                result = parse_and_validate_args(mock_metadata, mock_args)
+
+            self.assertEqual(['3.9', '3.10', '3.11'], result['python_versions'])
+
+    def test_custom_python_versions(self):
+        """Test parsing custom Python versions."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.8,3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.argv', ['proviso']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        self.assertEqual(['3.8', '3.9'], result['python_versions'])
+
+    def test_directory_expansion(self):
+        """Test that ~ is expanded in directory path."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '~/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.expanduser') as mock_expanduser:
+            mock_expanduser.return_value = '/home/user/project'
+
+            with patch('proviso.main.argv', ['proviso']):
+                result = parse_and_validate_args(mock_metadata, mock_args)
+
+            # Verify expanduser was called for directory
+            mock_expanduser.assert_called_with('~/project')
+            self.assertEqual('/home/user/project', result['directory'])
+
+    def test_filename_without_directory(self):
+        """Test that filename without directory is placed in project directory."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.argv', ['proviso']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        self.assertEqual(
+            '/path/to/project/requirements.txt', result['output_path']
+        )
+
+    def test_filename_with_directory(self):
+        """Test that filename with directory is used as-is."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = '/tmp/requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.argv', ['proviso']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        self.assertEqual('/tmp/requirements.txt', result['output_path'])
+
+    def test_default_header(self):
+        """Test default header generation."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.argv', ['proviso', '--directory', '/foo']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        expected = (
+            '# DO NOT EDIT THIS FILE DIRECTLY - use proviso --directory /foo\n'
+        )
+        self.assertEqual(expected, result['header'])
+
+    def test_custom_header_with_placeholder(self):
+        """Test custom header with [command line] placeholder."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = '# Custom header [command line]'
+
+        with patch('proviso.main.argv', ['proviso', '--header', 'test']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        expected = '# Custom header proviso --header test\n'
+        self.assertEqual(expected, result['header'])
+
+    def test_custom_header_no_trailing_newline(self):
+        """Test that custom header gets newline added."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = '# Custom header'
+
+        with patch('proviso.main.argv', ['proviso']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        self.assertTrue(result['header'].endswith('\n'))
+
+    def test_empty_custom_header(self):
+        """Test that empty custom header is handled."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = ''
+
+        with patch('proviso.main.argv', ['proviso']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        # Empty header should remain empty
+        self.assertEqual('', result['header'])
 
 
 class TestWriteRequirementsToFile(TestCase):
