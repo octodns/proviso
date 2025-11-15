@@ -1,3 +1,4 @@
+from logging import getLogger
 from operator import attrgetter
 
 import httpx
@@ -12,6 +13,8 @@ from unearth import PackageFinder, TargetPython
 from unearth.auth import MultiDomainBasicAuth
 
 from .utils import CachingClient, format_python_version_for_markers
+
+log = getLogger('proviso.resolver')
 
 
 class Candidate:
@@ -59,7 +62,9 @@ class PyPIProvider(AbstractProvider):
         # Build environment for marker evaluation
         if python_version:
             # Start with default environment and override Python version
-            version_info_dict = format_python_version_for_markers(python_version)
+            version_info_dict = format_python_version_for_markers(
+                python_version
+            )
 
             self.environment = default_environment()
             self.environment.update(version_info_dict)
@@ -93,6 +98,8 @@ class PyPIProvider(AbstractProvider):
         # Use the first requirement to search (they should all have the same name)
         req = reqs[0]
 
+        log.debug(f'Finding matches for {identifier}: {req}')
+
         # Find best match using unearth
         result = self.finder.find_matches(str(req))
 
@@ -110,6 +117,7 @@ class PyPIProvider(AbstractProvider):
                     candidates.append(Candidate(identifier, version))
 
         # Return candidates sorted by version (newest first)
+        log.debug(f'Found {len(candidates)} candidates for {identifier}')
         return sorted(candidates, key=attrgetter('version'), reverse=True)
 
     def is_satisfied_by(self, requirement, candidate):
@@ -123,7 +131,14 @@ class PyPIProvider(AbstractProvider):
         cache_key = (candidate.name, candidate.version)
 
         if cache_key in self._dependencies_cache:
+            log.debug(
+                f'Dependencies cache hit for {candidate.name}=={candidate.version}'
+            )
             return self._dependencies_cache[cache_key]
+
+        log.debug(
+            f'Getting dependencies for {candidate.name}=={candidate.version}'
+        )
 
         # Find the package to get its metadata
         result = self.finder.find_best_match(
@@ -169,6 +184,9 @@ class PyPIProvider(AbstractProvider):
                 if req.marker.evaluate(environment=self.environment):
                     dependencies.append(req)
 
+        log.debug(
+            f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version}'
+        )
         self._dependencies_cache[cache_key] = dependencies
         return dependencies
 

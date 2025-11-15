@@ -2,9 +2,13 @@
 #
 #
 
+from logging import getLogger
+
 import httpx
 from packaging.version import Version
 from unearth.fetchers import DEFAULT_SECURE_ORIGINS
+
+log = getLogger('proviso.utils')
 
 
 class CachingClient(httpx.Client):
@@ -23,9 +27,11 @@ class CachingClient(httpx.Client):
 
         # Check memory cache first
         if cache_key in self._cache:
+            log.debug(f'Cache hit: {url}')
             return self._cache[cache_key]
 
         # Not in cache, fetch from network
+        log.debug(f'Cache miss, fetching: {url}')
         response = super().get(url, **kwargs)
 
         self._cache[cache_key] = response
