@@ -146,6 +146,9 @@ class PyPIProvider(AbstractProvider):
         )
 
         if not result.best:
+            log.warning(
+                f'No matching package found for {candidate.name}=={candidate.version}'
+            )
             self._dependencies_cache[cache_key] = []
             return []
 

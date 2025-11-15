@@ -94,8 +94,6 @@ def find_requirements(requirements, python_versions):
 
     log.info('')
 
-    python_versions = set(python_versions)
-
     return versions
 
 
@@ -131,7 +129,7 @@ def main():
     parser.add_argument(
         '--extras',
         default=None,
-        help='Comma-separated list of extras to include (e.g., "dev,test"). Defaults to all defined extras extras.',
+        help='Comma-separated list of extras to include (e.g., "dev,test"). Defaults to all defined extras.',
     )
     parser.add_argument(
         '--python-versions',
@@ -174,6 +172,15 @@ def main():
         extras = metadata.provides_extra
     else:
         extras = set(e.strip() for e in args.extras.split(',') if e.strip())
+        # Validate that requested extras exist
+        available_extras = set(metadata.provides_extra)
+        invalid_extras = extras - available_extras
+        if invalid_extras:
+            log.error(
+                f"Invalid extras requested: {', '.join(sorted(invalid_extras))}. "
+                f"Available extras: {', '.join(sorted(available_extras)) if available_extras else 'none'}"
+            )
+            exit(1)
 
     if args.python_versions is None:
         # If no python versions specified, use active versions from endoflife.date
