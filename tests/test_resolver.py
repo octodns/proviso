@@ -249,6 +249,421 @@ class TestPyPIProvider(TestCase):
             )
             self.assertEqual((True, 1), pref_c)
 
+    def test_find_matches_no_requirements(self):
+        """Test find_matches with no requirements."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder'):
+            provider = PyPIProvider(session, index_urls)
+
+            # Empty requirements dict
+            requirements = {}
+            incompatibilities = {}
+
+            result = provider.find_matches(
+                'requests', requirements, incompatibilities
+            )
+
+            self.assertEqual([], result)
+
+    def test_find_matches_with_candidates(self):
+        """Test find_matches returns matching candidates."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            # Mock package results
+            mock_package1 = MagicMock()
+            mock_package1.version = '2.28.0'
+            mock_package2 = MagicMock()
+            mock_package2.version = '2.27.0'
+            mock_package3 = MagicMock()
+            mock_package3.version = '2.26.0'
+
+            mock_finder.find_matches.return_value = [
+                mock_package1,
+                mock_package2,
+                mock_package3,
+            ]
+
+            requirements = {'requests': [Requirement('requests>=2.27.0')]}
+            incompatibilities = {}
+
+            result = provider.find_matches(
+                'requests', requirements, incompatibilities
+            )
+
+            # Should return candidates sorted newest first
+            self.assertEqual(2, len(result))
+            self.assertEqual('2.28.0', str(result[0].version))
+            self.assertEqual('2.27.0', str(result[1].version))
+
+    def test_find_matches_with_incompatibilities(self):
+        """Test find_matches filters incompatible versions."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            mock_package1 = MagicMock()
+            mock_package1.version = '2.28.0'
+            mock_package2 = MagicMock()
+            mock_package2.version = '2.27.0'
+
+            mock_finder.find_matches.return_value = [
+                mock_package1,
+                mock_package2,
+            ]
+
+            requirements = {'requests': [Requirement('requests>=2.27.0')]}
+            # Mark 2.28.0 as incompatible
+            incompatibilities = {
+                'requests': [Candidate('requests', Version('2.28.0'))]
+            }
+
+            result = provider.find_matches(
+                'requests', requirements, incompatibilities
+            )
+
+            # Should only return 2.27.0
+            self.assertEqual(1, len(result))
+            self.assertEqual('2.27.0', str(result[0].version))
+
+    def test_get_dependencies_cache_hit(self):
+        """Test get_dependencies returns cached dependencies."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder'):
+            provider = PyPIProvider(session, index_urls)
+
+            candidate = Candidate('requests', Version('2.28.0'))
+            cached_deps = [Requirement('urllib3>=1.26.0')]
+
+            # Pre-populate cache
+            provider._dependencies_cache[('requests', Version('2.28.0'))] = (
+                cached_deps
+            )
+
+            result = provider.get_dependencies(candidate)
+
+            self.assertEqual(cached_deps, result)
+
+    def test_get_dependencies_no_package_found(self):
+        """Test get_dependencies when no package is found."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            # Mock no best match found
+            mock_result = MagicMock()
+            mock_result.best = None
+            mock_finder.find_best_match.return_value = mock_result
+
+            candidate = Candidate('nonexistent', Version('1.0.0'))
+
+            result = provider.get_dependencies(candidate)
+
+            self.assertEqual([], result)
+            # Should be cached
+            self.assertIn(
+                ('nonexistent', Version('1.0.0')), provider._dependencies_cache
+            )
+
+    def test_get_dependencies_with_metadata(self):
+        """Test get_dependencies extracts dependencies from metadata."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            # Mock package with metadata
+            mock_package = MagicMock()
+            mock_link = MagicMock()
+            mock_dist_info_link = MagicMock()
+            mock_dist_info_link.url = 'https://pypi.org/metadata'
+            mock_link.dist_info_link = mock_dist_info_link
+            mock_package.link = mock_link
+
+            mock_result = MagicMock()
+            mock_result.best = mock_package
+            mock_finder.find_best_match.return_value = mock_result
+
+            # Mock session response
+            mock_response = MagicMock()
+            mock_response.text = '''Metadata-Version: 2.1
+Name: test-package
+Version: 1.0.0
+Requires-Dist: urllib3>=1.26.0
+Requires-Dist: requests>=2.0.0
+'''
+            session.get.return_value = mock_response
+
+            candidate = Candidate('test-package', Version('1.0.0'))
+
+            result = provider.get_dependencies(candidate)
+
+            # Should return dependencies
+            self.assertEqual(2, len(result))
+            self.assertTrue(any('urllib3' in str(r) for r in result))
+            self.assertTrue(any('requests' in str(r) for r in result))
+
+    def test_get_dependencies_with_markers(self):
+        """Test get_dependencies evaluates markers correctly."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            mock_package = MagicMock()
+            mock_link = MagicMock()
+            mock_dist_info_link = MagicMock()
+            mock_dist_info_link.url = 'https://pypi.org/metadata'
+            mock_link.dist_info_link = mock_dist_info_link
+            mock_package.link = mock_link
+
+            mock_result = MagicMock()
+            mock_result.best = mock_package
+            mock_finder.find_best_match.return_value = mock_result
+
+            mock_response = MagicMock()
+            mock_response.text = '''Metadata-Version: 2.1
+Name: test-package
+Version: 1.0.0
+Requires-Dist: urllib3>=1.26.0
+Requires-Dist: pytest>=7.0.0; extra == "test"
+'''
+            session.get.return_value = mock_response
+
+            candidate = Candidate('test-package', Version('1.0.0'))
+
+            result = provider.get_dependencies(candidate)
+
+            # Should only include urllib3 (no test extra)
+            self.assertEqual(1, len(result))
+            self.assertIn('urllib3', str(result[0]))
+
+    def test_get_dependencies_no_dist_info_link(self):
+        """Test get_dependencies when no dist_info_link is available."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            mock_package = MagicMock()
+            mock_link = MagicMock()
+            mock_link.dist_info_link = None
+            mock_package.link = mock_link
+
+            mock_result = MagicMock()
+            mock_result.best = mock_package
+            mock_finder.find_best_match.return_value = mock_result
+
+            candidate = Candidate('test-package', Version('1.0.0'))
+
+            result = provider.get_dependencies(candidate)
+
+            self.assertEqual([], result)
+
+    def test_get_dependencies_no_session(self):
+        """Test get_dependencies when session is None (uses httpx.get)."""
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            # Pass None for session
+            provider = PyPIProvider(None, index_urls)
+
+            mock_package = MagicMock()
+            mock_link = MagicMock()
+            mock_dist_info_link = MagicMock()
+            mock_dist_info_link.url = 'https://pypi.org/metadata'
+            mock_link.dist_info_link = mock_dist_info_link
+            mock_package.link = mock_link
+
+            mock_result = MagicMock()
+            mock_result.best = mock_package
+            mock_finder.find_best_match.return_value = mock_result
+
+            with patch('proviso.resolver.httpx') as mock_httpx:
+                mock_response = MagicMock()
+                mock_response.text = '''Metadata-Version: 2.1
+Name: test-package
+Version: 1.0.0
+Requires-Dist: urllib3>=1.26.0
+'''
+                mock_httpx.get.return_value = mock_response
+
+                candidate = Candidate('test-package', Version('1.0.0'))
+
+                result = provider.get_dependencies(candidate)
+
+                # Should have called httpx.get
+                mock_httpx.get.assert_called_once_with(
+                    'https://pypi.org/metadata'
+                )
+                self.assertEqual(1, len(result))
+
+    def test_get_dependencies_with_marker_default_environment(self):
+        """Test get_dependencies with marker evaluation in default environment."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            # No python_version means environment is None
+            provider = PyPIProvider(session, index_urls, python_version=None)
+
+            mock_package = MagicMock()
+            mock_link = MagicMock()
+            mock_dist_info_link = MagicMock()
+            mock_dist_info_link.url = 'https://pypi.org/metadata'
+            mock_link.dist_info_link = mock_dist_info_link
+            mock_package.link = mock_link
+
+            mock_result = MagicMock()
+            mock_result.best = mock_package
+            mock_finder.find_best_match.return_value = mock_result
+
+            mock_response = MagicMock()
+            # Use a marker that evaluates to True in default environment
+            mock_response.text = '''Metadata-Version: 2.1
+Name: test-package
+Version: 1.0.0
+Requires-Dist: urllib3>=1.26.0; python_version >= "3.8"
+'''
+            session.get.return_value = mock_response
+
+            candidate = Candidate('test-package', Version('1.0.0'))
+
+            result = provider.get_dependencies(candidate)
+
+            # Should include urllib3 (marker evaluates to True)
+            self.assertEqual(1, len(result))
+            self.assertIn('urllib3', str(result[0]))
+
+    def test_get_dependencies_with_marker_custom_environment(self):
+        """Test get_dependencies with marker evaluation in custom environment."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            with patch('proviso.resolver.TargetPython'):
+                with patch('proviso.resolver.default_environment') as mock_env:
+                    mock_env.return_value = {}
+
+                    mock_finder = MagicMock()
+                    mock_finder_class.return_value = mock_finder
+
+                    # With python_version, environment will be set
+                    provider = PyPIProvider(
+                        session, index_urls, python_version='3.9'
+                    )
+
+                    mock_package = MagicMock()
+                    mock_link = MagicMock()
+                    mock_dist_info_link = MagicMock()
+                    mock_dist_info_link.url = 'https://pypi.org/metadata'
+                    mock_link.dist_info_link = mock_dist_info_link
+                    mock_package.link = mock_link
+
+                    mock_result = MagicMock()
+                    mock_result.best = mock_package
+                    mock_finder.find_best_match.return_value = mock_result
+
+                    mock_response = MagicMock()
+                    # Use a marker that will be evaluated against custom environment
+                    mock_response.text = '''Metadata-Version: 2.1
+Name: test-package
+Version: 1.0.0
+Requires-Dist: urllib3>=1.26.0; python_version >= "3.9"
+'''
+                    session.get.return_value = mock_response
+
+                    candidate = Candidate('test-package', Version('1.0.0'))
+
+                    result = provider.get_dependencies(candidate)
+
+                    # Should include urllib3 (marker evaluates to True for 3.9)
+                    self.assertEqual(1, len(result))
+                    self.assertIn('urllib3', str(result[0]))
+
+    def test_get_dependencies_with_marker_false_custom_environment(self):
+        """Test get_dependencies excludes dependencies when marker evaluates to False."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            with patch('proviso.resolver.TargetPython'):
+                with patch('proviso.resolver.default_environment') as mock_env:
+                    mock_env.return_value = {}
+
+                    mock_finder = MagicMock()
+                    mock_finder_class.return_value = mock_finder
+
+                    # With python_version, environment will be set
+                    provider = PyPIProvider(
+                        session, index_urls, python_version='3.9'
+                    )
+
+                    mock_package = MagicMock()
+                    mock_link = MagicMock()
+                    mock_dist_info_link = MagicMock()
+                    mock_dist_info_link.url = 'https://pypi.org/metadata'
+                    mock_link.dist_info_link = mock_dist_info_link
+                    mock_package.link = mock_link
+
+                    mock_result = MagicMock()
+                    mock_result.best = mock_package
+                    mock_finder.find_best_match.return_value = mock_result
+
+                    mock_response = MagicMock()
+                    # Use a marker that will evaluate to False for 3.9
+                    mock_response.text = '''Metadata-Version: 2.1
+Name: test-package
+Version: 1.0.0
+Requires-Dist: urllib3>=1.26.0; python_version >= "3.10"
+'''
+                    session.get.return_value = mock_response
+
+                    candidate = Candidate('test-package', Version('1.0.0'))
+
+                    result = provider.get_dependencies(candidate)
+
+                    # Should NOT include urllib3 (marker evaluates to False for 3.9)
+                    self.assertEqual(0, len(result))
+
 
 class TestResolver(TestCase):
     def test_init_default_index_urls(self):
