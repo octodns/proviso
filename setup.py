@@ -20,12 +20,7 @@ def version():
 
 description, long_description = descriptions()
 
-tests_require = (
-    'pytest',
-    'pytest-cov',
-    'pytest-network',
-    # TODO: other test-time requirements
-)
+tests_require = ('pytest', 'pytest-cov', 'pytest-network')
 
 setup(
     author='Ross McFarland',
