@@ -7,5 +7,10 @@ source "${SCRIPT_PATH}/common.sh"
 
 SOURCES="$(find *.py proviso tests -name "*.py" || true) $(grep --files-with-matches '^#!.*python' script/* || true)"
 
+head -n 20 \
+    proviso/builder.py \
+    proviso/main.py \
+    tests/test_main.py
+
 isort "$@" $SOURCES
 black "$@" $SOURCES
