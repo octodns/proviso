@@ -1,6 +1,6 @@
 from argparse import ArgumentParser
 from collections import defaultdict
-from logging import DEBUG, INFO, WARNING, basicConfig, getLogger
+from logging import DEBUG, ERROR, INFO, WARNING, basicConfig, getLogger
 from os import getcwd
 from os.path import dirname, expanduser, join
 from sys import argv, exit
@@ -39,10 +39,9 @@ captured stderr:
 def format_and_print_metadata(metadata, extras, python_versions):
     """Format and print project metadata."""
     log.info(
-        f'''Project: {metadata.name} {metadata.version}
-  extras: {', '.join(extras)}
-  python_versions: {', '.join(python_versions)}
-'''
+        f'Project: {metadata.name} {metadata.version}, '
+        f'extras: {", ".join(extras)}, '
+        f'python_versions: {", ".join(python_versions)}'
     )
 
 
@@ -67,11 +66,7 @@ def find_requirements(requirements, python_versions):
     if not requirements:
         return {}
 
-    log.info(
-        f'''Requirements:
-  {'\n  '.join([str(r) for r in requirements])}
-'''
-    )
+    log.info(f'Requirements: {", ".join([str(r) for r in requirements])}')
 
     # Create one resolver instance (shared cache across all Python versions)
     resolver = Resolver()
@@ -81,18 +76,17 @@ def find_requirements(requirements, python_versions):
 
     # Resolve for each Python version
     for python_version in python_versions:
-        log.info(f'  Python {python_version}:')
-        log.info('    Resolving dependencies...')
+        log.info(f'Resolving dependencies for Python {python_version}')
 
         resolved = resolver.resolve(requirements, python_version=python_version)
 
-        log.info(f'    Resolved {len(resolved)} dependencies')
+        log.info(
+            f'Resolved {len(resolved)} dependencies for Python {python_version}'
+        )
 
         # Accumulate into versions dict
         for name, info in resolved.items():
             versions[name][info['version']].append(python_version)
-
-    log.info('')
 
     return versions
 
@@ -213,11 +207,21 @@ def main():  # pragma: no cover
         default='requirements.txt',
         help='Output filename or path for requirements (default: requirements.txt). If just a filename, will be placed in --directory; if a path, will be used as-is.',
     )
+    level_map = {
+        'DEBUG': DEBUG,
+        'INFO': INFO,
+        'WARNING': WARNING,
+        'ERROR': ERROR,
+        'debug': DEBUG,
+        'info': INFO,
+        'warning': WARNING,
+        'error': ERROR,
+    }
     parser.add_argument(
         '--level',
-        default='INFO',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        help='Logging level (default: INFO)',
+        default='WARNING',
+        choices=sorted(level_map.keys()),
+        help='Logging level (default: WARNING)',
     )
     parser.add_argument(
         '--header',
@@ -228,10 +232,10 @@ def main():  # pragma: no cover
     args = parser.parse_args()
 
     # Configure logging
-    level_map = {'DEBUG': DEBUG, 'INFO': INFO, 'WARNING': WARNING}
     basicConfig(
-        level=level_map.get(args.level, INFO),
-        format='%(levelname)-7s: %(message)s',
+        level=level_map.get(args.level, WARNING),
+        format='%(asctime)s [%(levelname)-8s] %(message)s',
+        datefmt='%Y-%m-%dT%H:%M:%S',
     )
 
     # Suppress verbose httpx logging unless we're in DEBUG mode
