@@ -4,9 +4,8 @@ from os.path import join
 from subprocess import run
 from tempfile import TemporaryDirectory
 
-from packaging.metadata import Metadata
-
 from build import ProjectBuilder
+from packaging.metadata import Metadata
 
 
 def _runner(cmd, cwd=None, extra_environ=None):

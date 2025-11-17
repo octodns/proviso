@@ -6,9 +6,11 @@ skip-magic-trailing-comma=true
 [tool.isort]
 profile = "black"
 known_first_party="proviso"
-known_octodns="octodns"
+# we'll often have a buTHIRDPARTYild directory which will trip isort up and make it think
+# build is first-party, it's third
+known_third_party=["build"]
 line_length=80
-sections="FUTURE,STDLIB,THIRDPARTY,OCTODNS,FIRSTPARTY,LOCALFOLDER"
+sections="FUTURE,STDLIB,THIRDPARTY,FIRSTPARTY,LOCALFOLDER"
 
 [tool.pytest.ini_options]
 filterwarnings = [
