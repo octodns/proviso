@@ -197,11 +197,13 @@ class PyPIProvider(AbstractProvider):
 class Resolver:
     """Resolves package dependencies using PyPI."""
 
-    def __init__(self, index_urls=None):
+    def __init__(self, index_urls=None, cache_db_path=None):
         """Initialize the resolver.
 
         Args:
             index_urls: List of package index URLs. Defaults to PyPI.
+            cache_db_path: Optional path to SQLite database for persistent caching.
+                          If None, uses in-memory caching (default).
         """
         if index_urls is None:
             index_urls = ['https://pypi.org/simple/']
@@ -209,7 +211,7 @@ class Resolver:
         self.index_urls = index_urls
 
         # Create cached HTTP client shared across all resolutions
-        self._session = CachingClient()
+        self._session = CachingClient(cache_db_path=cache_db_path)
         self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
 
     def resolve(self, requirements, python_version=None):

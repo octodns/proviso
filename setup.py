@@ -45,6 +45,7 @@ setup(
     },
     install_requires=(
         'build>=0.7.0',
+        'hishel[httpx]>=0.1.0',
         'resolvelib>=1.0.0',
         'setuptools>=40.8.0',
         'unearth>=0.17.0',

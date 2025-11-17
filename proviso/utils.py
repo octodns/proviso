@@ -2,41 +2,37 @@
 #
 #
 
-from logging import getLogger
-
 import httpx
+from hishel import SyncSqliteStorage
+from hishel.httpx import SyncCacheTransport
 from packaging.version import Version
 from unearth.fetchers import DEFAULT_SECURE_ORIGINS
-
-log = getLogger('proviso.utils')
 
 
 class CachingClient(httpx.Client):
     """httpx.Client wrapper that implements the Fetcher protocol for unearth with caching."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._cache = {}
+    def __init__(self, *args, cache_db_path=None, **kwargs):
+        """Initialize CachingClient with optional persistent caching.
 
-    def get(self, url, **kwargs):
-        """Override get() to add simple caching."""
+        Args:
+            cache_db_path: Optional path to SQLite database for persistent caching.
+                          If None, uses in-memory caching (default).
+            *args: Passed to httpx.Client
+            **kwargs: Passed to httpx.Client
+        """
+        # Create storage based on whether persistent caching is requested
+        if cache_db_path:
+            storage = SyncSqliteStorage(database_path=cache_db_path)
+        else:
+            storage = None  # hishel will use in-memory storage
 
-        # Create cache key from URL, lots of assumptions here, e.g. headers
-        # don't matter that should hold for our use cases
-        cache_key = url
-
-        # Check memory cache first
-        if cache_key in self._cache:
-            log.debug(f'Cache hit: {url}')
-            return self._cache[cache_key]
-
-        # Not in cache, fetch from network
-        log.debug(f'Cache miss, fetching: {url}')
-        response = super().get(url, **kwargs)
-
-        self._cache[cache_key] = response
-
-        return response
+        # Create cache transport wrapping the default HTTP transport
+        transport = SyncCacheTransport(
+            next_transport=httpx.HTTPTransport(), storage=storage
+        )
+        # Initialize parent with cache transport
+        super().__init__(*args, transport=transport, **kwargs)
 
     def get_stream(self, url, *, headers=None):
         """Required by Fetcher protocol."""

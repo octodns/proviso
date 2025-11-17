@@ -223,9 +223,11 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9,3.10'
         mock_args.filename = 'requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         self.assertEqual(['dev', 'test', 'docs'], result['extras'])
 
@@ -240,9 +242,11 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9,3.10'
         mock_args.filename = 'requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         self.assertEqual([], result['extras'])
 
@@ -257,9 +261,11 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9,3.10'
         mock_args.filename = 'requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         self.assertEqual({'dev', 'test'}, result['extras'])
 
@@ -274,6 +280,7 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9'
         mock_args.filename = 'requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.exit') as mock_exit:
             with patch('proviso.main.log') as mock_log:
@@ -295,6 +302,7 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = None
         mock_args.filename = 'requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.Python') as mock_python_class:
             mock_python = MagicMock()
@@ -321,9 +329,11 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.8,3.9'
         mock_args.filename = 'requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         self.assertEqual(['3.8', '3.9'], result['python_versions'])
 
@@ -338,6 +348,7 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9'
         mock_args.filename = 'requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.expanduser') as mock_expanduser:
             mock_expanduser.return_value = '/home/user/project'
@@ -360,9 +371,11 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9'
         mock_args.filename = 'requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         self.assertEqual(
             '/path/to/project/requirements.txt', result['output_path']
@@ -379,9 +392,11 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9'
         mock_args.filename = '/tmp/requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         self.assertEqual('/tmp/requirements.txt', result['output_path'])
 
@@ -396,9 +411,11 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9'
         mock_args.filename = 'requirements.txt'
         mock_args.header = None
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso', '--directory', '/foo']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         expected = (
             '# DO NOT EDIT THIS FILE DIRECTLY - use proviso --directory /foo\n'
@@ -416,9 +433,11 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9'
         mock_args.filename = 'requirements.txt'
         mock_args.header = '# Custom header [command line]'
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso', '--header', 'test']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         expected = '# Custom header proviso --header test\n'
         self.assertEqual(expected, result['header'])
@@ -434,9 +453,11 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9'
         mock_args.filename = 'requirements.txt'
         mock_args.header = '# Custom header'
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         self.assertTrue(result['header'].endswith('\n'))
 
@@ -451,12 +472,77 @@ class TestParseAndValidateArgs(TestCase):
         mock_args.python_versions = '3.9'
         mock_args.filename = 'requirements.txt'
         mock_args.header = ''
+        mock_args.cache_db = None
 
         with patch('proviso.main.argv', ['proviso']):
-            result = parse_and_validate_args(mock_metadata, mock_args)
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
 
         # Empty header should remain empty
         self.assertEqual('', result['header'])
+
+    def test_cache_db_from_env(self):
+        """Test that cache_db_path comes from environment when not in args."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+        mock_args.cache_db = None
+
+        with patch('proviso.main.argv', ['proviso']):
+            with patch('proviso.main.getenv', return_value='/tmp/cache.db'):
+                with patch('proviso.main.expanduser', side_effect=lambda x: x):
+                    result = parse_and_validate_args(mock_metadata, mock_args)
+
+        self.assertEqual('/tmp/cache.db', result['cache_db_path'])
+
+    def test_cache_db_from_args(self):
+        """Test that cache_db_path from args takes precedence over env."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+        mock_args.cache_db = '~/custom/cache.db'
+
+        with patch('proviso.main.argv', ['proviso']):
+            with patch('proviso.main.getenv', return_value='/tmp/cache.db'):
+                with patch(
+                    'proviso.main.expanduser',
+                    side_effect=lambda x: x.replace('~', '/home/user'),
+                ):
+                    result = parse_and_validate_args(mock_metadata, mock_args)
+
+        # Should use args value and expand ~
+        self.assertEqual('/home/user/custom/cache.db', result['cache_db_path'])
+
+    def test_cache_db_none_when_not_set(self):
+        """Test that cache_db_path is None when not set anywhere."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+        mock_args.cache_db = None
+
+        with patch('proviso.main.argv', ['proviso']):
+            with patch('proviso.main.getenv', return_value=None):
+                result = parse_and_validate_args(mock_metadata, mock_args)
+
+        self.assertIsNone(result['cache_db_path'])
 
 
 class TestWriteRequirementsToFile(TestCase):

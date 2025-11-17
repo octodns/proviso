@@ -18,6 +18,8 @@ if [ "$PRAGMA_COUNT" -gt "$PRAGMA_ALLOWED" ]; then
   exit 1
 fi
 
+export PROVISO_CACHE_DB=
+
 pytest \
   --disable-network \
   --cov-reset \
