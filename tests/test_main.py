@@ -229,6 +229,23 @@ class TestParseAndValidateArgs(TestCase):
 
         self.assertEqual(['dev', 'test', 'docs'], result['extras'])
 
+    def test_default_extras_when_none(self):
+        """Test that extras default to empty list when provides_extra is None."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = None
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = '3.9,3.10'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.argv', ['proviso']):
+            result = parse_and_validate_args(mock_metadata, mock_args)
+
+        self.assertEqual([], result['extras'])
+
     def test_custom_extras(self):
         """Test parsing custom extras from command line."""
         mock_metadata = MagicMock()
