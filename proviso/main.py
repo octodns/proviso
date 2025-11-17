@@ -133,7 +133,7 @@ def parse_and_validate_args(metadata, args):
 
     # Parse extras from command line
     if args.extras is None:
-        extras = metadata.provides_extra
+        extras = metadata.provides_extra or []
     else:
         extras = set(e.strip() for e in args.extras.split(',') if e.strip())
         # Validate that requested extras exist
