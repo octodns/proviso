@@ -1,7 +1,6 @@
 from logging import getLogger
 from operator import attrgetter
 
-import httpx
 from packaging.markers import default_environment
 from packaging.metadata import Metadata
 from packaging.requirements import Requirement
@@ -158,11 +157,8 @@ class PyPIProvider(AbstractProvider):
         if package.link.dist_info_link:
             url = package.link.dist_info_link.url
 
-            # Fetch (session caches if it's a CachingClient)
-            if self.session:
-                response = self.session.get(url)
-            else:
-                response = httpx.get(url)
+            # Fetch using cached session
+            response = self.session.get(url)
 
             # Disable validation to handle metadata version mismatches
             metadata = Metadata.from_email(response.text, validate=False)
@@ -197,19 +193,22 @@ class PyPIProvider(AbstractProvider):
 class Resolver:
     """Resolves package dependencies using PyPI."""
 
-    def __init__(self, index_urls=None):
+    def __init__(self, index_urls=None, session=None):
         """Initialize the resolver.
 
         Args:
             index_urls: List of package index URLs. Defaults to PyPI.
+            session: Optional httpx.Client for making requests. If None, creates a new CachingClient.
         """
         if index_urls is None:
             index_urls = ['https://pypi.org/simple/']
 
         self.index_urls = index_urls
 
-        # Create cached HTTP client shared across all resolutions
-        self._session = CachingClient()
+        # Use provided session or create a new CachingClient
+        if session is None:
+            session = CachingClient()
+        self._session = session
         self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
 
     def resolve(self, requirements, python_version=None):
