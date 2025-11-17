@@ -9,6 +9,16 @@ class Python:
 
     API_URL = 'https://endoflife.date/api/python.json'
 
+    def __init__(self, session=None):
+        """Initialize Python release fetcher.
+
+        Args:
+            session: Optional httpx.Client for making requests. If None, creates a new client.
+        """
+        if session is None:
+            session = httpx.Client()
+        self.session = session
+
     @cached_property
     def releases(self):
         """Fetch all Python release data from endoflife.date API.
@@ -21,7 +31,7 @@ class Python:
             - latest: latest patch version
             - and other metadata
         """
-        response = httpx.get(self.API_URL)
+        response = self.session.get(self.API_URL)
         response.raise_for_status()
         return response.json()
 

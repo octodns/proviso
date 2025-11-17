@@ -50,18 +50,30 @@ class TestPython(TestCase):
             },
         ]
 
+    def test_init_with_session(self):
+        """Test initialization with a session parameter."""
+        mock_session = MagicMock()
+        python_obj = Python(session=mock_session)
+        self.assertIs(python_obj.session, mock_session)
+
     def test_releases_fetches_from_api(self):
         """Test that releases property fetches from the API."""
-        python_obj = Python()
-
         mock_response = MagicMock()
         mock_response.json.return_value = self.sample_releases
 
-        with patch('httpx.get', return_value=mock_response) as mock_get:
+        with patch('httpx.Client') as mock_client_class:
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            python_obj = Python()
             releases = python_obj.releases
 
+            # Verify client was created
+            mock_client_class.assert_called_once()
+
             # Verify API was called
-            mock_get.assert_called_once_with(Python.API_URL)
+            mock_client.get.assert_called_once_with(Python.API_URL)
             mock_response.raise_for_status.assert_called_once()
 
             # Verify data returned
@@ -69,12 +81,16 @@ class TestPython(TestCase):
 
     def test_releases_cached(self):
         """Test that releases property is cached."""
-        python_obj = Python()
-
         mock_response = MagicMock()
         mock_response.json.return_value = self.sample_releases
 
-        with patch('httpx.get', return_value=mock_response) as mock_get:
+        with patch('httpx.Client') as mock_client_class:
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            python_obj = Python()
+
             # First access
             releases1 = python_obj.releases
 
@@ -82,21 +98,25 @@ class TestPython(TestCase):
             releases2 = python_obj.releases
 
             # Should only call API once due to caching
-            mock_get.assert_called_once()
+            mock_client.get.assert_called_once()
 
             # Both should return same data
             self.assertEqual(releases1, releases2)
 
     def test_releases_raises_on_http_error(self):
         """Test that releases raises exception on HTTP error."""
-        python_obj = Python()
-
         mock_response = MagicMock()
         mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
             'Error', request=MagicMock(), response=MagicMock()
         )
 
-        with patch('httpx.get', return_value=mock_response):
+        with patch('httpx.Client') as mock_client_class:
+            mock_client = MagicMock()
+            mock_client.get.return_value = mock_response
+            mock_client_class.return_value = mock_client
+
+            python_obj = Python()
+
             with self.assertRaises(httpx.HTTPStatusError):
                 python_obj.releases
 

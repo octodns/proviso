@@ -10,6 +10,7 @@ from build import BuildBackendException
 from proviso.builder import Builder
 from proviso.python import Python
 from proviso.resolver import Resolver
+from proviso.utils import CachingClient
 
 log = getLogger('proviso')
 
@@ -62,15 +63,15 @@ def get_requirements_with_extras(metadata, extras):
     return requirements
 
 
-def find_requirements(requirements, python_versions, cache_db_path=None):
+def find_requirements(requirements, python_versions, session=None):
 
     if not requirements:
         return {}
 
     log.info(f'Requirements: {", ".join([str(r) for r in requirements])}')
 
-    # Create one resolver instance (shared cache across all Python versions)
-    resolver = Resolver(cache_db_path=cache_db_path)
+    # Create one resolver instance (shared session across all Python versions)
+    resolver = Resolver(session=session)
 
     # Collect versions: versions[package][version] = [python_versions]
     versions = defaultdict(lambda: defaultdict(list))
@@ -118,8 +119,13 @@ def write_requirements_to_file(
                 fh.write('\n')
 
 
-def parse_and_validate_args(metadata, args):
+def parse_and_validate_args(metadata, args, session=None):
     """Parse and validate command line arguments.
+
+    Args:
+        metadata: Project metadata
+        args: Parsed command line arguments
+        session: Optional cached HTTP client for API requests
 
     Returns a dict with parsed values:
     - directory: expanded directory path
@@ -127,7 +133,6 @@ def parse_and_validate_args(metadata, args):
     - python_versions: list of Python versions
     - output_path: full path for output file
     - header: header string to write to file
-    - cache_db_path: optional path to cache database
     """
     # Expand user path (e.g., ~ -> /home/username)
     directory = expanduser(args.directory)
@@ -149,7 +154,7 @@ def parse_and_validate_args(metadata, args):
 
     if args.python_versions is None:
         # If no python versions specified, use active versions from endoflife.date
-        python = Python()
+        python = Python(session=session)
         python_versions = [release['cycle'] for release in python.active]
     else:
         python_versions = [
@@ -176,21 +181,12 @@ def parse_and_validate_args(metadata, args):
         if header and not header.endswith('\n'):
             header += '\n'
 
-    # Determine cache database path
-    # Priority: command line arg > environment variable > None (in-memory)
-    cache_db_path = args.cache_db
-    if cache_db_path is None:
-        cache_db_path = getenv('PROVISO_CACHE_DB')
-    if cache_db_path:
-        cache_db_path = expanduser(cache_db_path)
-
     return {
         'directory': directory,
         'extras': extras,
         'python_versions': python_versions,
         'output_path': output_path,
         'header': header,
-        'cache_db_path': cache_db_path,
     }
 
 
@@ -258,11 +254,22 @@ def main():  # pragma: no cover
     if args.level != 'DEBUG':
         getLogger('httpx').setLevel(WARNING)
 
+    # Determine cache database path
+    # Priority: command line arg > environment variable > None (in-memory)
+    cache_db_path = args.cache_db
+    if cache_db_path is None:
+        cache_db_path = getenv('PROVISO_CACHE_DB')
+    if cache_db_path:
+        cache_db_path = expanduser(cache_db_path)
+
+    # Create shared caching client for all HTTP requests
+    session = CachingClient(cache_db_path=cache_db_path)
+
     # Build project metadata
     metadata = build_project_metadata(args.directory)
 
     # Parse and validate arguments
-    parsed = parse_and_validate_args(metadata, args)
+    parsed = parse_and_validate_args(metadata, args, session=session)
 
     format_and_print_metadata(
         metadata, parsed['extras'], parsed['python_versions']
@@ -271,9 +278,7 @@ def main():  # pragma: no cover
     requirements = get_requirements_with_extras(metadata, parsed['extras'])
 
     versions = find_requirements(
-        requirements,
-        python_versions=parsed['python_versions'],
-        cache_db_path=parsed['cache_db_path'],
+        requirements, python_versions=parsed['python_versions'], session=session
     )
 
     write_requirements_to_file(

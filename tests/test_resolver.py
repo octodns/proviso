@@ -492,47 +492,6 @@ Requires-Dist: pytest>=7.0.0; extra == "test"
 
             self.assertEqual([], result)
 
-    def test_get_dependencies_no_session(self):
-        """Test get_dependencies when session is None (uses httpx.get)."""
-        index_urls = ['https://pypi.org/simple/']
-
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
-            mock_finder = MagicMock()
-            mock_finder_class.return_value = mock_finder
-
-            # Pass None for session
-            provider = PyPIProvider(None, index_urls)
-
-            mock_package = MagicMock()
-            mock_link = MagicMock()
-            mock_dist_info_link = MagicMock()
-            mock_dist_info_link.url = 'https://pypi.org/metadata'
-            mock_link.dist_info_link = mock_dist_info_link
-            mock_package.link = mock_link
-
-            mock_result = MagicMock()
-            mock_result.best = mock_package
-            mock_finder.find_best_match.return_value = mock_result
-
-            with patch('proviso.resolver.httpx') as mock_httpx:
-                mock_response = MagicMock()
-                mock_response.text = '''Metadata-Version: 2.1
-Name: test-package
-Version: 1.0.0
-Requires-Dist: urllib3>=1.26.0
-'''
-                mock_httpx.get.return_value = mock_response
-
-                candidate = Candidate('test-package', Version('1.0.0'))
-
-                result = provider.get_dependencies(candidate)
-
-                # Should have called httpx.get
-                mock_httpx.get.assert_called_once_with(
-                    'https://pypi.org/metadata'
-                )
-                self.assertEqual(1, len(result))
-
     def test_get_dependencies_with_marker_default_environment(self):
         """Test get_dependencies with marker evaluation in default environment."""
         session = MagicMock()
@@ -701,6 +660,14 @@ class TestResolver(TestCase):
                 resolver = Resolver()
 
                 self.assertEqual(mock_client_instance, resolver._session)
+
+    def test_init_with_provided_session(self):
+        """Test that Resolver uses provided session."""
+        with patch('proviso.resolver.MultiDomainBasicAuth'):
+            mock_session = MagicMock()
+            resolver = Resolver(session=mock_session)
+
+            self.assertIs(mock_session, resolver._session)
 
     def test_resolve_returns_dict(self):
         """Test that resolve returns a dictionary."""

@@ -481,69 +481,6 @@ class TestParseAndValidateArgs(TestCase):
         # Empty header should remain empty
         self.assertEqual('', result['header'])
 
-    def test_cache_db_from_env(self):
-        """Test that cache_db_path comes from environment when not in args."""
-        mock_metadata = MagicMock()
-        mock_metadata.provides_extra = []
-
-        mock_args = MagicMock()
-        mock_args.directory = '/path/to/project'
-        mock_args.extras = None
-        mock_args.python_versions = '3.9'
-        mock_args.filename = 'requirements.txt'
-        mock_args.header = None
-        mock_args.cache_db = None
-
-        with patch('proviso.main.argv', ['proviso']):
-            with patch('proviso.main.getenv', return_value='/tmp/cache.db'):
-                with patch('proviso.main.expanduser', side_effect=lambda x: x):
-                    result = parse_and_validate_args(mock_metadata, mock_args)
-
-        self.assertEqual('/tmp/cache.db', result['cache_db_path'])
-
-    def test_cache_db_from_args(self):
-        """Test that cache_db_path from args takes precedence over env."""
-        mock_metadata = MagicMock()
-        mock_metadata.provides_extra = []
-
-        mock_args = MagicMock()
-        mock_args.directory = '/path/to/project'
-        mock_args.extras = None
-        mock_args.python_versions = '3.9'
-        mock_args.filename = 'requirements.txt'
-        mock_args.header = None
-        mock_args.cache_db = '~/custom/cache.db'
-
-        with patch('proviso.main.argv', ['proviso']):
-            with patch('proviso.main.getenv', return_value='/tmp/cache.db'):
-                with patch(
-                    'proviso.main.expanduser',
-                    side_effect=lambda x: x.replace('~', '/home/user'),
-                ):
-                    result = parse_and_validate_args(mock_metadata, mock_args)
-
-        # Should use args value and expand ~
-        self.assertEqual('/home/user/custom/cache.db', result['cache_db_path'])
-
-    def test_cache_db_none_when_not_set(self):
-        """Test that cache_db_path is None when not set anywhere."""
-        mock_metadata = MagicMock()
-        mock_metadata.provides_extra = []
-
-        mock_args = MagicMock()
-        mock_args.directory = '/path/to/project'
-        mock_args.extras = None
-        mock_args.python_versions = '3.9'
-        mock_args.filename = 'requirements.txt'
-        mock_args.header = None
-        mock_args.cache_db = None
-
-        with patch('proviso.main.argv', ['proviso']):
-            with patch('proviso.main.getenv', return_value=None):
-                result = parse_and_validate_args(mock_metadata, mock_args)
-
-        self.assertIsNone(result['cache_db_path'])
-
 
 class TestWriteRequirementsToFile(TestCase):
     def test_write_simple_requirements(self):
