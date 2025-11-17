@@ -6,6 +6,7 @@ from os.path import dirname, expanduser, join
 from sys import argv, exit
 
 from build import BuildBackendException
+
 from proviso.builder import Builder
 from proviso.python import Python
 from proviso.resolver import Resolver

@@ -6,9 +6,8 @@ skip-magic-trailing-comma=true
 [tool.isort]
 profile = "black"
 known_first_party="proviso"
-known_octodns="octodns"
 line_length=80
-sections="FUTURE,STDLIB,THIRDPARTY,OCTODNS,FIRSTPARTY,LOCALFOLDER"
+sections="FUTURE,STDLIB,THIRDPARTY,FIRSTPARTY,LOCALFOLDER"
 
 [tool.pytest.ini_options]
 filterwarnings = [

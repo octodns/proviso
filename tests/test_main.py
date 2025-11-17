@@ -4,9 +4,9 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
+from build import BuildBackendException
 from packaging.requirements import Requirement
 
-from build import BuildBackendException
 from proviso.main import (
     build_project_metadata,
     find_requirements,
