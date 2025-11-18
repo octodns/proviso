@@ -498,7 +498,7 @@ class TestWriteRequirementsToFile(TestCase):
             with open(output_file) as fh:
                 content = fh.read()
 
-            expected = 'package-a==1.0.0\npackage-b==2.0.0\n'
+            expected = "x-python-version-not-supported; python_version!='3.9' and python_version!='3.10' and python_version!='3.11'\npackage-a==1.0.0\npackage-b==2.0.0\n"
             self.assertEqual(expected, content)
 
     def test_write_with_version_markers(self):
@@ -539,7 +539,7 @@ class TestWriteRequirementsToFile(TestCase):
             with open(output_file) as fh:
                 content = fh.read()
 
-            expected = '# This is a test header\npackage-a==1.0.0\n'
+            expected = "# This is a test header\nx-python-version-not-supported; python_version!='3.9' and python_version!='3.10' and python_version!='3.11'\npackage-a==1.0.0\n"
             self.assertEqual(expected, content)
 
     def test_write_with_header_no_trailing_newline(self):
@@ -557,7 +557,7 @@ class TestWriteRequirementsToFile(TestCase):
             with open(output_file) as fh:
                 content = fh.read()
 
-            expected = '# This is a test header\npackage-a==1.0.0\n'
+            expected = "# This is a test header\nx-python-version-not-supported; python_version!='3.9' and python_version!='3.10' and python_version!='3.11'\npackage-a==1.0.0\n"
             self.assertEqual(expected, content)
 
     def test_sorted_output(self):
@@ -576,10 +576,10 @@ class TestWriteRequirementsToFile(TestCase):
             with open(output_file) as fh:
                 lines = fh.readlines()
 
-            # Verify sorted order
-            self.assertEqual('aardvark==1.0.0\n', lines[0])
-            self.assertEqual('monkey==1.0.0\n', lines[1])
-            self.assertEqual('zebra==1.0.0\n', lines[2])
+            # Verify sorted order (skip first line which is x-python-version-not-supported marker)
+            self.assertEqual('aardvark==1.0.0\n', lines[1])
+            self.assertEqual('monkey==1.0.0\n', lines[2])
+            self.assertEqual('zebra==1.0.0\n', lines[3])
 
     def test_multiple_versions_same_package(self):
         """Test package with different versions for different Python versions."""
