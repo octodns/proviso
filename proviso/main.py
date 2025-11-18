@@ -102,6 +102,16 @@ def write_requirements_to_file(
             fh.write(header)
             if not header.endswith('\n'):
                 fh.write('\n')
+
+        fh.write('x-python-version-not-supported; ')
+        for i, python_version in enumerate(python_versions):
+            if i:
+                fh.write(' and ')
+            fh.write("python_version!='")
+            fh.write(python_version)
+            fh.write("'")
+        fh.write('\n')
+
         for pkg, vers in sorted(versions.items()):
             for ver, pythons in vers.items():
                 # same pkg ver for all pythons
