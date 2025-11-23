@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
@@ -117,7 +118,10 @@ class TestPyPIProvider(TestCase):
 
             # Verify PackageFinder was created correctly
             mock_finder.assert_called_once_with(
-                session=session, index_urls=index_urls, target_python=None
+                session=session,
+                index_urls=index_urls,
+                target_python=None,
+                exclude_newer_than=None,
             )
 
             # Environment should be None when no python_version specified
@@ -729,3 +733,71 @@ class TestResolver(TestCase):
                         mock_provider.assert_called_once()
                         call_kwargs = mock_provider.call_args[1]
                         self.assertEqual('3.9', call_kwargs['python_version'])
+
+    def test_resolve_with_exclude_newer_than(self):
+        """Test resolve with exclude_newer_than parameter."""
+        with patch('proviso.resolver.CachingClient'):
+            with patch('proviso.resolver.MultiDomainBasicAuth'):
+                resolver = Resolver()
+
+                mock_result = MagicMock()
+                mock_result.mapping = {}
+
+                with patch(
+                    'proviso.resolver.ResolveLibResolver'
+                ) as mock_resolver_class:
+                    mock_resolver_instance = MagicMock()
+                    mock_resolver_instance.resolve.return_value = mock_result
+                    mock_resolver_class.return_value = mock_resolver_instance
+
+                    with patch(
+                        'proviso.resolver.PyPIProvider'
+                    ) as mock_provider:
+                        requirements = [Requirement('requests>=2.0.0')]
+                        exclude_newer_than = datetime(
+                            2024, 1, 1, tzinfo=timezone.utc
+                        )
+                        resolver.resolve(
+                            requirements, exclude_newer_than=exclude_newer_than
+                        )
+
+                        # Verify PyPIProvider was called with exclude_newer_than
+                        mock_provider.assert_called_once()
+                        call_kwargs = mock_provider.call_args[1]
+                        self.assertEqual(
+                            exclude_newer_than,
+                            call_kwargs['exclude_newer_than'],
+                        )
+
+
+class TestPyPIProviderExcludeNewerThan(TestCase):
+    def test_init_with_exclude_newer_than(self):
+        """Test PyPIProvider initialization with exclude_newer_than."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+        exclude_newer_than = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder:
+            PyPIProvider(
+                session, index_urls, exclude_newer_than=exclude_newer_than
+            )
+
+            # Verify PackageFinder was created with exclude_newer_than
+            mock_finder.assert_called_once()
+            call_kwargs = mock_finder.call_args[1]
+            self.assertEqual(
+                exclude_newer_than, call_kwargs['exclude_newer_than']
+            )
+
+    def test_init_without_exclude_newer_than(self):
+        """Test PyPIProvider initialization without exclude_newer_than."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder:
+            PyPIProvider(session, index_urls)
+
+            # Verify PackageFinder was created with exclude_newer_than=None
+            mock_finder.assert_called_once()
+            call_kwargs = mock_finder.call_args[1]
+            self.assertIsNone(call_kwargs['exclude_newer_than'])
