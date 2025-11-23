@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from os.path import join
 from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
@@ -209,6 +210,33 @@ class TestFindRequirements(TestCase):
                 self.assertIn('1.1.0', result['package'])
                 self.assertEqual(['3.9'], result['package']['1.0.0'])
                 self.assertEqual(['3.10'], result['package']['1.1.0'])
+
+    def test_with_exclude_newer_than(self):
+        """Test that exclude_newer_than is passed to resolver."""
+        requirements = [Requirement('requests>=2.0.0')]
+        python_versions = ['3.9']
+        exclude_newer_than = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_instance = MagicMock()
+            mock_resolver_instance.resolve.return_value = {
+                'requests': {'version': '2.28.0', 'extras': []}
+            }
+            mock_resolver_class.return_value = mock_resolver_instance
+
+            with patch('proviso.main.log'):
+                find_requirements(
+                    requirements,
+                    python_versions,
+                    exclude_newer_than=exclude_newer_than,
+                )
+
+                # Verify resolver.resolve was called with exclude_newer_than
+                mock_resolver_instance.resolve.assert_called_once()
+                call_kwargs = mock_resolver_instance.resolve.call_args[1]
+                self.assertEqual(
+                    exclude_newer_than, call_kwargs['exclude_newer_than']
+                )
 
 
 class TestParseAndValidateArgs(TestCase):

@@ -1,5 +1,6 @@
 from argparse import ArgumentParser
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from logging import DEBUG, ERROR, INFO, WARNING, basicConfig, getLogger
 from os import getcwd, getenv
 from os.path import dirname, expanduser, join
@@ -63,7 +64,9 @@ def get_requirements_with_extras(metadata, extras):
     return requirements
 
 
-def find_requirements(requirements, python_versions, session=None):
+def find_requirements(
+    requirements, python_versions, session=None, exclude_newer_than=None
+):
 
     if not requirements:
         return {}
@@ -80,7 +83,11 @@ def find_requirements(requirements, python_versions, session=None):
     for python_version in python_versions:
         log.info(f'Resolving dependencies for Python {python_version}')
 
-        resolved = resolver.resolve(requirements, python_version=python_version)
+        resolved = resolver.resolve(
+            requirements,
+            python_version=python_version,
+            exclude_newer_than=exclude_newer_than,
+        )
 
         log.info(
             f'Resolved {len(resolved)} dependencies for Python {python_version}'
@@ -250,6 +257,12 @@ def main():  # pragma: no cover
         default=None,
         help='Path to SQLite database for persistent HTTP caching. If not specified, checks PROVISO_CACHE_DB environment variable. If neither is set, uses in-memory caching.',
     )
+    parser.add_argument(
+        '--cooldown-days',
+        type=int,
+        default=0,
+        help='Exclude packages uploaded within this many days (dependency cooldown). Default: 0 (disabled).',
+    )
 
     args = parser.parse_args()
 
@@ -287,8 +300,21 @@ def main():  # pragma: no cover
 
     requirements = get_requirements_with_extras(metadata, parsed['extras'])
 
+    # Calculate exclude_newer_than if cooldown is enabled
+    exclude_newer_than = None
+    if args.cooldown_days > 0:
+        exclude_newer_than = datetime.now(timezone.utc) - timedelta(
+            days=args.cooldown_days
+        )
+        log.info(
+            f'Dependency cooldown: excluding packages uploaded after {exclude_newer_than.isoformat()}'
+        )
+
     versions = find_requirements(
-        requirements, python_versions=parsed['python_versions'], session=session
+        requirements,
+        python_versions=parsed['python_versions'],
+        session=session,
+        exclude_newer_than=exclude_newer_than,
     )
 
     write_requirements_to_file(

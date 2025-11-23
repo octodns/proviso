@@ -44,7 +44,9 @@ class Candidate:
 class PyPIProvider(AbstractProvider):
     """Provider that queries PyPI for packages and their dependencies."""
 
-    def __init__(self, session, index_urls, python_version=None):
+    def __init__(
+        self, session, index_urls, python_version=None, exclude_newer_than=None
+    ):
         self.session = session
         self._dependencies_cache = {}
 
@@ -53,9 +55,12 @@ class PyPIProvider(AbstractProvider):
         if python_version:
             target_python = TargetPython(py_ver=Version(python_version).release)
 
-        # Create PackageFinder with the target Python version
+        # Create PackageFinder with the target Python version and optional date filter
         self.finder = PackageFinder(
-            session=session, index_urls=index_urls, target_python=target_python
+            session=session,
+            index_urls=index_urls,
+            target_python=target_python,
+            exclude_newer_than=exclude_newer_than,
         )
 
         # Build environment for marker evaluation
@@ -211,13 +216,17 @@ class Resolver:
         self._session = session
         self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
 
-    def resolve(self, requirements, python_version=None):
+    def resolve(
+        self, requirements, python_version=None, exclude_newer_than=None
+    ):
         """Resolve dependencies for the given requirements.
 
         Args:
             requirements: List of packaging.requirements.Requirement objects
             python_version: Target Python version string (e.g., "3.9", "3.10.5").
                           Defaults to current Python version.
+            exclude_newer_than: Optional datetime to exclude packages uploaded after
+                          this date (for dependency cooldowns).
 
         Returns:
             Dict mapping package names to metadata dicts with 'version' and 'extras'
@@ -229,6 +238,7 @@ class Resolver:
             session=self._session,
             index_urls=self.index_urls,
             python_version=python_version,
+            exclude_newer_than=exclude_newer_than,
         )
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)
