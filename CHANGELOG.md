@@ -1,3 +1,8 @@
+## 0.2.0 - 2025-11-28
+
+Minor:
+* Minor bump to see if there's further pypi collisions
+
 ## 0.1.0 - 2025-11-26
 
 Minor:
