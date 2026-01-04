@@ -164,6 +164,7 @@ class PyPIProvider(AbstractProvider):
 
             # Fetch using cached session
             response = self.session.get(url)
+            response.raise_for_status()
 
             # Disable validation to handle metadata version mismatches
             metadata = Metadata.from_email(response.text, validate=False)
