@@ -627,6 +627,51 @@ Requires-Dist: urllib3>=1.26.0; python_version >= "3.10"
                     # Should NOT include urllib3 (marker evaluates to False for 3.9)
                     self.assertEqual(0, len(result))
 
+    def test_get_dependencies_http_error(self):
+        """Test get_dependencies when HTTP request fails."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            mock_package = MagicMock()
+            mock_link = MagicMock()
+            mock_dist_info_link = MagicMock()
+            mock_dist_info_link.url = 'https://pypi.org/metadata'
+            mock_link.dist_info_link = mock_dist_info_link
+            mock_package.link = mock_link
+
+            mock_result = MagicMock()
+            mock_result.best = mock_package
+            mock_finder.find_best_match.return_value = mock_result
+
+            # Mock 404 response
+            mock_response = MagicMock()
+            mock_response.status_code = 404
+            mock_response.text = 'Not Found'
+
+            import httpx
+
+            def raise_for_status():
+                if 400 <= mock_response.status_code < 600:
+                    raise httpx.HTTPStatusError(
+                        message="Client Error",
+                        request=MagicMock(),
+                        response=mock_response,
+                    )
+
+            mock_response.raise_for_status.side_effect = raise_for_status
+            session.get.return_value = mock_response
+
+            candidate = Candidate('requests', Version('2.28.0'))
+
+            with self.assertRaises(httpx.HTTPStatusError):
+                provider.get_dependencies(candidate)
+
 
 class TestResolver(TestCase):
     def test_init_default_index_urls(self):
