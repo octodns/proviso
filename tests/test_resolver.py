@@ -355,9 +355,9 @@ class TestPyPIProvider(TestCase):
             cached_deps = [Requirement('urllib3>=1.26.0')]
 
             # Pre-populate cache
-            provider._dependencies_cache[('requests', Version('2.28.0'))] = (
-                cached_deps
-            )
+            provider._dependencies_cache[
+                ('requests', Version('2.28.0'), frozenset())
+            ] = cached_deps
 
             result = provider.get_dependencies(candidate)
 
@@ -386,7 +386,8 @@ class TestPyPIProvider(TestCase):
             self.assertEqual([], result)
             # Should be cached
             self.assertIn(
-                ('nonexistent', Version('1.0.0')), provider._dependencies_cache
+                ('nonexistent', Version('1.0.0'), frozenset()),
+                provider._dependencies_cache,
             )
 
     def test_get_dependencies_with_metadata(self):
@@ -846,3 +847,107 @@ class TestPyPIProviderExcludeNewerThan(TestCase):
             mock_finder.assert_called_once()
             call_kwargs = mock_finder.call_args[1]
             self.assertIsNone(call_kwargs['exclude_newer_than'])
+
+
+class TestPyPIProviderExtrasBug(TestCase):
+    def test_get_dependencies_with_extras_repro(self):
+        """Test that get_dependencies correctly handles extras."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            mock_package = MagicMock()
+            mock_link = MagicMock()
+            mock_dist_info_link = MagicMock()
+            mock_dist_info_link.url = 'https://pypi.org/metadata'
+            mock_link.dist_info_link = mock_dist_info_link
+            mock_package.link = mock_link
+
+            mock_result = MagicMock()
+            mock_result.best = mock_package
+            mock_finder.find_best_match.return_value = mock_result
+
+            mock_response = MagicMock()
+            # "requests[security]" depends on "cryptography"
+            # "requests" does not (by default)
+            mock_response.text = '''Metadata-Version: 2.1
+Name: requests
+Version: 2.28.0
+Requires-Dist: urllib3<1.27,>=1.21.1
+Requires-Dist: certifi>=2017.4.17
+Requires-Dist: cryptography>=1.3.4; extra == 'security'
+'''
+            session.get.return_value = mock_response
+
+            # Case 1: Candidate with NO extras
+            candidate_no_extra = Candidate('requests', Version('2.28.0'))
+            deps_no_extra = provider.get_dependencies(candidate_no_extra)
+
+            # Should have urllib3 and certifi, but NOT cryptography
+            deps_names_no_extra = [d.name for d in deps_no_extra]
+            self.assertIn('urllib3', deps_names_no_extra)
+            self.assertIn('certifi', deps_names_no_extra)
+            self.assertNotIn('cryptography', deps_names_no_extra)
+
+            # Case 2: Candidate WITH 'security' extra
+            candidate_security = Candidate(
+                'requests', Version('2.28.0'), extras=frozenset(['security'])
+            )
+
+            deps_security = provider.get_dependencies(candidate_security)
+            deps_names_security = [d.name for d in deps_security]
+
+            self.assertIn(
+                'cryptography',
+                deps_names_security,
+                "cryptography should be present when security extra is requested",
+            )
+
+
+class TestPyPIProviderCoverage(TestCase):
+    def test_get_dependencies_extras_no_match(self):
+        """Test get_dependencies when extras are present but don't match marker."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            mock_package = MagicMock()
+            mock_link = MagicMock()
+            mock_dist_info_link = MagicMock()
+            mock_dist_info_link.url = 'https://pypi.org/metadata'
+            mock_link.dist_info_link = mock_dist_info_link
+            mock_package.link = mock_link
+
+            mock_result = MagicMock()
+            mock_result.best = mock_package
+            mock_finder.find_best_match.return_value = mock_result
+
+            mock_response = MagicMock()
+            # Requirement depends on 'other' extra
+            mock_response.text = '''Metadata-Version: 2.1
+Name: requests
+Version: 2.28.0
+Requires-Dist: cryptography>=1.3.4; extra == 'other'
+'''
+            session.get.return_value = mock_response
+
+            # Candidate has 'security' extra, which does NOT match 'other'
+            candidate = Candidate(
+                'requests', Version('2.28.0'), extras=frozenset(['security'])
+            )
+
+            deps = provider.get_dependencies(candidate)
+
+            # Should NOT include cryptography
+            deps_names = [d.name for d in deps]
+            self.assertNotIn('cryptography', deps_names)

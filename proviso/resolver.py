@@ -132,16 +132,16 @@ class PyPIProvider(AbstractProvider):
 
     def get_dependencies(self, candidate):
         """Get dependencies for a candidate."""
-        cache_key = (candidate.name, candidate.version)
+        cache_key = (candidate.name, candidate.version, candidate.extras)
 
         if cache_key in self._dependencies_cache:
             log.debug(
-                f'Dependencies cache hit for {candidate.name}=={candidate.version}'
+                f'Dependencies cache hit for {candidate.name}=={candidate.version} extras={candidate.extras}'
             )
             return self._dependencies_cache[cache_key]
 
         log.debug(
-            f'Getting dependencies for {candidate.name}=={candidate.version}'
+            f'Getting dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
 
         # Find the package to get its metadata
@@ -176,18 +176,29 @@ class PyPIProvider(AbstractProvider):
         # Extract dependencies from metadata
         dependencies = []
         for req in metadata.requires_dist or []:
-            # Evaluate markers for target environment
             if req.marker is None:
                 # No marker means always included
                 dependencies.append(req)
-            elif self.environment is None:
-                # No custom environment, use default
-                if req.marker.evaluate():
+                continue
+
+            # Prepare environment for evaluation
+            # Use custom environment if set, otherwise default
+            base_env = (self.environment or default_environment()).copy()
+
+            # Check if requirement is valid for base environment (no extra)
+            # We explicitly set extra to empty string to handle markers that might reference it
+            base_env['extra'] = ''
+            if req.marker.evaluate(environment=base_env):
+                dependencies.append(req)
+                continue
+
+            # If not matched yet, check against requested extras
+            for extra in candidate.extras:
+                env = base_env.copy()
+                env['extra'] = extra
+                if req.marker.evaluate(environment=env):
                     dependencies.append(req)
-            else:
-                # Use custom environment for evaluation
-                if req.marker.evaluate(environment=self.environment):
-                    dependencies.append(req)
+                    break
 
         log.debug(
             f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version}'
