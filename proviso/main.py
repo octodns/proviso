@@ -286,43 +286,42 @@ def main():  # pragma: no cover
         cache_db_path = expanduser(cache_db_path)
 
     # Create shared caching client for all HTTP requests
-    session = CachingClient(cache_db_path=cache_db_path)
+    with CachingClient(cache_db_path=cache_db_path) as session:
+        # Build project metadata
+        metadata = build_project_metadata(args.directory)
 
-    # Build project metadata
-    metadata = build_project_metadata(args.directory)
+        # Parse and validate arguments
+        parsed = parse_and_validate_args(metadata, args, session=session)
 
-    # Parse and validate arguments
-    parsed = parse_and_validate_args(metadata, args, session=session)
-
-    format_and_print_metadata(
-        metadata, parsed['extras'], parsed['python_versions']
-    )
-
-    requirements = get_requirements_with_extras(metadata, parsed['extras'])
-
-    # Calculate exclude_newer_than if cooldown is enabled
-    exclude_newer_than = None
-    if args.cooldown_days > 0:
-        exclude_newer_than = datetime.now(timezone.utc) - timedelta(
-            days=args.cooldown_days
-        )
-        log.info(
-            f'Dependency cooldown: excluding packages uploaded after {exclude_newer_than.isoformat()}'
+        format_and_print_metadata(
+            metadata, parsed['extras'], parsed['python_versions']
         )
 
-    versions = find_requirements(
-        requirements,
-        python_versions=parsed['python_versions'],
-        session=session,
-        exclude_newer_than=exclude_newer_than,
-    )
+        requirements = get_requirements_with_extras(metadata, parsed['extras'])
 
-    write_requirements_to_file(
-        versions,
-        parsed['python_versions'],
-        parsed['output_path'],
-        header=parsed['header'],
-    )
+        # Calculate exclude_newer_than if cooldown is enabled
+        exclude_newer_than = None
+        if args.cooldown_days > 0:
+            exclude_newer_than = datetime.now(timezone.utc) - timedelta(
+                days=args.cooldown_days
+            )
+            log.info(
+                f'Dependency cooldown: excluding packages uploaded after {exclude_newer_than.isoformat()}'
+            )
+
+        versions = find_requirements(
+            requirements,
+            python_versions=parsed['python_versions'],
+            session=session,
+            exclude_newer_than=exclude_newer_than,
+        )
+
+        write_requirements_to_file(
+            versions,
+            parsed['python_versions'],
+            parsed['output_path'],
+            header=parsed['header'],
+        )
 
 
 if __name__ == '__main__':  # pragma: no cover
