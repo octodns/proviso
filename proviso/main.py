@@ -23,8 +23,7 @@ def build_project_metadata(directory):
         return builder.metadata
     except BuildBackendException as e:
         cpe = e.exception
-        log.error(
-            f'''Failed to build project.
+        log.error(f'''Failed to build project.
 
 captured stdout:
 --------------------------------------------------------------------------------
@@ -34,8 +33,7 @@ captured stderr:
 --------------------------------------------------------------------------------
 {cpe.stderr.decode('utf-8')}
 --------------------------------------------------------------------------------
-'''
-        )
+''')
         exit(1)
 
 
