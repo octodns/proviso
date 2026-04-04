@@ -1,3 +1,12 @@
+## 0.3.0 - 2026-04-03
+
+Minor:
+* Use CachingClient as a context manager to ensure proper resource cleanup. - [#13](https://github.com/octodns/proviso/pull/13)
+
+Patch:
+* Correctly resolve optional dependencies when extras are requested. - [#11](https://github.com/octodns/proviso/pull/11)
+* Raise exception on HTTP errors when fetching package metadata. - [#12](https://github.com/octodns/proviso/pull/12)
+
 ## 0.2.0 - 2025-11-28
 
 Minor:
