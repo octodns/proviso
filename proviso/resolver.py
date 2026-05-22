@@ -256,7 +256,7 @@ class Resolver:
         resolver = ResolveLibResolver(provider, reporter)
 
         # Resolve
-        result = resolver.resolve(requirements)
+        result = resolver.resolve(requirements, max_rounds=1000)
 
         # Convert result to our format
         resolved = {}
