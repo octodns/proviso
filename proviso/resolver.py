@@ -49,6 +49,7 @@ class PyPIProvider(AbstractProvider):
     ):
         self.session = session
         self._dependencies_cache = {}
+        self._matches_cache = {}
 
         # Create TargetPython if a specific version is requested
         target_python = None
@@ -102,10 +103,19 @@ class PyPIProvider(AbstractProvider):
         # Use the first requirement to search (they should all have the same name)
         req = reqs[0]
 
-        log.debug(f'Finding matches for {identifier}: {req}')
-
-        # Find best match using unearth
-        result = self.finder.find_matches(str(req))
+        # Fetch (and cache) all platform-compatible packages for this name.
+        # The specifier/incompatibility filtering below is kept outside the cache
+        # because `incompatibilities` changes on every backtracking round.
+        if identifier in self._matches_cache:
+            log.debug(f'Matches cache hit for {identifier}')
+            result = self._matches_cache[identifier]
+        else:
+            log.debug(f'Finding matches for {identifier}: {req}')
+            # Query by name only so one cache entry covers all specifiers seen
+            # during resolution.  unearth returns a lazy LazySequence so we
+            # materialise it immediately before caching.
+            result = list(self.finder.find_matches(identifier))
+            self._matches_cache[identifier] = result
 
         # Get all applicable versions
         candidates = []

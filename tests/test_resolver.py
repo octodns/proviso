@@ -343,6 +343,107 @@ class TestPyPIProvider(TestCase):
             self.assertEqual(1, len(result))
             self.assertEqual('2.27.0', str(result[0].version))
 
+    def test_find_matches_cache_avoids_second_unearth_call(self):
+        """Test that a second find_matches call for the same identifier reuses
+        the cached result without querying unearth again."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            mock_package1 = MagicMock()
+            mock_package1.version = '2.28.0'
+            mock_package2 = MagicMock()
+            mock_package2.version = '2.27.0'
+
+            mock_finder.find_matches.return_value = [
+                mock_package1,
+                mock_package2,
+            ]
+
+            requirements = {'requests': [Requirement('requests>=2.27.0')]}
+            incompatibilities = {}
+
+            result1 = provider.find_matches(
+                'requests', requirements, incompatibilities
+            )
+            result2 = provider.find_matches(
+                'requests', requirements, incompatibilities
+            )
+
+            # unearth should only be called once — the second call hits the cache
+            mock_finder.find_matches.assert_called_once()
+            # Both calls return the same candidates
+            self.assertEqual(
+                [str(c.version) for c in result1],
+                [str(c.version) for c in result2],
+            )
+
+    def test_find_matches_cache_keyed_by_name(self):
+        """Test that find_matches queries unearth with the bare package name."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+            mock_finder.find_matches.return_value = []
+
+            provider.find_matches(
+                'requests', {'requests': [Requirement('requests>=2.27.0')]}, {}
+            )
+
+            # Should be called with the bare identifier, not a specifier string
+            mock_finder.find_matches.assert_called_once_with('requests')
+
+    def test_find_matches_incompatibility_filtering_applied_per_call(self):
+        """Test that incompatibility filtering is applied on each call, not cached,
+        so backtracking correctly excludes previously tried versions."""
+        session = MagicMock()
+        index_urls = ['https://pypi.org/simple/']
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, index_urls)
+
+            mock_package1 = MagicMock()
+            mock_package1.version = '2.28.0'
+            mock_package2 = MagicMock()
+            mock_package2.version = '2.27.0'
+
+            mock_finder.find_matches.return_value = [
+                mock_package1,
+                mock_package2,
+            ]
+
+            requirements = {'requests': [Requirement('requests>=2.27.0')]}
+
+            # First call — no incompatibilities; both versions should be returned
+            result1 = provider.find_matches('requests', requirements, {})
+            self.assertEqual(2, len(result1))
+
+            # Second call — 2.28.0 is now incompatible (simulates a backtrack)
+            incompatibilities = {
+                'requests': [Candidate('requests', Version('2.28.0'))]
+            }
+            result2 = provider.find_matches(
+                'requests', requirements, incompatibilities
+            )
+
+            # unearth was only called once (cache hit on second call)
+            mock_finder.find_matches.assert_called_once()
+            # But the incompatibility filter still excluded 2.28.0
+            self.assertEqual(1, len(result2))
+            self.assertEqual('2.27.0', str(result2[0].version))
+
     def test_get_dependencies_cache_hit(self):
         """Test get_dependencies returns cached dependencies."""
         session = MagicMock()
