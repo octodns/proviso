@@ -1,3 +1,5 @@
+import math
+from collections import namedtuple
 from datetime import datetime, timezone
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
@@ -5,7 +7,17 @@ from unittest.mock import MagicMock, patch
 from packaging.requirements import Requirement
 from packaging.version import Version
 
-from proviso.resolver import Candidate, PyPIProvider, Resolver
+from proviso.resolver import (
+    _CONFLICT_PRIORITY_THRESHOLD,
+    Candidate,
+    PyPIProvider,
+    Resolver,
+)
+
+# Lightweight stand-in for resolvelib's RequirementInformation namedtuple.
+# resolvelib defines RequirementInformation(requirement, parent); we use the
+# same field names so tests read naturally.
+_RequirementInfo = namedtuple('_RequirementInfo', ['requirement', 'parent'])
 
 
 class TestCandidate(TestCase):
@@ -31,6 +43,29 @@ class TestCandidate(TestCase):
         candidate = Candidate('package', Version('1.0.0'), dependencies=deps)
 
         self.assertEqual(deps, candidate._dependencies)
+
+    def test_init_with_package(self):
+        """Test Candidate stores the unearth package object."""
+        mock_package = MagicMock()
+        candidate = Candidate('package', Version('1.0.0'), package=mock_package)
+
+        self.assertIs(mock_package, candidate.package)
+
+    def test_init_package_defaults_to_none(self):
+        """Test Candidate.package defaults to None when not provided."""
+        candidate = Candidate('package', Version('1.0.0'))
+
+        self.assertIsNone(candidate.package)
+
+    def test_equality_ignores_package(self):
+        """Test that __eq__ and __hash__ ignore the package attribute."""
+        pkg_a = MagicMock()
+        pkg_b = MagicMock()
+        c1 = Candidate('requests', Version('2.28.0'), package=pkg_a)
+        c2 = Candidate('requests', Version('2.28.0'), package=pkg_b)
+
+        self.assertEqual(c1, c2)
+        self.assertEqual(hash(c1), hash(c2))
 
     def test_init_canonicalizes_name(self):
         """Test that package names are canonicalized."""
@@ -222,36 +257,141 @@ class TestPyPIProvider(TestCase):
 
             self.assertFalse(provider.is_satisfied_by(req, candidate))
 
-    def test_get_preference(self):
-        """Test get_preference method."""
-        session = MagicMock()
-        index_urls = ['https://pypi.org/simple/']
-
+    def test_get_preference_free_requirement(self):
+        """A free (no specifier) requirement returns the highest-value tuple."""
         with patch('proviso.resolver.PackageFinder'):
-            provider = PyPIProvider(session, index_urls)
+            provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
 
-            resolutions = {'package-a': MagicMock()}
-            candidates = {
-                'package-b': [MagicMock(), MagicMock()],
-                'package-c': [MagicMock()],
-            }
-
-            # Package already resolved should have lower preference
-            pref_a = provider.get_preference(
-                'package-a', resolutions, candidates, None, None
+            info = _RequirementInfo(
+                requirement=Requirement('requests'), parent=None
             )
-            self.assertEqual((False, 0), pref_a)
-
-            # Unresolved packages
-            pref_b = provider.get_preference(
-                'package-b', resolutions, candidates, None, None
+            pref = provider.get_preference(
+                'requests', {}, {}, {'requests': [info]}, []
             )
-            self.assertEqual((True, 2), pref_b)
 
-            pref_c = provider.get_preference(
-                'package-c', resolutions, candidates, None, None
+            # not conflict_promoted=True, not direct=True, not pinned=True,
+            # not upper_bounded=True, requested_order=inf, not unfree=True, name
+            self.assertEqual(
+                (True, True, True, True, math.inf, True, 'requests'), pref
             )
-            self.assertEqual((True, 1), pref_c)
+
+    def test_get_preference_pinned_before_free(self):
+        """A pinned (==x.y.z) requirement sorts before a free one."""
+        with patch('proviso.resolver.PackageFinder'):
+            provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
+
+            info_pinned = _RequirementInfo(
+                requirement=Requirement('requests==2.28.0'), parent=None
+            )
+            info_free = _RequirementInfo(
+                requirement=Requirement('urllib3'), parent=None
+            )
+            information = {'requests': [info_pinned], 'urllib3': [info_free]}
+            pref_pinned = provider.get_preference(
+                'requests', {}, {}, information, []
+            )
+            pref_free = provider.get_preference(
+                'urllib3', {}, {}, information, []
+            )
+
+            self.assertLess(pref_pinned, pref_free)
+
+    def test_get_preference_upper_bounded_before_free(self):
+        """An upper-bounded requirement sorts before a free one."""
+        with patch('proviso.resolver.PackageFinder'):
+            provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
+
+            info_bounded = _RequirementInfo(
+                requirement=Requirement('requests<3.0'), parent=None
+            )
+            info_free = _RequirementInfo(
+                requirement=Requirement('urllib3'), parent=None
+            )
+            information = {'requests': [info_bounded], 'urllib3': [info_free]}
+            pref_bounded = provider.get_preference(
+                'requests', {}, {}, information, []
+            )
+            pref_free = provider.get_preference(
+                'urllib3', {}, {}, information, []
+            )
+
+            self.assertLess(pref_bounded, pref_free)
+
+    def test_get_preference_user_requested_order(self):
+        """Earlier user-specified requirements sort before later ones."""
+        with patch('proviso.resolver.PackageFinder'):
+            user_requested = {'requests': 0, 'urllib3': 1}
+            provider = PyPIProvider(
+                MagicMock(),
+                ['https://pypi.org/simple/'],
+                user_requested=user_requested,
+            )
+
+            info_a = _RequirementInfo(
+                requirement=Requirement('requests'), parent=None
+            )
+            info_b = _RequirementInfo(
+                requirement=Requirement('urllib3'), parent=None
+            )
+            information = {'requests': [info_a], 'urllib3': [info_b]}
+
+            pref_first = provider.get_preference(
+                'requests', {}, {}, information, []
+            )
+            pref_second = provider.get_preference(
+                'urllib3', {}, {}, information, []
+            )
+
+            self.assertLess(pref_first, pref_second)
+
+    def test_get_preference_conflict_promoted_sorts_first(self):
+        """A conflict-promoted package sorts before all others."""
+        with patch('proviso.resolver.PackageFinder'):
+            provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
+            provider._conflict_promoted.add('requests')
+
+            info = _RequirementInfo(
+                requirement=Requirement('requests'), parent=None
+            )
+            info_other = _RequirementInfo(
+                requirement=Requirement('urllib3==1.26.0'), parent=None
+            )
+            information = {'requests': [info], 'urllib3': [info_other]}
+
+            pref_promoted = provider.get_preference(
+                'requests', {}, {}, information, []
+            )
+            pref_pinned = provider.get_preference(
+                'urllib3', {}, {}, information, []
+            )
+
+            # Promoted always sorts first regardless of pin/bound status
+            self.assertLess(pref_promoted, pref_pinned)
+
+    def test_get_preference_direct_url_before_pinned(self):
+        """A direct-URL requirement sorts before a pinned specifier."""
+        with patch('proviso.resolver.PackageFinder'):
+            provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
+
+            info_direct = _RequirementInfo(
+                requirement=Requirement(
+                    'mylib @ https://example.com/mylib.tar.gz'
+                ),
+                parent=None,
+            )
+            info_pinned = _RequirementInfo(
+                requirement=Requirement('requests==2.28.0'), parent=None
+            )
+            information = {'mylib': [info_direct], 'requests': [info_pinned]}
+
+            pref_direct = provider.get_preference(
+                'mylib', {}, {}, information, []
+            )
+            pref_pinned = provider.get_preference(
+                'requests', {}, {}, information, []
+            )
+
+            self.assertLess(pref_direct, pref_pinned)
 
     def test_find_matches_no_requirements(self):
         """Test find_matches with no requirements."""
@@ -1052,3 +1192,289 @@ Requires-Dist: cryptography>=1.3.4; extra == 'other'
             # Should NOT include cryptography
             deps_names = [d.name for d in deps]
             self.assertNotIn('cryptography', deps_names)
+
+
+class TestNarrowRequirementSelection(TestCase):
+    """Tests for PyPIProvider.narrow_requirement_selection."""
+
+    def _make_provider(self):
+        with patch('proviso.resolver.PackageFinder'):
+            return PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
+
+    def test_no_backtrack_causes_returns_all(self):
+        """With no backtrack causes, all identifiers are returned unchanged."""
+        provider = self._make_provider()
+        identifiers = ['requests', 'urllib3', 'certifi']
+        result = list(
+            provider.narrow_requirement_selection(identifiers, {}, {}, {}, [])
+        )
+        self.assertEqual(identifiers, result)
+
+    def test_backtrack_cause_returned_first(self):
+        """Identifiers that are a backtrack cause are returned ahead of others."""
+        provider = self._make_provider()
+
+        cause_req = Requirement('urllib3>=1.26')
+        cause = _RequirementInfo(requirement=cause_req, parent=None)
+
+        result = list(
+            provider.narrow_requirement_selection(
+                ['requests', 'urllib3', 'certifi'], {}, {}, {}, [cause]
+            )
+        )
+        # Only the cause identifier should be returned
+        self.assertEqual(['urllib3'], result)
+
+    def test_parent_name_also_collected(self):
+        """The parent Candidate's name is also treated as a backtrack cause."""
+        provider = self._make_provider()
+
+        parent = Candidate('requests', Version('2.28.0'))
+        cause_req = Requirement('urllib3>=1.26')
+        cause = _RequirementInfo(requirement=cause_req, parent=parent)
+
+        result = list(
+            provider.narrow_requirement_selection(
+                ['requests', 'urllib3', 'certifi'], {}, {}, {}, [cause]
+            )
+        )
+        # Both the requirement name and the parent name are causes
+        self.assertIn('urllib3', result)
+        self.assertIn('requests', result)
+        self.assertNotIn('certifi', result)
+
+    def test_conflict_count_increments(self):
+        """Unresolved conflict names increment _conflict_counts."""
+        provider = self._make_provider()
+
+        cause = _RequirementInfo(
+            requirement=Requirement('urllib3>=1.26'), parent=None
+        )
+        provider.narrow_requirement_selection(['urllib3'], {}, {}, {}, [cause])
+        self.assertEqual(1, provider._conflict_counts['urllib3'])
+
+    def test_resolved_name_not_incremented(self):
+        """Conflict counts are not incremented for already-resolved packages."""
+        provider = self._make_provider()
+
+        cause = _RequirementInfo(
+            requirement=Requirement('urllib3>=1.26'), parent=None
+        )
+        resolutions = {'urllib3': Candidate('urllib3', Version('1.26.0'))}
+        provider.narrow_requirement_selection(
+            ['urllib3'], resolutions, {}, {}, [cause]
+        )
+        self.assertEqual(0, provider._conflict_counts['urllib3'])
+
+    def test_promoted_after_threshold(self):
+        """A name is added to _conflict_promoted after _CONFLICT_PRIORITY_THRESHOLD conflicts."""
+        provider = self._make_provider()
+
+        cause = _RequirementInfo(
+            requirement=Requirement('urllib3>=1.26'), parent=None
+        )
+        for _ in range(_CONFLICT_PRIORITY_THRESHOLD):
+            provider.narrow_requirement_selection(
+                ['urllib3'], {}, {}, {}, [cause]
+            )
+
+        self.assertIn('urllib3', provider._conflict_promoted)
+
+    def test_promoted_returned_when_no_current_causes(self):
+        """Promoted identifiers are returned when there are no current backtrack causes."""
+        provider = self._make_provider()
+        provider._conflict_promoted.add('urllib3')
+
+        result = list(
+            provider.narrow_requirement_selection(
+                ['requests', 'urllib3', 'certifi'], {}, {}, {}, []
+            )
+        )
+        self.assertEqual(['urllib3'], result)
+
+    def test_current_causes_take_precedence_over_promoted(self):
+        """Current backtrack causes are returned ahead of promoted identifiers."""
+        provider = self._make_provider()
+        provider._conflict_promoted.add('urllib3')
+
+        cause = _RequirementInfo(
+            requirement=Requirement('certifi>=2017'), parent=None
+        )
+        result = list(
+            provider.narrow_requirement_selection(
+                ['requests', 'urllib3', 'certifi'], {}, {}, {}, [cause]
+            )
+        )
+        # Current cause wins over promoted
+        self.assertEqual(['certifi'], result)
+
+
+class TestFindMatchesPrerelease(TestCase):
+    """Tests for pip-aligned prerelease handling in find_matches."""
+
+    def _make_provider_with_packages(self, versions):
+        """Helper: creates a provider whose finder returns packages at given versions."""
+        session = MagicMock()
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, ['https://pypi.org/simple/'])
+
+            packages = []
+            for v in versions:
+                pkg = MagicMock()
+                pkg.version = v
+                packages.append(pkg)
+
+            mock_finder.find_matches.return_value = packages
+            return provider
+
+    def test_prerelease_excluded_by_default(self):
+        """Pre-release versions are excluded when no specifier explicitly allows them."""
+        provider = self._make_provider_with_packages(
+            ['2.28.0', '2.29.0a1', '2.27.0']
+        )
+        result = provider.find_matches(
+            'requests', {'requests': [Requirement('requests>=2.0.0')]}, {}
+        )
+        versions = [str(c.version) for c in result]
+        self.assertIn('2.28.0', versions)
+        self.assertIn('2.27.0', versions)
+        self.assertNotIn('2.29.0a1', versions)
+
+    def test_prerelease_included_when_specifier_allows(self):
+        """Pre-release versions are included when a specifier references a pre-release."""
+        provider = self._make_provider_with_packages(
+            ['2.28.0', '2.29.0a1', '2.27.0']
+        )
+        # Specifier explicitly references a pre-release → prereleases=True
+        result = provider.find_matches(
+            'requests', {'requests': [Requirement('requests>=2.29.0a1')]}, {}
+        )
+        versions = [str(c.version) for c in result]
+        self.assertIn('2.29.0a1', versions)
+
+    def test_stable_versions_always_included(self):
+        """Non-pre-release versions are always included regardless of the flag."""
+        provider = self._make_provider_with_packages(['2.28.0', '2.27.0'])
+        result = provider.find_matches(
+            'requests', {'requests': [Requirement('requests>=2.27.0')]}, {}
+        )
+        versions = [str(c.version) for c in result]
+        self.assertIn('2.28.0', versions)
+        self.assertIn('2.27.0', versions)
+
+
+class TestGetDependenciesPackageFastPath(TestCase):
+    """Tests for the get_dependencies fast path that uses candidate.package."""
+
+    def test_uses_candidate_package_skips_find_best_match(self):
+        """get_dependencies uses candidate.package directly, avoiding find_best_match."""
+        session = MagicMock()
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, ['https://pypi.org/simple/'])
+
+            # Set up a package object as if carried from find_matches
+            mock_package = MagicMock()
+            mock_dist_info_link = MagicMock()
+            mock_dist_info_link.url = 'https://pypi.org/metadata/requests'
+            mock_package.link.dist_info_link = mock_dist_info_link
+
+            mock_response = MagicMock()
+            mock_response.text = '''Metadata-Version: 2.1
+Name: requests
+Version: 2.28.0
+Requires-Dist: urllib3>=1.21.1
+'''
+            session.get.return_value = mock_response
+
+            # Candidate WITH package set — this is the fast path
+            candidate = Candidate(
+                'requests', Version('2.28.0'), package=mock_package
+            )
+            result = provider.get_dependencies(candidate)
+
+            # find_best_match must NOT have been called
+            mock_finder.find_best_match.assert_not_called()
+            # The dependency was still resolved correctly
+            self.assertEqual(1, len(result))
+            self.assertIn('urllib3', str(result[0]))
+
+    def test_falls_back_to_find_best_match_when_no_package(self):
+        """get_dependencies falls back to find_best_match when candidate.package is None."""
+        session = MagicMock()
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder_class.return_value = mock_finder
+
+            provider = PyPIProvider(session, ['https://pypi.org/simple/'])
+
+            mock_package = MagicMock()
+            mock_dist_info_link = MagicMock()
+            mock_dist_info_link.url = 'https://pypi.org/metadata/requests'
+            mock_package.link.dist_info_link = mock_dist_info_link
+
+            mock_result = MagicMock()
+            mock_result.best = mock_package
+            mock_finder.find_best_match.return_value = mock_result
+
+            mock_response = MagicMock()
+            mock_response.text = '''Metadata-Version: 2.1
+Name: requests
+Version: 2.28.0
+Requires-Dist: urllib3>=1.21.1
+'''
+            session.get.return_value = mock_response
+
+            # Candidate WITHOUT package set — fallback path
+            candidate = Candidate('requests', Version('2.28.0'))
+            result = provider.get_dependencies(candidate)
+
+            mock_finder.find_best_match.assert_called_once_with(
+                'requests==2.28.0'
+            )
+            self.assertEqual(1, len(result))
+
+
+class TestResolverUserRequested(TestCase):
+    """Tests for user_requested wiring in Resolver.resolve."""
+
+    def test_user_requested_passed_to_provider(self):
+        """Resolver.resolve builds a user_requested dict and passes it to PyPIProvider."""
+        with patch('proviso.resolver.CachingClient'):
+            with patch('proviso.resolver.MultiDomainBasicAuth'):
+                resolver = Resolver()
+
+                mock_result = MagicMock()
+                mock_result.mapping = {}
+
+                with patch(
+                    'proviso.resolver.ResolveLibResolver'
+                ) as mock_resolver_class:
+                    mock_resolver_instance = MagicMock()
+                    mock_resolver_instance.resolve.return_value = mock_result
+                    mock_resolver_class.return_value = mock_resolver_instance
+
+                    with patch(
+                        'proviso.resolver.PyPIProvider'
+                    ) as mock_provider_class:
+                        requirements = [
+                            Requirement('requests>=2.0.0'),
+                            Requirement('urllib3>=1.26.0'),
+                        ]
+                        resolver.resolve(requirements)
+
+                        call_kwargs = mock_provider_class.call_args[1]
+                        user_requested = call_kwargs['user_requested']
+
+                        # Both top-level packages should be present with correct order
+                        self.assertIn('requests', user_requested)
+                        self.assertIn('urllib3', user_requested)
+                        self.assertEqual(0, user_requested['requests'])
+                        self.assertEqual(1, user_requested['urllib3'])
