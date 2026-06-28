@@ -17,9 +17,15 @@ from .utils import CachingClient, format_python_version_for_markers
 
 log = getLogger('proviso.resolver')
 
-# Mirrors pip's _CONFLICT_PRIORITY_THRESHOLD: after this many rounds where a
-# package appears unresolved in a conflict, it gets promoted so its constraints
-# take effect before other packages pick a version.
+# The following constant and the narrow_requirement_selection / get_preference
+# methods on PyPIProvider are ported from pip's PipProvider implementation:
+#   pip 26.1.2  (ported 2026-06-27)
+#   pip/_internal/resolution/resolvelib/provider.py
+# When upgrading pip, diff that file against these sections to pick up any
+# improvements pip has made to its resolution heuristics.
+
+# Ported from pip: pip/_internal/resolution/resolvelib/provider.py
+# _CONFLICT_PRIORITY_THRESHOLD
 _CONFLICT_PRIORITY_THRESHOLD = 5
 
 
@@ -105,6 +111,8 @@ class PyPIProvider(AbstractProvider):
             return canonicalize_name(requirement_or_candidate.name)
         return requirement_or_candidate.name
 
+    # Ported from pip: pip/_internal/resolution/resolvelib/provider.py
+    # PipProvider.narrow_requirement_selection
     def narrow_requirement_selection(
         self,
         identifiers,
@@ -157,6 +165,8 @@ class PyPIProvider(AbstractProvider):
 
         return identifiers
 
+    # Ported from pip: pip/_internal/resolution/resolvelib/provider.py
+    # PipProvider.get_preference
     def get_preference(
         self, identifier, resolutions, candidates, information, backtrack_causes
     ):
