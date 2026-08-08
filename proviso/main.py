@@ -258,8 +258,8 @@ def main():  # pragma: no cover
     parser.add_argument(
         '--cooldown-days',
         type=int,
-        default=0,
-        help='Exclude packages uploaded within this many days (dependency cooldown). Default: 0 (disabled).',
+        default=7,
+        help='Exclude packages uploaded within this many days (dependency cooldown). Default: 7. Use 0 to disable.',
     )
 
     args = parser.parse_args()
