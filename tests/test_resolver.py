@@ -12,6 +12,8 @@ from proviso.resolver import (
     Candidate,
     PyPIProvider,
     Resolver,
+    make_identifier,
+    split_identifier,
 )
 
 # Lightweight stand-in for resolvelib's RequirementInformation namedtuple.
@@ -1478,3 +1480,219 @@ class TestResolverUserRequested(TestCase):
                         self.assertIn('urllib3', user_requested)
                         self.assertEqual(0, user_requested['requests'])
                         self.assertEqual(1, user_requested['urllib3'])
+
+
+class TestExtras(TestCase):
+    """Tests for resolving requirements that request extras."""
+
+    # Requires-Dist metadata for the fake index used by _make_provider
+    METADATA = {
+        'hishel': (
+            'msgpack>=1.0',
+            'httpx>=0.28; extra == "httpx"',
+            'anysqlite>=0.0.5; extra == "async"',
+        ),
+        'httpx': ('anyio',),
+        'anyio': (),
+        'anysqlite': (),
+        'msgpack': (),
+        'app': ('hishel[httpx]', 'hishel>=1.0'),
+    }
+    VERSIONS = {
+        'hishel': ('1.0.0', '2.0.0'),
+        'httpx': ('0.28.1',),
+        'anyio': ('4.16.0',),
+        'anysqlite': ('0.0.5',),
+        'msgpack': ('1.2.4',),
+        'app': ('1.0.0',),
+    }
+
+    def _make_package(self, name, version):
+        package = MagicMock()
+        package.version = version
+        package.link.dist_info_link.url = f'https://pypi/{name}/{version}'
+        return package
+
+    def _make_provider(self):
+        session = MagicMock()
+
+        def get(url):
+            name = url.split('/')[-2]
+            lines = [
+                'Metadata-Version: 2.1',
+                f'Name: {name}',
+                f'Version: {url.split("/")[-1]}',
+            ]
+            lines.extend(f'Requires-Dist: {req}' for req in self.METADATA[name])
+            response = MagicMock()
+            response.text = '\n'.join(lines) + '\n'
+            return response
+
+        session.get.side_effect = get
+
+        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+            mock_finder = MagicMock()
+            mock_finder.find_matches.side_effect = lambda name: [
+                self._make_package(name, v) for v in self.VERSIONS[name]
+            ]
+            mock_finder_class.return_value = mock_finder
+            provider = PyPIProvider(
+                session, ['https://pypi.org/simple/'], python_version='3.13'
+            )
+        return provider
+
+    def test_make_identifier(self):
+        self.assertEqual('hishel', make_identifier('Hishel'))
+        self.assertEqual('hishel', make_identifier('hishel', frozenset()))
+        self.assertEqual(
+            'hishel[async,httpx]', make_identifier('Hishel', {'HTTPX', 'async'})
+        )
+
+    def test_split_identifier(self):
+        self.assertEqual(('hishel', frozenset()), split_identifier('hishel'))
+        self.assertEqual(
+            ('hishel', frozenset(['async', 'httpx'])),
+            split_identifier('hishel[async,httpx]'),
+        )
+
+    def test_candidate_canonicalizes_extras(self):
+        candidate = Candidate('pkg', Version('1.0'), extras=['Foo_Bar'])
+        self.assertEqual(frozenset(['foo-bar']), candidate.extras)
+
+    def test_identify_with_extras(self):
+        provider = self._make_provider()
+        self.assertEqual(
+            'hishel[httpx]', provider.identify(Requirement('Hishel[HTTPX]'))
+        )
+        self.assertEqual(
+            'hishel[httpx]',
+            provider.identify(
+                Candidate('hishel', Version('2.0.0'), extras={'httpx'})
+            ),
+        )
+
+    def test_find_matches_extras_identifier(self):
+        provider = self._make_provider()
+        result = provider.find_matches(
+            'hishel[httpx]',
+            {'hishel[httpx]': [Requirement('hishel[httpx]')]},
+            {},
+        )
+        self.assertEqual(
+            [
+                Candidate('hishel', Version('2.0.0'), extras={'httpx'}),
+                Candidate('hishel', Version('1.0.0'), extras={'httpx'}),
+            ],
+            result,
+        )
+
+    def test_find_matches_extras_honors_base_constraints(self):
+        provider = self._make_provider()
+        result = provider.find_matches(
+            'hishel[httpx]',
+            {
+                'hishel[httpx]': [Requirement('hishel[httpx]')],
+                'hishel': [Requirement('hishel<2')],
+            },
+            {},
+        )
+        self.assertEqual([Version('1.0.0')], [c.version for c in result])
+
+        result = provider.find_matches(
+            'hishel[httpx]',
+            {'hishel[httpx]': [Requirement('hishel[httpx]')]},
+            {'hishel': [Candidate('hishel', Version('2.0.0'))]},
+        )
+        self.assertEqual([Version('1.0.0')], [c.version for c in result])
+
+    def test_find_matches_cache_shared_with_base(self):
+        provider = self._make_provider()
+        provider.find_matches('hishel', {'hishel': [Requirement('hishel')]}, {})
+        provider.find_matches(
+            'hishel[httpx]',
+            {'hishel[httpx]': [Requirement('hishel[httpx]')]},
+            {},
+        )
+        provider.finder.find_matches.assert_called_once_with('hishel')
+
+    def test_get_dependencies_extras_candidate(self):
+        provider = self._make_provider()
+        package = self._make_package('hishel', '2.0.0')
+
+        base = Candidate('hishel', Version('2.0.0'), package=package)
+        self.assertEqual(
+            ['msgpack>=1.0'], [str(d) for d in provider.get_dependencies(base)]
+        )
+
+        extras = Candidate(
+            'hishel', Version('2.0.0'), extras={'httpx'}, package=package
+        )
+        # Pins the base package and adds only the extra's dependencies
+        self.assertEqual(
+            ['hishel==2.0.0', 'httpx>=0.28; extra == "httpx"'],
+            [str(d) for d in provider.get_dependencies(extras)],
+        )
+
+        # Metadata is fetched once for both candidates
+        provider.session.get.assert_called_once_with(
+            'https://pypi/hishel/2.0.0'
+        )
+
+    def test_narrow_requirement_selection_with_extras(self):
+        provider = self._make_provider()
+        parent = Candidate('app', Version('1.0.0'), extras={'cache'})
+        cause = _RequirementInfo(
+            requirement=Requirement('hishel[httpx]'), parent=parent
+        )
+        result = list(
+            provider.narrow_requirement_selection(
+                ['hishel', 'hishel[httpx]', 'app[cache]', 'msgpack'],
+                {},
+                {},
+                {},
+                [cause],
+            )
+        )
+        self.assertEqual(['hishel[httpx]', 'app[cache]'], result)
+
+    def test_resolve_with_extras(self):
+        provider = self._make_provider()
+        with patch('proviso.resolver.PyPIProvider', return_value=provider):
+            resolver = Resolver(session=MagicMock())
+            result = resolver.resolve([Requirement('app')])
+
+        self.assertEqual(
+            {
+                'app': {'version': '1.0.0', 'extras': []},
+                'hishel': {'version': '2.0.0', 'extras': ['httpx']},
+                'httpx': {'version': '0.28.1', 'extras': []},
+                'anyio': {'version': '4.16.0', 'extras': []},
+                'msgpack': {'version': '1.2.4', 'extras': []},
+            },
+            result,
+        )
+
+    def test_resolve_extras_follow_base_constraints(self):
+        provider = self._make_provider()
+        with patch('proviso.resolver.PyPIProvider', return_value=provider):
+            resolver = Resolver(session=MagicMock())
+            result = resolver.resolve(
+                [Requirement('hishel[httpx,async]'), Requirement('hishel<2')]
+            )
+
+        self.assertEqual(
+            {'version': '1.0.0', 'extras': ['async', 'httpx']}, result['hishel']
+        )
+        self.assertIn('anysqlite', result)
+        self.assertIn('httpx', result)
+
+    def test_resolve_user_requested_includes_base(self):
+        with patch('proviso.resolver.PyPIProvider') as mock_provider_class:
+            with patch('proviso.resolver.ResolveLibResolver'):
+                Resolver(session=MagicMock()).resolve(
+                    [Requirement('requests'), Requirement('hishel[httpx]')]
+                )
+        self.assertEqual(
+            {'requests': 0, 'hishel[httpx]': 1, 'hishel': 1},
+            mock_provider_class.call_args.kwargs['user_requested'],
+        )
