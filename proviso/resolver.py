@@ -29,6 +29,29 @@ log = getLogger('proviso.resolver')
 _CONFLICT_PRIORITY_THRESHOLD = 5
 
 
+def make_identifier(name, extras=None):
+    """Return the resolver identifier for a package name and extras.
+
+    A requirement with extras (``name[a,b]``) gets its own identifier, separate
+    from the plain package name, so the resolver tracks it as its own node.
+    Its candidates depend on the base package at the same version, which pulls
+    in the base dependencies and keeps the versions in sync.
+    """
+    name = canonicalize_name(name)
+    if not extras:
+        return name
+    extras = sorted(canonicalize_name(e) for e in extras)
+    return f'{name}[{",".join(extras)}]'
+
+
+def split_identifier(identifier):
+    """Split an identifier into its package name and a frozenset of extras."""
+    name, sep, extras = identifier.partition('[')
+    if not sep:
+        return name, frozenset()
+    return name, frozenset(extras.rstrip(']').split(','))
+
+
 class Candidate:
     """Represents a concrete package version."""
 
@@ -37,7 +60,7 @@ class Candidate:
     ):
         self.name = canonicalize_name(name)
         self.version = version
-        self.extras = extras or frozenset()
+        self.extras = frozenset(canonicalize_name(e) for e in extras or ())
         self._dependencies = dependencies
         # unearth package object carried from find_matches; avoids a redundant
         # find_best_match lookup in get_dependencies when present.
@@ -72,6 +95,7 @@ class PyPIProvider(AbstractProvider):
     ):
         self.session = session
         self._dependencies_cache = {}
+        self._requires_dist_cache = {}
         self._matches_cache = {}
         # Conflict-promotion state (mirrors pip's PipProvider)
         self._conflict_counts = defaultdict(int)
@@ -106,10 +130,10 @@ class PyPIProvider(AbstractProvider):
             self.environment = None
 
     def identify(self, requirement_or_candidate):
-        """Return the package name as the identifier."""
-        if isinstance(requirement_or_candidate, Requirement):
-            return canonicalize_name(requirement_or_candidate.name)
-        return requirement_or_candidate.name
+        """Return the identifier: the package name plus any extras."""
+        return make_identifier(
+            requirement_or_candidate.name, requirement_or_candidate.extras
+        )
 
     # Ported from pip: pip/_internal/resolution/resolvelib/provider.py
     # PipProvider.narrow_requirement_selection
@@ -132,11 +156,9 @@ class PyPIProvider(AbstractProvider):
         """
         backtrack_identifiers = set()
         for info in backtrack_causes:
-            names = [canonicalize_name(info.requirement.name)]
+            names = [self.identify(info.requirement)]
             if info.parent is not None:
-                names.append(
-                    info.parent.name
-                )  # Candidate.name is already canonical
+                names.append(self.identify(info.parent))
             for name in names:
                 backtrack_identifiers.add(name)
                 if name not in resolutions:
@@ -219,19 +241,27 @@ class PyPIProvider(AbstractProvider):
         if not reqs:
             return []
 
+        name, extras = split_identifier(identifier)
+        incompat_candidates = list(incompatibilities.get(identifier, []))
+        if extras:
+            # An extras candidate pins its base package to the same version,
+            # so honor the base package's constraints here too (as pip does).
+            reqs.extend(requirements.get(name, []))
+            incompat_candidates.extend(incompatibilities.get(name, []))
+
         # Fetch (and cache) all platform-compatible packages for this name.
         # The specifier/incompatibility filtering below is kept outside the cache
         # because `incompatibilities` changes on every backtracking round.
-        if identifier in self._matches_cache:
-            log.debug(f'Matches cache hit for {identifier}')
-            result = self._matches_cache[identifier]
+        if name in self._matches_cache:
+            log.debug(f'Matches cache hit for {name}')
+            result = self._matches_cache[name]
         else:
-            log.debug(f'Finding matches for {identifier}: {reqs[0]}')
-            # Query by name only so one cache entry covers all specifiers seen
-            # during resolution.  unearth returns a lazy LazySequence so we
-            # materialise it immediately before caching.
-            result = list(self.finder.find_matches(identifier))
-            self._matches_cache[identifier] = result
+            log.debug(f'Finding matches for {name}: {reqs[0]}')
+            # Query by name only so one cache entry covers all specifiers and
+            # extras seen during resolution.  unearth returns a lazy
+            # LazySequence so we materialise it immediately before caching.
+            result = list(self.finder.find_matches(name))
+            self._matches_cache[name] = result
 
         # Determine whether pre-releases are allowed: pip permits them only when
         # a specifier in the requirement set explicitly references pre-releases
@@ -239,9 +269,7 @@ class PyPIProvider(AbstractProvider):
         allow_prereleases = any(r.specifier.prereleases for r in reqs)
 
         # Collect incompatible versions for fast O(1) membership tests.
-        incompat_versions = {
-            c.version for c in incompatibilities.get(identifier, [])
-        }
+        incompat_versions = {c.version for c in incompat_candidates}
 
         # Build the filtered, sorted candidate list.
         candidates = []
@@ -262,7 +290,9 @@ class PyPIProvider(AbstractProvider):
 
             # Carry the unearth package object so get_dependencies can use it
             # directly without a redundant find_best_match lookup.
-            candidates.append(Candidate(identifier, version, package=package))
+            candidates.append(
+                Candidate(name, version, extras=extras, package=package)
+            )
 
         # Return candidates sorted by version (newest first)
         log.debug(f'Found {len(candidates)} candidates for {identifier}')
@@ -274,19 +304,15 @@ class PyPIProvider(AbstractProvider):
             return False
         return candidate.version in requirement.specifier
 
-    def get_dependencies(self, candidate):
-        """Get dependencies for a candidate."""
-        cache_key = (candidate.name, candidate.version, candidate.extras)
+    def _get_requires_dist(self, candidate):
+        """Return the Requires-Dist entries for a candidate's name and version.
 
-        if cache_key in self._dependencies_cache:
-            log.debug(
-                f'Dependencies cache hit for {candidate.name}=={candidate.version} extras={candidate.extras}'
-            )
-            return self._dependencies_cache[cache_key]
-
-        log.debug(
-            f'Getting dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
-        )
+        The result is cached by name and version, so a package and its extras
+        candidates share a single metadata fetch.
+        """
+        cache_key = (candidate.name, candidate.version)
+        if cache_key in self._requires_dist_cache:
+            return self._requires_dist_cache[cache_key]
 
         # Use the unearth package object carried from find_matches to avoid a
         # redundant index lookup.  Fall back to find_best_match for candidates
@@ -301,7 +327,7 @@ class PyPIProvider(AbstractProvider):
                 log.warning(
                     f'No matching package found for {candidate.name}=={candidate.version}'
                 )
-                self._dependencies_cache[cache_key] = []
+                self._requires_dist_cache[cache_key] = []
                 return []
 
             package = result.best
@@ -316,31 +342,54 @@ class PyPIProvider(AbstractProvider):
 
             # Disable validation to handle metadata version mismatches
             metadata = Metadata.from_email(response.text, validate=False)
+            requires_dist = list(metadata.requires_dist or [])
         else:
             # Fallback: no metadata available
-            self._dependencies_cache[cache_key] = []
-            return []
+            requires_dist = []
 
-        # Extract dependencies from metadata
+        self._requires_dist_cache[cache_key] = requires_dist
+        return requires_dist
+
+    def get_dependencies(self, candidate):
+        """Get dependencies for a candidate.
+
+        A candidate without extras returns the dependencies that apply to the
+        target environment.  A candidate with extras returns a pin on its base
+        package at the same version plus the dependencies that only its extras
+        add; the base dependencies come in through the base package.
+        """
+        cache_key = (candidate.name, candidate.version, candidate.extras)
+
+        if cache_key in self._dependencies_cache:
+            log.debug(
+                f'Dependencies cache hit for {candidate.name}=={candidate.version} extras={candidate.extras}'
+            )
+            return self._dependencies_cache[cache_key]
+
+        log.debug(
+            f'Getting dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
+        )
+
+        # Prepare environment for marker evaluation.  Use the custom
+        # environment if set, otherwise the default.  extra is set to an empty
+        # string to handle markers that reference it.
+        base_env = (self.environment or default_environment()).copy()
+        base_env['extra'] = ''
+
         dependencies = []
-        for req in metadata.requires_dist or []:
-            if req.marker is None:
-                # No marker means always included
-                dependencies.append(req)
+        if candidate.extras:
+            dependencies.append(
+                Requirement(f'{candidate.name}=={candidate.version}')
+            )
+
+        for req in self._get_requires_dist(candidate):
+            if req.marker is None or req.marker.evaluate(environment=base_env):
+                # Applies without any extra, so it belongs to the base package
+                if not candidate.extras:
+                    dependencies.append(req)
                 continue
 
-            # Prepare environment for evaluation
-            # Use custom environment if set, otherwise default
-            base_env = (self.environment or default_environment()).copy()
-
-            # Check if requirement is valid for base environment (no extra)
-            # We explicitly set extra to empty string to handle markers that might reference it
-            base_env['extra'] = ''
-            if req.marker.evaluate(environment=base_env):
-                dependencies.append(req)
-                continue
-
-            # If not matched yet, check against requested extras
+            # Not a base dependency, check against requested extras
             for extra in candidate.extras:
                 env = base_env.copy()
                 env['extra'] = extra
@@ -349,7 +398,7 @@ class PyPIProvider(AbstractProvider):
                     break
 
         log.debug(
-            f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version}'
+            f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
         self._dependencies_cache[cache_key] = dependencies
         return dependencies
@@ -396,9 +445,11 @@ class Resolver:
         """
         # Record the user-specified ordering so get_preference can prioritise
         # top-level requirements (mirrors pip's _user_requested).
-        user_requested = {
-            canonicalize_name(r.name): i for i, r in enumerate(requirements)
-        }
+        user_requested = {}
+        for i, r in enumerate(requirements):
+            user_requested.setdefault(make_identifier(r.name, r.extras), i)
+            # Requested extras also imply the base package
+            user_requested.setdefault(make_identifier(r.name), i)
 
         provider = PyPIProvider(
             session=self._session,
@@ -413,12 +464,18 @@ class Resolver:
         # Resolve
         result = resolver.resolve(requirements, max_rounds=1000)
 
-        # Convert result to our format
+        # Convert result to our format, folding extras candidates into their
+        # base package.  An extras candidate pins its base package to the same
+        # version, so the versions always agree.
         resolved = {}
-        for identifier, candidate in result.mapping.items():
-            resolved[identifier] = {
-                'version': str(candidate.version),
-                'extras': list(candidate.extras),
-            }
+        for candidate in result.mapping.values():
+            info = resolved.setdefault(
+                candidate.name,
+                {'version': str(candidate.version), 'extras': set()},
+            )
+            info['extras'].update(candidate.extras)
+
+        for info in resolved.values():
+            info['extras'] = sorted(info['extras'])
 
         return resolved
