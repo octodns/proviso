@@ -2,11 +2,61 @@
 #
 #
 
+import sqlite3
+from logging import getLogger
+from pathlib import Path
+
 import httpx
-from hishel import SyncSqliteStorage
-from hishel.httpx import SyncCacheTransport
+from hishel import SqliteStorage
+from hishel.httpx import CacheTransport
 from packaging.version import Version
 from unearth.fetchers import DEFAULT_SECURE_ORIGINS
+
+log = getLogger(__name__)
+
+# The columns of a hishel 1.x cache's `entries` table. hishel 2.x refuses to
+# open such a database.
+HISHEL_V1_ENTRIES_COLUMNS = {
+    'id',
+    'cache_key',
+    'data',
+    'created_at',
+    'deleted_at',
+}
+
+
+def _resolve_cache_db_path(cache_db_path):
+    """Return the file hishel's SqliteStorage uses for database_path.
+
+    hishel puts a bare filename under ``.cache/hishel/`` in the current
+    directory and uses any other path as given.
+    """
+    path = Path(cache_db_path)
+    if path.parent == Path('.'):
+        return Path('.cache/hishel') / path.name
+    return path
+
+
+def _drop_hishel_v1_cache(cache_db_path):
+    """Drop hishel 1.x cache tables so that hishel 2.x can use the database."""
+    path = _resolve_cache_db_path(cache_db_path)
+    if not path.is_file():
+        return
+    connection = sqlite3.connect(str(path))
+    try:
+        columns = {
+            row[1] for row in connection.execute('PRAGMA table_info(entries)')
+        }
+        if columns != HISHEL_V1_ENTRIES_COLUMNS:
+            return
+        log.warning(
+            'clearing incompatible hishel 1.x HTTP cache in %s', str(path)
+        )
+        with connection:
+            connection.execute('DROP TABLE IF EXISTS streams')
+            connection.execute('DROP TABLE IF EXISTS entries')
+    finally:
+        connection.close()
 
 
 class CachingClient(httpx.Client):
@@ -21,15 +71,21 @@ class CachingClient(httpx.Client):
             *args: Passed to httpx.Client
             **kwargs: Passed to httpx.Client
         """
-        # Create storage based on whether persistent caching is requested
         if cache_db_path:
-            storage = SyncSqliteStorage(database_path=cache_db_path)
+            _drop_hishel_v1_cache(cache_db_path)
+            storage = SqliteStorage(database_path=cache_db_path)
         else:
-            storage = None  # hishel will use in-memory storage
+            storage = SqliteStorage(
+                connection=sqlite3.connect(
+                    ':memory:', check_same_thread=False, isolation_level=None
+                )
+            )
 
-        # Create cache transport wrapping the default HTTP transport
-        transport = SyncCacheTransport(
-            next_transport=httpx.HTTPTransport(), storage=storage
+        # Follow HTTP caching headers (RFC 9111). Without rfc=True, hishel
+        # caches every response until the storage TTL expires, and there's
+        # no TTL by default, so new PyPI releases would never show up.
+        transport = CacheTransport(
+            next_transport=httpx.HTTPTransport(), storage=storage, rfc=True
         )
         # Initialize parent with cache transport
         super().__init__(*args, transport=transport, **kwargs)
