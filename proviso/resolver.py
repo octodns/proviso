@@ -363,7 +363,7 @@ class Resolver:
 
         Args:
             index_urls: List of package index URLs. Defaults to PyPI.
-            session: Optional httpx.Client for making requests. If None, creates a new CachingClient.
+            session: Optional httpx2.Client for making requests. If None, creates a new CachingClient.
         """
         if index_urls is None:
             index_urls = ['https://pypi.org/simple/']

@@ -271,9 +271,9 @@ def main():  # pragma: no cover
         datefmt='%Y-%m-%dT%H:%M:%S',
     )
 
-    # Suppress verbose httpx logging unless we're in DEBUG mode
+    # Suppress verbose httpx2 logging unless we're in DEBUG mode
     if args.level != 'DEBUG':
-        getLogger('httpx').setLevel(WARNING)
+        getLogger('httpx2').setLevel(WARNING)
 
     # Determine cache database path
     # Priority: command line arg > environment variable > None (in-memory)

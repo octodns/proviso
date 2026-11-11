@@ -2,7 +2,7 @@ from datetime import date
 from unittest import TestCase
 from unittest.mock import MagicMock, PropertyMock, patch
 
-import httpx
+import httpx2
 
 from proviso.python import Python
 
@@ -61,7 +61,7 @@ class TestPython(TestCase):
         mock_response = MagicMock()
         mock_response.json.return_value = self.sample_releases
 
-        with patch('httpx.Client') as mock_client_class:
+        with patch('httpx2.Client') as mock_client_class:
             mock_client = MagicMock()
             mock_client.get.return_value = mock_response
             mock_client_class.return_value = mock_client
@@ -84,7 +84,7 @@ class TestPython(TestCase):
         mock_response = MagicMock()
         mock_response.json.return_value = self.sample_releases
 
-        with patch('httpx.Client') as mock_client_class:
+        with patch('httpx2.Client') as mock_client_class:
             mock_client = MagicMock()
             mock_client.get.return_value = mock_response
             mock_client_class.return_value = mock_client
@@ -106,18 +106,18 @@ class TestPython(TestCase):
     def test_releases_raises_on_http_error(self):
         """Test that releases raises exception on HTTP error."""
         mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        mock_response.raise_for_status.side_effect = httpx2.HTTPStatusError(
             'Error', request=MagicMock(), response=MagicMock()
         )
 
-        with patch('httpx.Client') as mock_client_class:
+        with patch('httpx2.Client') as mock_client_class:
             mock_client = MagicMock()
             mock_client.get.return_value = mock_response
             mock_client_class.return_value = mock_client
 
             python_obj = Python()
 
-            with self.assertRaises(httpx.HTTPStatusError):
+            with self.assertRaises(httpx2.HTTPStatusError):
                 python_obj.releases
 
     def test_active_filters_by_date(self):

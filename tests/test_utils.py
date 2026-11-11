@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 
-import httpx
+import httpx2
 from unearth.fetchers import DEFAULT_SECURE_ORIGINS
 
 from proviso.utils import (
@@ -18,7 +18,7 @@ from proviso.utils import (
 URL = 'https://pypi.org/pypi/example/json'
 
 
-class RecordingTransport(httpx.MockTransport):
+class RecordingTransport(httpx2.MockTransport):
     """MockTransport that counts the requests that reach it."""
 
     def __init__(self, headers):
@@ -26,7 +26,7 @@ class RecordingTransport(httpx.MockTransport):
 
         def handler(request):
             self.calls += 1
-            return httpx.Response(200, headers=headers, json={'n': self.calls})
+            return httpx2.Response(200, headers=headers, json={'n': self.calls})
 
         super().__init__(handler)
 
