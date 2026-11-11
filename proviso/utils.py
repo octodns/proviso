@@ -6,9 +6,9 @@ import sqlite3
 from logging import getLogger
 from pathlib import Path
 
-import httpx
+import httpx2
 from hishel import SqliteStorage
-from hishel.httpx import CacheTransport
+from hishel.httpx2 import CacheTransport
 from packaging.version import Version
 from unearth.fetchers import DEFAULT_SECURE_ORIGINS
 
@@ -59,8 +59,8 @@ def _drop_hishel_v1_cache(cache_db_path):
         connection.close()
 
 
-class CachingClient(httpx.Client):
-    """httpx.Client wrapper that implements the Fetcher protocol for unearth with caching."""
+class CachingClient(httpx2.Client):
+    """httpx2.Client wrapper that implements the Fetcher protocol for unearth with caching."""
 
     def __init__(self, *args, cache_db_path=None, **kwargs):
         """Initialize CachingClient with optional persistent caching.
@@ -68,8 +68,8 @@ class CachingClient(httpx.Client):
         Args:
             cache_db_path: Optional path to SQLite database for persistent caching.
                           If None, uses in-memory caching (default).
-            *args: Passed to httpx.Client
-            **kwargs: Passed to httpx.Client
+            *args: Passed to httpx2.Client
+            **kwargs: Passed to httpx2.Client
         """
         if cache_db_path:
             _drop_hishel_v1_cache(cache_db_path)
@@ -85,7 +85,7 @@ class CachingClient(httpx.Client):
         # caches every response until the storage TTL expires, and there's
         # no TTL by default, so new PyPI releases would never show up.
         transport = CacheTransport(
-            next_transport=httpx.HTTPTransport(), storage=storage, rfc=True
+            next_transport=httpx2.HTTPTransport(), storage=storage, rfc=True
         )
         # Initialize parent with cache transport
         super().__init__(*args, transport=transport, **kwargs)

@@ -896,11 +896,11 @@ Requires-Dist: urllib3>=1.26.0; python_version >= "3.10"
             mock_response.status_code = 404
             mock_response.text = 'Not Found'
 
-            import httpx
+            import httpx2
 
             def raise_for_status():
                 if 400 <= mock_response.status_code < 600:
-                    raise httpx.HTTPStatusError(
+                    raise httpx2.HTTPStatusError(
                         message="Client Error",
                         request=MagicMock(),
                         response=mock_response,
@@ -911,7 +911,7 @@ Requires-Dist: urllib3>=1.26.0; python_version >= "3.10"
 
             candidate = Candidate('requests', Version('2.28.0'))
 
-            with self.assertRaises(httpx.HTTPStatusError):
+            with self.assertRaises(httpx2.HTTPStatusError):
                 provider.get_dependencies(candidate)
 
 

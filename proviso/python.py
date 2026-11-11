@@ -1,7 +1,7 @@
 from datetime import date
 from functools import cached_property
 
-import httpx
+import httpx2
 
 
 class Python:
@@ -13,10 +13,10 @@ class Python:
         """Initialize Python release fetcher.
 
         Args:
-            session: Optional httpx.Client for making requests. If None, creates a new client.
+            session: Optional httpx2.Client for making requests. If None, creates a new client.
         """
         if session is None:
-            session = httpx.Client()
+            session = httpx2.Client()
         self.session = session
 
     @cached_property
