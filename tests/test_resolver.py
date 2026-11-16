@@ -1706,7 +1706,9 @@ class TestRootRequirementMarkers(TestCase):
         with patch('proviso.resolver.ResolveLibResolver') as rl:
             rl.return_value.resolve.return_value = mock_result
             with patch('proviso.resolver.PyPIProvider') as provider:
-                result = resolver.resolve(self.REQS, **kwargs)
+                with patch('proviso.resolver.default_environment') as de:
+                    de.return_value = {'sys_platform': 'linux'}
+                    result = resolver.resolve(self.REQS, **kwargs)
         return result, rl, provider
 
     def test_resolve_passes_filtered_requirements(self):
