@@ -1,19 +1,28 @@
 import math
+import tarfile
 from collections import namedtuple
 from datetime import datetime, timezone
 from functools import partial
+from io import BytesIO
 from os.path import join
+from pathlib import Path
+from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
+from zipfile import ZipFile
 
+from build import BuildBackendException
+from packaging.metadata import Metadata
 from packaging.requirements import Requirement
 from packaging.version import Version
-from unearth import PackageFinder
+from unearth import Link, PackageFinder
+from unearth.errors import UnpackError
 
 from proviso.resolver import (
     _CONFLICT_PRIORITY_THRESHOLD,
     Candidate,
+    MetadataUnavailableError,
     PyPIProvider,
     Resolver,
     make_identifier,
@@ -721,7 +730,7 @@ Requires-Dist: pytest>=7.0.0; extra == "test"
             self.assertIn('urllib3', str(result[0]))
 
     def test_get_dependencies_no_dist_info_link(self):
-        """Test get_dependencies when no dist_info_link is available."""
+        """Without a dist_info_link the metadata comes from the file."""
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
@@ -742,9 +751,18 @@ Requires-Dist: pytest>=7.0.0; extra == "test"
 
             candidate = Candidate('test-package', Version('1.0.0'))
 
-            result = provider.get_dependencies(candidate)
+            with patch.object(
+                provider,
+                '_download_metadata',
+                return_value=Metadata.from_raw(
+                    {'requires_dist': ['six']}, validate=False
+                ),
+            ) as mock_download:
+                result = provider.get_dependencies(candidate)
 
-            self.assertEqual([], result)
+            mock_download.assert_called_once_with(candidate, mock_link)
+            self.assertEqual([Requirement('six')], result)
+            session.get.assert_not_called()
 
     def test_get_dependencies_with_marker_default_environment(self):
         """Test get_dependencies with marker evaluation in default environment."""
@@ -1480,7 +1498,11 @@ class TestPrereleaseWithRealFinder(TestCase):
         self.addCleanup(self._tmp.cleanup)
         for version in self.VERSIONS:
             filename = f'foo-{version}-py3-none-any.whl'
-            open(join(self._tmp.name, filename), 'wb').close()
+            with ZipFile(join(self._tmp.name, filename), 'w') as zf:
+                zf.writestr(
+                    f'foo-{version}.dist-info/METADATA',
+                    f'Metadata-Version: 2.1\nName: foo\nVersion: {version}\n',
+                )
         finder = partial(PackageFinder, find_links=[self._tmp.name])
         patcher = patch('proviso.resolver.PackageFinder', finder)
         patcher.start()
@@ -1850,3 +1872,198 @@ class TestExtras(TestCase):
             {'requests': 0, 'hishel[httpx]': 1, 'hishel': 1},
             mock_provider_class.call_args.kwargs['user_requested'],
         )
+
+
+class TestFileMetadata(TestCase):
+    """Metadata read from a downloaded file when the index serves none.
+
+    Files are local file:// links, so unearth's real download_and_unpack
+    runs without touching the network.  The build backend is mocked.
+    """
+
+    METADATA = '''Metadata-Version: {version}
+Name: foo
+Version: 1.0
+{extra}Requires-Dist: six
+Requires-Dist: pytest; extra == "test"
+'''
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        patcher = patch('proviso.resolver.build_sdist_metadata')
+        self.mock_build = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mock_build.return_value = Metadata.from_raw(
+            {'requires_dist': ['built-dep']}, validate=False
+        )
+
+    def _metadata(self, version='2.2', extra=''):
+        return self.METADATA.format(version=version, extra=extra)
+
+    def _wheel(self, metadata=None, contents=None):
+        path = self.dir / 'foo-1.0-py3-none-any.whl'
+        if contents is not None:
+            path.write_bytes(contents)
+            return path
+        with ZipFile(path, 'w') as zf:
+            zf.writestr('foo/__init__.py', '')
+            if metadata is not None:
+                zf.writestr('foo-1.0.dist-info/METADATA', metadata)
+        return path
+
+    def _sdist(self, pkg_info=None):
+        path = self.dir / 'foo-1.0.tar.gz'
+        files = {'foo-1.0/setup.py': b''}
+        if pkg_info is not None:
+            files['foo-1.0/PKG-INFO'] = pkg_info.encode()
+        with tarfile.open(path, 'w:gz') as tf:
+            for name, data in files.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, BytesIO(data))
+        return path
+
+    def _provider(self):
+        return PyPIProvider(None, [], python_version='3.12')
+
+    def _candidate(self, path):
+        package = MagicMock()
+        package.link = Link.from_path(path)
+        return Candidate('foo', Version('1.0'), package=package)
+
+    def _dependencies(self, path, provider=None):
+        provider = provider or self._provider()
+        return provider.get_dependencies(self._candidate(path))
+
+    def test_wheel(self):
+        path = self._wheel(self._metadata(version='2.1'))
+        self.assertEqual([Requirement('six')], self._dependencies(path))
+        self.mock_build.assert_not_called()
+
+    def test_wheel_without_metadata(self):
+        path = self._wheel()
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path)
+        self.assertIn('foo==1.0', str(ctx.exception))
+        self.assertIn('no METADATA', str(ctx.exception))
+        self.assertEqual('foo', ctx.exception.name)
+        self.assertEqual(Version('1.0'), ctx.exception.version)
+
+    def test_wheel_unreadable(self):
+        path = self._wheel(contents=b'not a zip file')
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path)
+        self.assertIn('foo==1.0', str(ctx.exception))
+        self.assertIn('reading foo-1.0-py3-none-any.whl', str(ctx.exception))
+
+    def test_sdist_reliable_pkg_info(self):
+        path = self._sdist(self._metadata(version='2.2'))
+        self.assertEqual([Requirement('six')], self._dependencies(path))
+        self.mock_build.assert_not_called()
+
+    def test_sdist_old_pkg_info_builds(self):
+        path = self._sdist(self._metadata(version='2.1'))
+        self.assertEqual([Requirement('built-dep')], self._dependencies(path))
+        self.mock_build.assert_called_once()
+        # The build gets the unpacked sdist, which is cleaned up afterwards
+        source_dir = self.mock_build.call_args[0][0]
+        self.assertEqual('unpacked', source_dir.name)
+        self.assertFalse(source_dir.exists())
+
+    def test_sdist_dynamic_requires_dist_builds(self):
+        # Dynamic is compared case-insensitively
+        path = self._sdist(
+            self._metadata(version='2.4', extra='Dynamic: requires-dist\n')
+        )
+        self.assertEqual([Requirement('built-dep')], self._dependencies(path))
+        self.mock_build.assert_called_once()
+
+    def test_sdist_other_dynamic_field_uses_pkg_info(self):
+        path = self._sdist(
+            self._metadata(version='2.2', extra='Dynamic: Classifier\n')
+        )
+        self.assertEqual([Requirement('six')], self._dependencies(path))
+        self.mock_build.assert_not_called()
+
+    def test_sdist_without_pkg_info_builds(self):
+        path = self._sdist()
+        self.assertEqual([Requirement('built-dep')], self._dependencies(path))
+        self.mock_build.assert_called_once()
+
+    def test_sdist_build_failure(self):
+        error = CalledProcessError(
+            1, ['python'], output=b'backend stdout', stderr=b'backend stderr'
+        )
+        self.mock_build.side_effect = BuildBackendException(
+            error, 'Backend subprocess exited'
+        )
+        path = self._sdist()
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path)
+        message = str(ctx.exception)
+        self.assertIn('foo==1.0', message)
+        self.assertIn('building foo-1.0.tar.gz failed', message)
+        self.assertIn('Backend subprocess exited', message)
+        self.assertIn('backend stdout', message)
+        self.assertIn('backend stderr', message)
+
+    def test_download_failure(self):
+        provider = self._provider()
+        candidate = self._candidate(self.dir / 'foo-1.0.tar.gz')
+        with patch.object(
+            provider.finder,
+            'download_and_unpack',
+            side_effect=UnpackError('Download failed: 404'),
+        ):
+            with self.assertRaises(MetadataUnavailableError) as ctx:
+                provider.get_dependencies(candidate)
+        message = str(ctx.exception)
+        self.assertIn('foo==1.0', message)
+        self.assertIn('Download failed: 404', message)
+        self.mock_build.assert_not_called()
+
+    def test_second_call_does_not_download_or_build_again(self):
+        path = self._sdist()
+        provider = self._provider()
+        with patch.object(
+            PackageFinder,
+            'download_and_unpack',
+            autospec=True,
+            side_effect=PackageFinder.download_and_unpack,
+        ) as mock_download:
+            # The base candidate and an extras candidate share one fetch
+            first = self._dependencies(path, provider)
+            extras = Candidate(
+                'foo', Version('1.0'), extras={'test'}, package=MagicMock()
+            )
+            provider.get_dependencies(extras)
+        self.assertEqual([Requirement('built-dep')], first)
+        mock_download.assert_called_once()
+        self.mock_build.assert_called_once()
+
+    def test_each_provider_downloads_and_builds(self):
+        # Requirements can vary by target Python, so nothing is shared
+        path = self._sdist()
+        self._dependencies(path, self._provider())
+        self._dependencies(path, self._provider())
+        self.assertEqual(2, self.mock_build.call_count)
+
+    def test_dist_info_link_does_not_download(self):
+        session = MagicMock()
+        session.get.return_value.text = self._metadata()
+        provider = PyPIProvider(session, [], python_version='3.12')
+        package = MagicMock()
+        package.link = Link(
+            'https://files.example/foo-1.0.tar.gz', dist_info_metadata=True
+        )
+        candidate = Candidate('foo', Version('1.0'), package=package)
+        with patch.object(provider.finder, 'download_and_unpack') as mock_dl:
+            result = provider.get_dependencies(candidate)
+        self.assertEqual([Requirement('six')], result)
+        session.get.assert_called_once_with(
+            'https://files.example/foo-1.0.tar.gz.metadata'
+        )
+        mock_dl.assert_not_called()
+        self.mock_build.assert_not_called()

@@ -2,6 +2,8 @@ import math
 from collections import defaultdict
 from logging import getLogger
 from operator import attrgetter
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from packaging.markers import default_environment
 from packaging.metadata import Metadata
@@ -13,6 +15,12 @@ from resolvelib import Resolver as ResolveLibResolver
 from unearth import PackageFinder, TargetPython
 from unearth.auth import MultiDomainBasicAuth
 
+from .builder import (
+    build_failure_reason,
+    build_sdist_metadata,
+    sdist_pkg_info_metadata,
+    wheel_metadata,
+)
 from .utils import CachingClient, format_python_version_for_markers
 
 log = getLogger('proviso.resolver')
@@ -80,6 +88,17 @@ class Candidate:
 
     def __hash__(self):
         return hash((self.name, self.version, self.extras))
+
+
+class MetadataUnavailableError(Exception):
+    """A package version's metadata, and so its dependencies, is unavailable."""
+
+    def __init__(self, name, version, reason):
+        self.name = name
+        self.version = version
+        super().__init__(
+            f'Unable to get the metadata for {name}=={version}: {reason}'
+        )
 
 
 class PyPIProvider(AbstractProvider):
@@ -365,11 +384,62 @@ class PyPIProvider(AbstractProvider):
             metadata = Metadata.from_email(response.text, validate=False)
             requires_dist = list(metadata.requires_dist or [])
         else:
-            # Fallback: no metadata available
-            requires_dist = []
+            # No metadata from the index, e.g. for sdists, so get it from the
+            # file itself as pip does.  It's cached per provider, so per
+            # target Python, because an sdist's requirements can vary by it.
+            metadata = self._download_metadata(candidate, package.link)
+            requires_dist = list(metadata.requires_dist or [])
 
         self._requires_dist_cache[cache_key] = requires_dist
         return requires_dist
+
+    def _download_metadata(self, candidate, link):
+        """Download a candidate's file and return its Metadata.
+
+        Wheels carry it in .dist-info/METADATA.  Sdists carry it in PKG-INFO,
+        which is used when PEP 643 says it's reliable; otherwise the sdist's
+        build backend is asked for it.
+        """
+        name, version = candidate.name, candidate.version
+        log.info(f'Downloading {link.filename} for {name}=={version} metadata')
+        with TemporaryDirectory() as tmpdir:
+            location = Path(tmpdir) / 'unpacked'
+            location.mkdir()
+            try:
+                path = self.finder.download_and_unpack(
+                    link, location, download_dir=Path(tmpdir) / 'download'
+                )
+            except Exception as e:
+                raise MetadataUnavailableError(
+                    name, version, f'downloading {link.redacted} failed: {e}'
+                ) from e
+
+            try:
+                if link.is_wheel:
+                    metadata = wheel_metadata(path)
+                else:
+                    metadata = sdist_pkg_info_metadata(path)
+            except Exception as e:
+                raise MetadataUnavailableError(
+                    name, version, f'reading {link.filename} failed: {e}'
+                ) from e
+
+            if metadata is not None:
+                return metadata
+            if link.is_wheel:
+                raise MetadataUnavailableError(
+                    name, version, f'no METADATA in {link.filename}'
+                )
+
+            log.info(f'Building {name}=={version} to get its metadata')
+            try:
+                return build_sdist_metadata(path)
+            except Exception as e:
+                raise MetadataUnavailableError(
+                    name,
+                    version,
+                    f'building {link.filename} failed: {build_failure_reason(e)}',
+                ) from e
 
     def get_dependencies(self, candidate):
         """Get dependencies for a candidate.
