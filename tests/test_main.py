@@ -12,7 +12,6 @@ from proviso.main import (
     build_project_metadata,
     find_requirements,
     format_and_print_metadata,
-    get_requirements_with_extras,
     parse_and_validate_args,
     write_requirements_to_file,
 )
@@ -94,66 +93,6 @@ class TestFormatAndPrintMetadata(TestCase):
             self.assertIn('1.0.0', log_msg)
             self.assertIn('dev, test', log_msg)
             self.assertIn('3.9, 3.10, 3.11', log_msg)
-
-
-class TestGetRequirementsWithExtras(TestCase):
-    def test_no_requirements(self):
-        """Test with metadata that has no requirements."""
-        mock_metadata = MagicMock()
-        mock_metadata.requires_dist = None
-
-        result = get_requirements_with_extras(mock_metadata, [])
-
-        self.assertEqual([], result)
-
-    def test_base_requirements_only(self):
-        """Test with only base requirements (no markers)."""
-        req1 = Requirement('requests>=2.0.0')
-        req2 = Requirement('urllib3>=1.26.0')
-
-        mock_metadata = MagicMock()
-        mock_metadata.requires_dist = [req1, req2]
-
-        result = get_requirements_with_extras(mock_metadata, [])
-
-        self.assertEqual([req1, req2], result)
-
-    def test_requirements_with_extras(self):
-        """Test with requirements that have extra markers."""
-        req1 = Requirement('requests>=2.0.0')
-        req2 = Requirement('pytest>=7.0.0; extra == "dev"')
-        req3 = Requirement('black>=22.0.0; extra == "dev"')
-        req4 = Requirement('sphinx>=4.0.0; extra == "docs"')
-
-        mock_metadata = MagicMock()
-        mock_metadata.requires_dist = [req1, req2, req3, req4]
-
-        # Request dev extra
-        result = get_requirements_with_extras(mock_metadata, ['dev'])
-
-        # Should include base requirement and dev extras
-        self.assertEqual(3, len(result))
-        self.assertIn(req1, result)
-        self.assertIn(req2, result)
-        self.assertIn(req3, result)
-        self.assertNotIn(req4, result)
-
-    def test_multiple_extras(self):
-        """Test with multiple extras requested."""
-        req1 = Requirement('requests>=2.0.0')
-        req2 = Requirement('pytest>=7.0.0; extra == "dev"')
-        req3 = Requirement('sphinx>=4.0.0; extra == "docs"')
-
-        mock_metadata = MagicMock()
-        mock_metadata.requires_dist = [req1, req2, req3]
-
-        result = get_requirements_with_extras(mock_metadata, ['dev', 'docs'])
-
-        # Should include all requirements
-        self.assertEqual(3, len(result))
-        self.assertIn(req1, result)
-        self.assertIn(req2, result)
-        self.assertIn(req3, result)
 
 
 class TestFindRequirements(TestCase):
@@ -253,6 +192,19 @@ class TestFindRequirements(TestCase):
                 self.assertEqual(
                     expected,
                     mock_resolver.resolve.call_args.kwargs['allow_prereleases'],
+                )
+
+    def test_find_requirements_passes_extras(self):
+        """extras defaults to empty and is passed to the resolver."""
+        requirements = [Requirement('requests>=2.0.0')]
+        for kwargs, expected in (({}, ()), ({'extras': ['dev']}, ['dev'])):
+            with patch('proviso.main.Resolver') as mock_resolver_class:
+                mock_resolver = mock_resolver_class.return_value
+                mock_resolver.resolve.return_value = {}
+                with patch('proviso.main.log'):
+                    find_requirements(requirements, ['3.9'], **kwargs)
+                self.assertEqual(
+                    expected, mock_resolver.resolve.call_args.kwargs['extras']
                 )
 
 
