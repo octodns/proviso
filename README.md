@@ -51,6 +51,12 @@ Generate requirements for specific Python versions:
 proviso --python-versions 3.10,3.11,3.12
 ```
 
+Each version stands for a series of Python releases. `3.12` covers every 3.12
+release, `3` covers every 3.x release, and `3.12.5` covers only that release.
+A dependency is pinned when any release in the series needs it, for example
+because of a `python_full_version` marker or a `Requires-Python` that needs a
+later patch release.
+
 Include specific extras (e.g., dev dependencies):
 
 ```bash

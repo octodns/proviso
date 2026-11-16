@@ -10,10 +10,11 @@ from packaging.utils import canonicalize_name
 from packaging.version import Version
 from resolvelib import AbstractProvider, BaseReporter
 from resolvelib import Resolver as ResolveLibResolver
-from unearth import PackageFinder, TargetPython
+from unearth import TargetPython
 from unearth.auth import MultiDomainBasicAuth
 
-from .utils import CachingClient, format_python_version_for_markers
+from .series import PythonSeries, SeriesPackageFinder
+from .utils import CachingClient
 
 log = getLogger('proviso.resolver')
 
@@ -52,16 +53,17 @@ def split_identifier(identifier):
     return name, frozenset(extras.rstrip(']').split(','))
 
 
-def marker_environment(python_version=None):
-    """Return the environment used to evaluate markers for a target Python.
+def marker_applies(marker, environment, series=None, extra=''):
+    """Return whether a marker applies to a target Python series and extra.
 
-    Without a python_version this is the environment of the running
-    interpreter.
+    environment supplies the values that don't depend on the target Python,
+    such as the platform. With a series the marker applies when it's true for
+    any release in it. Without one the marker is evaluated against
+    environment as is, which is the running interpreter's.
     """
-    environment = default_environment()
-    if python_version:
-        environment.update(format_python_version_for_markers(python_version))
-    return environment
+    if series is None:
+        return marker.evaluate(dict(environment, extra=extra))
+    return series.marker_applies(marker, environment, extra)
 
 
 def filter_requirements(requirements, python_version=None, extras=()):
@@ -71,14 +73,18 @@ def filter_requirements(requirements, python_version=None, extras=()):
     extra selected, or its marker is true with any one of the extras selected.
     Order is preserved and each requirement appears at most once.
     """
-    base_env = marker_environment(python_version)
-    envs = [dict(base_env, extra='')]
-    envs.extend(dict(base_env, extra=extra) for extra in extras)
+    environment = default_environment()
+    series = PythonSeries(python_version) if python_version else None
+    extras = ('', *extras)
 
     return [
         r
         for r in requirements
-        if r.marker is None or any(r.marker.evaluate(env) for env in envs)
+        if r.marker is None
+        or any(
+            marker_applies(r.marker, environment, series, extra)
+            for extra in extras
+        )
     ]
 
 
@@ -137,22 +143,22 @@ class PyPIProvider(AbstractProvider):
         # Ordering of user-specified top-level requirements (name → index)
         self._user_requested = user_requested or {}
 
-        # Create TargetPython if a specific version is requested
+        # The target Python series, None means the running interpreter
+        self.series = PythonSeries(python_version) if python_version else None
+
+        # Create TargetPython if a specific version is requested.  It selects
+        # wheel tags; Requires-Python is checked against the whole series by
+        # SeriesPackageFinder.
         target_python = None
-        if python_version:
-            target_python = TargetPython(py_ver=Version(python_version).release)
+        if self.series:
+            target_python = TargetPython(py_ver=self.series.release)
 
         # Create PackageFinder with the target Python version and optional date filter
-        self.finder = PackageFinder(
+        self.finder = SeriesPackageFinder(
             session=session,
             index_urls=index_urls,
             target_python=target_python,
             exclude_newer_than=exclude_newer_than,
-        )
-
-        # Build environment for marker evaluation, None means the current one
-        self.environment = (
-            marker_environment(python_version) if python_version else None
         )
 
     def identify(self, requirement_or_candidate):
@@ -413,11 +419,9 @@ class PyPIProvider(AbstractProvider):
             f'Getting dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
 
-        # Prepare environment for marker evaluation.  Use the custom
-        # environment if set, otherwise the default.  extra is set to an empty
-        # string to handle markers that reference it.
-        base_env = (self.environment or default_environment()).copy()
-        base_env['extra'] = ''
+        # Markers are evaluated for the target series on top of the running
+        # interpreter's environment
+        environment = default_environment()
 
         dependencies = []
         if candidate.extras:
@@ -426,7 +430,9 @@ class PyPIProvider(AbstractProvider):
             )
 
         for req in self._get_requires_dist(candidate):
-            if req.marker is None or req.marker.evaluate(environment=base_env):
+            if req.marker is None or marker_applies(
+                req.marker, environment, self.series
+            ):
                 # Applies without any extra, so it belongs to the base package
                 if not candidate.extras:
                     dependencies.append(req)
@@ -434,9 +440,7 @@ class PyPIProvider(AbstractProvider):
 
             # Not a base dependency, check against requested extras
             for extra in candidate.extras:
-                env = base_env.copy()
-                env['extra'] = extra
-                if req.marker.evaluate(environment=env):
+                if marker_applies(req.marker, environment, self.series, extra):
                     dependencies.append(req)
                     break
 
@@ -480,8 +484,11 @@ class Resolver:
 
         Args:
             requirements: List of packaging.requirements.Requirement objects
-            python_version: Target Python version string (e.g., "3.9", "3.10.5").
-                          Defaults to current Python version.
+            python_version: Target Python version string. "3.12" stands for
+                          every 3.12 release, "3" for every 3.x.y release and
+                          "3.12.5" for exactly that release. A dependency is
+                          included when any release in the series needs it.
+                          Defaults to the running Python.
             exclude_newer_than: Optional datetime to exclude packages uploaded after
                           this date (for dependency cooldowns).
             allow_prereleases: Consider pre-release versions for every package.

@@ -12,7 +12,6 @@ from proviso.utils import (
     CachingClient,
     _drop_hishel_v1_cache,
     _resolve_cache_db_path,
-    format_python_version_for_markers,
 )
 
 URL = 'https://pypi.org/pypi/example/json'
@@ -63,44 +62,6 @@ def table_columns(path, table):
         }
     finally:
         connection.close()
-
-
-class TestFormatPythonVersionForMarkers(TestCase):
-    def test_major_minor_version(self):
-        """Test formatting with major.minor version."""
-        result = format_python_version_for_markers('3.9')
-        self.assertEqual('3.9', result['python_version'])
-        self.assertEqual('3.9.0', result['python_full_version'])
-
-    def test_major_minor_patch_version(self):
-        """Test formatting with major.minor.patch version."""
-        result = format_python_version_for_markers('3.10.5')
-        self.assertEqual('3.10', result['python_version'])
-        self.assertEqual('3.10.5', result['python_full_version'])
-
-    def test_full_version_string(self):
-        """Test formatting with full version string."""
-        result = format_python_version_for_markers('3.11.0')
-        self.assertEqual('3.11', result['python_version'])
-        self.assertEqual('3.11.0', result['python_full_version'])
-
-    def test_different_major_versions(self):
-        """Test formatting with different major versions."""
-        # Python 2.7 (for completeness, though not supported)
-        result = format_python_version_for_markers('2.7')
-        self.assertEqual('2.7', result['python_version'])
-        self.assertEqual('2.7.0', result['python_full_version'])
-
-        # Python 3.12
-        result = format_python_version_for_markers('3.12')
-        self.assertEqual('3.12', result['python_version'])
-        self.assertEqual('3.12.0', result['python_full_version'])
-
-    def test_version_with_higher_patch(self):
-        """Test formatting with higher patch numbers."""
-        result = format_python_version_for_markers('3.9.18')
-        self.assertEqual('3.9', result['python_version'])
-        self.assertEqual('3.9.18', result['python_full_version'])
 
 
 class TestCachingClient(TestCase):

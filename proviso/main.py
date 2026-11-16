@@ -11,6 +11,7 @@ from build import BuildBackendException
 from proviso.builder import Builder
 from proviso.python import Python
 from proviso.resolver import Resolver
+from proviso.series import PythonSeries
 from proviso.utils import CachingClient
 
 log = getLogger('proviso')
@@ -93,6 +94,7 @@ def write_requirements_to_file(
     versions, python_versions, filename, header=None
 ):
     """Write resolved requirements to file."""
+    series = {v: PythonSeries(v) for v in python_versions}
     with open(filename, 'w') as fh:  # Changed to 'w' mode for writing
         if header:
             fh.write(header)
@@ -100,12 +102,9 @@ def write_requirements_to_file(
                 fh.write('\n')
 
         fh.write('x-python-version-not-supported; ')
-        for i, python_version in enumerate(python_versions):
-            if i:
-                fh.write(' and ')
-            fh.write("python_version!='")
-            fh.write(python_version)
-            fh.write("'")
+        fh.write(
+            ' and '.join(series[v].guard_marker() for v in python_versions)
+        )
         fh.write('\n')
 
         for pkg, vers in sorted(versions.items()):
@@ -116,12 +115,9 @@ def write_requirements_to_file(
                 fh.write(ver)
                 if pythons != python_versions:
                     fh.write('; ')
-                    for i, python in enumerate(pythons):
-                        if i:
-                            fh.write(' or ')
-                        fh.write("python_version=='")
-                        fh.write(python)
-                        fh.write("'")
+                    fh.write(
+                        ' or '.join(series[p].match_marker() for p in pythons)
+                    )
                 fh.write('\n')
 
 

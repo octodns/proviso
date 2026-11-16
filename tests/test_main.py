@@ -596,3 +596,94 @@ class TestWriteRequirementsToFile(TestCase):
                 "package==1.1.0; python_version=='3.10' or python_version=='3.11'",
                 content,
             )
+
+    def _write(self, versions, python_versions):
+        with TemporaryDirectory() as tmpdir:
+            output_file = join(tmpdir, 'requirements.txt')
+            write_requirements_to_file(versions, python_versions, output_file)
+            with open(output_file) as fh:
+                return fh.read()
+
+    def _selected(self, content, full_version):
+        """Return the lines of content whose marker is true for a Python."""
+        env = {
+            'python_version': '.'.join(full_version.split('.')[:2]),
+            'python_full_version': full_version,
+        }
+        requirements = [Requirement(line) for line in content.splitlines()]
+        return [
+            f'{r.name}{r.specifier}'
+            for r in requirements
+            if r.marker is None or r.marker.evaluate(env)
+        ]
+
+    def test_write_patch_versions(self):
+        versions = {
+            'a': {'1.0': ['3.12.4', '3.12.5']},
+            'b': {'1.0': ['3.12.4'], '2.0': ['3.12.5']},
+        }
+        content = self._write(versions, ['3.12.4', '3.12.5'])
+        self.assertEqual(
+            "x-python-version-not-supported; python_full_version!='3.12.4' and python_full_version!='3.12.5'\n"
+            'a==1.0\n'
+            "b==1.0; python_full_version=='3.12.4'\n"
+            "b==2.0; python_full_version=='3.12.5'\n",
+            content,
+        )
+        self.assertEqual(
+            ['a==1.0', 'b==1.0'], self._selected(content, '3.12.4')
+        )
+        self.assertEqual(
+            ['a==1.0', 'b==2.0'], self._selected(content, '3.12.5')
+        )
+        self.assertEqual(
+            ['x-python-version-not-supported', 'a==1.0'],
+            self._selected(content, '3.12.6'),
+        )
+
+    def test_write_major_versions(self):
+        versions = {'a': {'1.0': ['2'], '2.0': ['3']}}
+        content = self._write(versions, ['2', '3'])
+        self.assertEqual(
+            "x-python-version-not-supported; (python_version<'2' or python_version>='3') and (python_version<'3' or python_version>='4')\n"
+            "a==1.0; python_version>='2' and python_version<'3'\n"
+            "a==2.0; python_version>='3' and python_version<'4'\n",
+            content,
+        )
+        self.assertEqual(['a==1.0'], self._selected(content, '2.7.18'))
+        self.assertEqual(['a==2.0'], self._selected(content, '3.0.0'))
+        self.assertEqual(['a==2.0'], self._selected(content, '3.14.1'))
+        self.assertEqual(
+            ['x-python-version-not-supported'], self._selected(content, '4.0.0')
+        )
+        self.assertEqual(
+            ['x-python-version-not-supported'], self._selected(content, '1.6.1')
+        )
+
+    def test_write_mixed_versions(self):
+        versions = {
+            'a': {'1.0': ['2', '3.12.5'], '2.0': ['3.11']},
+            'b': {'1.0': ['2', '3.11', '3.12.5']},
+        }
+        content = self._write(versions, ['2', '3.11', '3.12.5'])
+        self.assertEqual(
+            "x-python-version-not-supported; (python_version<'2' or python_version>='3') and python_version!='3.11' and python_full_version!='3.12.5'\n"
+            "a==1.0; python_version>='2' and python_version<'3' or python_full_version=='3.12.5'\n"
+            "a==2.0; python_version=='3.11'\n"
+            'b==1.0\n',
+            content,
+        )
+        self.assertEqual(
+            ['a==1.0', 'b==1.0'], self._selected(content, '2.7.18')
+        )
+        self.assertEqual(
+            ['a==2.0', 'b==1.0'], self._selected(content, '3.11.4')
+        )
+        self.assertEqual(
+            ['a==1.0', 'b==1.0'], self._selected(content, '3.12.5')
+        )
+        for full_version in ('3.12.4', '3.13.0', '1.6.1'):
+            self.assertEqual(
+                ['x-python-version-not-supported', 'b==1.0'],
+                self._selected(content, full_version),
+            )
