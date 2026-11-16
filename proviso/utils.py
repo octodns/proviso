@@ -9,7 +9,6 @@ from pathlib import Path
 import httpx2
 from hishel import SqliteStorage
 from hishel.httpx2 import CacheTransport
-from packaging.version import Version
 from unearth.fetchers import DEFAULT_SECURE_ORIGINS
 
 log = getLogger(__name__)
@@ -97,26 +96,3 @@ class CachingClient(httpx2.Client):
     def iter_secure_origins(self):
         """Required by Fetcher protocol."""
         yield from DEFAULT_SECURE_ORIGINS
-
-
-def format_python_version_for_markers(version_str):
-    """Format a Python version string for use in marker evaluation.
-
-    Args:
-        version_str: Version string like "3.9", "3.10.5", "3.11.0"
-
-    Returns:
-        Dict with 'python_version' and 'python_full_version' keys
-    """
-    v = Version(version_str)
-
-    # python_version is major.minor (e.g., "3.9")
-    python_version = f"{v.major}.{v.minor}"
-
-    # python_full_version includes patch
-    python_full_version = f"{v.major}.{v.minor}.{v.micro}"
-
-    return {
-        'python_version': python_version,
-        'python_full_version': python_full_version,
-    }

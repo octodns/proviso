@@ -12,7 +12,6 @@ from proviso.main import (
     build_project_metadata,
     find_requirements,
     format_and_print_metadata,
-    get_requirements_with_extras,
     parse_and_validate_args,
     write_requirements_to_file,
 )
@@ -94,66 +93,6 @@ class TestFormatAndPrintMetadata(TestCase):
             self.assertIn('1.0.0', log_msg)
             self.assertIn('dev, test', log_msg)
             self.assertIn('3.9, 3.10, 3.11', log_msg)
-
-
-class TestGetRequirementsWithExtras(TestCase):
-    def test_no_requirements(self):
-        """Test with metadata that has no requirements."""
-        mock_metadata = MagicMock()
-        mock_metadata.requires_dist = None
-
-        result = get_requirements_with_extras(mock_metadata, [])
-
-        self.assertEqual([], result)
-
-    def test_base_requirements_only(self):
-        """Test with only base requirements (no markers)."""
-        req1 = Requirement('requests>=2.0.0')
-        req2 = Requirement('urllib3>=1.26.0')
-
-        mock_metadata = MagicMock()
-        mock_metadata.requires_dist = [req1, req2]
-
-        result = get_requirements_with_extras(mock_metadata, [])
-
-        self.assertEqual([req1, req2], result)
-
-    def test_requirements_with_extras(self):
-        """Test with requirements that have extra markers."""
-        req1 = Requirement('requests>=2.0.0')
-        req2 = Requirement('pytest>=7.0.0; extra == "dev"')
-        req3 = Requirement('black>=22.0.0; extra == "dev"')
-        req4 = Requirement('sphinx>=4.0.0; extra == "docs"')
-
-        mock_metadata = MagicMock()
-        mock_metadata.requires_dist = [req1, req2, req3, req4]
-
-        # Request dev extra
-        result = get_requirements_with_extras(mock_metadata, ['dev'])
-
-        # Should include base requirement and dev extras
-        self.assertEqual(3, len(result))
-        self.assertIn(req1, result)
-        self.assertIn(req2, result)
-        self.assertIn(req3, result)
-        self.assertNotIn(req4, result)
-
-    def test_multiple_extras(self):
-        """Test with multiple extras requested."""
-        req1 = Requirement('requests>=2.0.0')
-        req2 = Requirement('pytest>=7.0.0; extra == "dev"')
-        req3 = Requirement('sphinx>=4.0.0; extra == "docs"')
-
-        mock_metadata = MagicMock()
-        mock_metadata.requires_dist = [req1, req2, req3]
-
-        result = get_requirements_with_extras(mock_metadata, ['dev', 'docs'])
-
-        # Should include all requirements
-        self.assertEqual(3, len(result))
-        self.assertIn(req1, result)
-        self.assertIn(req2, result)
-        self.assertIn(req3, result)
 
 
 class TestFindRequirements(TestCase):
@@ -253,6 +192,19 @@ class TestFindRequirements(TestCase):
                 self.assertEqual(
                     expected,
                     mock_resolver.resolve.call_args.kwargs['allow_prereleases'],
+                )
+
+    def test_find_requirements_passes_extras(self):
+        """extras defaults to empty and is passed to the resolver."""
+        requirements = [Requirement('requests>=2.0.0')]
+        for kwargs, expected in (({}, ()), ({'extras': ['dev']}, ['dev'])):
+            with patch('proviso.main.Resolver') as mock_resolver_class:
+                mock_resolver = mock_resolver_class.return_value
+                mock_resolver.resolve.return_value = {}
+                with patch('proviso.main.log'):
+                    find_requirements(requirements, ['3.9'], **kwargs)
+                self.assertEqual(
+                    expected, mock_resolver.resolve.call_args.kwargs['extras']
                 )
 
 
@@ -643,4 +595,95 @@ class TestWriteRequirementsToFile(TestCase):
             self.assertIn(
                 "package==1.1.0; python_version=='3.10' or python_version=='3.11'",
                 content,
+            )
+
+    def _write(self, versions, python_versions):
+        with TemporaryDirectory() as tmpdir:
+            output_file = join(tmpdir, 'requirements.txt')
+            write_requirements_to_file(versions, python_versions, output_file)
+            with open(output_file) as fh:
+                return fh.read()
+
+    def _selected(self, content, full_version):
+        """Return the lines of content whose marker is true for a Python."""
+        env = {
+            'python_version': '.'.join(full_version.split('.')[:2]),
+            'python_full_version': full_version,
+        }
+        requirements = [Requirement(line) for line in content.splitlines()]
+        return [
+            f'{r.name}{r.specifier}'
+            for r in requirements
+            if r.marker is None or r.marker.evaluate(env)
+        ]
+
+    def test_write_patch_versions(self):
+        versions = {
+            'a': {'1.0': ['3.12.4', '3.12.5']},
+            'b': {'1.0': ['3.12.4'], '2.0': ['3.12.5']},
+        }
+        content = self._write(versions, ['3.12.4', '3.12.5'])
+        self.assertEqual(
+            "x-python-version-not-supported; python_full_version!='3.12.4' and python_full_version!='3.12.5'\n"
+            'a==1.0\n'
+            "b==1.0; python_full_version=='3.12.4'\n"
+            "b==2.0; python_full_version=='3.12.5'\n",
+            content,
+        )
+        self.assertEqual(
+            ['a==1.0', 'b==1.0'], self._selected(content, '3.12.4')
+        )
+        self.assertEqual(
+            ['a==1.0', 'b==2.0'], self._selected(content, '3.12.5')
+        )
+        self.assertEqual(
+            ['x-python-version-not-supported', 'a==1.0'],
+            self._selected(content, '3.12.6'),
+        )
+
+    def test_write_major_versions(self):
+        versions = {'a': {'1.0': ['2'], '2.0': ['3']}}
+        content = self._write(versions, ['2', '3'])
+        self.assertEqual(
+            "x-python-version-not-supported; (python_version<'2' or python_version>='3') and (python_version<'3' or python_version>='4')\n"
+            "a==1.0; python_version>='2' and python_version<'3'\n"
+            "a==2.0; python_version>='3' and python_version<'4'\n",
+            content,
+        )
+        self.assertEqual(['a==1.0'], self._selected(content, '2.7.18'))
+        self.assertEqual(['a==2.0'], self._selected(content, '3.0.0'))
+        self.assertEqual(['a==2.0'], self._selected(content, '3.14.1'))
+        self.assertEqual(
+            ['x-python-version-not-supported'], self._selected(content, '4.0.0')
+        )
+        self.assertEqual(
+            ['x-python-version-not-supported'], self._selected(content, '1.6.1')
+        )
+
+    def test_write_mixed_versions(self):
+        versions = {
+            'a': {'1.0': ['2', '3.12.5'], '2.0': ['3.11']},
+            'b': {'1.0': ['2', '3.11', '3.12.5']},
+        }
+        content = self._write(versions, ['2', '3.11', '3.12.5'])
+        self.assertEqual(
+            "x-python-version-not-supported; (python_version<'2' or python_version>='3') and python_version!='3.11' and python_full_version!='3.12.5'\n"
+            "a==1.0; python_version>='2' and python_version<'3' or python_full_version=='3.12.5'\n"
+            "a==2.0; python_version=='3.11'\n"
+            'b==1.0\n',
+            content,
+        )
+        self.assertEqual(
+            ['a==1.0', 'b==1.0'], self._selected(content, '2.7.18')
+        )
+        self.assertEqual(
+            ['a==2.0', 'b==1.0'], self._selected(content, '3.11.4')
+        )
+        self.assertEqual(
+            ['a==1.0', 'b==1.0'], self._selected(content, '3.12.5')
+        )
+        for full_version in ('3.12.4', '3.13.0', '1.6.1'):
+            self.assertEqual(
+                ['x-python-version-not-supported', 'b==1.0'],
+                self._selected(content, full_version),
             )

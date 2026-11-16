@@ -11,6 +11,7 @@ from build import BuildBackendException
 from proviso.builder import Builder
 from proviso.python import Python
 from proviso.resolver import Resolver
+from proviso.series import PythonSeries
 from proviso.utils import CachingClient
 
 log = getLogger('proviso')
@@ -46,28 +47,13 @@ def format_and_print_metadata(metadata, extras, python_versions):
     )
 
 
-def get_requirements_with_extras(metadata, extras):
-    """Get requirements including extras."""
-    requires_dist = metadata.requires_dist or []
-
-    # base runtime direct requirements
-    requirements = [r for r in requires_dist if r.marker is None]
-    for extra in extras:
-        requirements.extend(
-            r
-            for r in requires_dist
-            if r.marker and r.marker.evaluate({'extra': extra})
-        )
-
-    return requirements
-
-
 def find_requirements(
     requirements,
     python_versions,
     session=None,
     exclude_newer_than=None,
     allow_prereleases=False,
+    extras=(),
 ):
 
     if not requirements:
@@ -90,6 +76,7 @@ def find_requirements(
             python_version=python_version,
             exclude_newer_than=exclude_newer_than,
             allow_prereleases=allow_prereleases,
+            extras=extras,
         )
 
         log.info(
@@ -107,6 +94,7 @@ def write_requirements_to_file(
     versions, python_versions, filename, header=None
 ):
     """Write resolved requirements to file."""
+    series = {v: PythonSeries(v) for v in python_versions}
     with open(filename, 'w') as fh:  # Changed to 'w' mode for writing
         if header:
             fh.write(header)
@@ -114,12 +102,9 @@ def write_requirements_to_file(
                 fh.write('\n')
 
         fh.write('x-python-version-not-supported; ')
-        for i, python_version in enumerate(python_versions):
-            if i:
-                fh.write(' and ')
-            fh.write("python_version!='")
-            fh.write(python_version)
-            fh.write("'")
+        fh.write(
+            ' and '.join(series[v].guard_marker() for v in python_versions)
+        )
         fh.write('\n')
 
         for pkg, vers in sorted(versions.items()):
@@ -130,12 +115,9 @@ def write_requirements_to_file(
                 fh.write(ver)
                 if pythons != python_versions:
                     fh.write('; ')
-                    for i, python in enumerate(pythons):
-                        if i:
-                            fh.write(' or ')
-                        fh.write("python_version=='")
-                        fh.write(python)
-                        fh.write("'")
+                    fh.write(
+                        ' or '.join(series[p].match_marker() for p in pythons)
+                    )
                 fh.write('\n')
 
 
@@ -306,7 +288,7 @@ def main():  # pragma: no cover
             metadata, parsed['extras'], parsed['python_versions']
         )
 
-        requirements = get_requirements_with_extras(metadata, parsed['extras'])
+        requirements = metadata.requires_dist or []
 
         # Calculate exclude_newer_than if cooldown is enabled
         exclude_newer_than = None
@@ -324,6 +306,7 @@ def main():  # pragma: no cover
             session=session,
             exclude_newer_than=exclude_newer_than,
             allow_prereleases=args.pre,
+            extras=parsed['extras'],
         )
 
         write_requirements_to_file(
