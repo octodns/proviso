@@ -92,8 +92,12 @@ class PyPIProvider(AbstractProvider):
         python_version=None,
         exclude_newer_than=None,
         user_requested=None,
+        allow_prereleases=False,
     ):
         self.session = session
+        # When True, pre-releases are candidates for every package (like pip's
+        # --pre).  When False, only for packages whose specifiers name one.
+        self.allow_prereleases = allow_prereleases
         self._dependencies_cache = {}
         self._requires_dist_cache = {}
         self._matches_cache = {}
@@ -263,10 +267,13 @@ class PyPIProvider(AbstractProvider):
             result = list(self.finder.find_matches(name))
             self._matches_cache[name] = result
 
-        # Determine whether pre-releases are allowed: pip permits them only when
-        # a specifier in the requirement set explicitly references pre-releases
-        # (e.g. ">=1.0a1").  SpecifierSet.prereleases returns True in that case.
-        allow_prereleases = any(r.specifier.prereleases for r in reqs)
+        # Determine whether pre-releases are allowed: always with --pre,
+        # otherwise only when a specifier in the requirement set explicitly
+        # references a pre-release (e.g. ">=1.0a1"), as pip does.
+        # SpecifierSet.prereleases returns True in that case.
+        allow_prereleases = self.allow_prereleases or any(
+            r.specifier.prereleases for r in reqs
+        )
 
         # Collect incompatible versions for fast O(1) membership tests.
         incompat_versions = {c.version for c in incompat_candidates}
@@ -280,8 +287,13 @@ class PyPIProvider(AbstractProvider):
             if version.is_prerelease and not allow_prereleases:
                 continue
 
-            # Check if this version satisfies all requirements.
-            if not all(version in r.specifier for r in reqs):
+            # Check if this version satisfies all requirements.  The
+            # pre-release decision was made above, so pass prereleases=True
+            # rather than relying on packaging's default, which changed in
+            # packaging 26 to accept pre-releases for specifiers like ">=1.0".
+            if not all(
+                r.specifier.contains(version, prereleases=True) for r in reqs
+            ):
                 continue
 
             # Skip versions that are known incompatible from prior backtracking.
@@ -302,7 +314,11 @@ class PyPIProvider(AbstractProvider):
         """Check if the candidate satisfies the requirement."""
         if canonicalize_name(requirement.name) != candidate.name:
             return False
-        return candidate.version in requirement.specifier
+        # Candidates only come from find_matches, which already applied the
+        # pre-release policy, so accept pre-releases here as pip does.
+        return requirement.specifier.contains(
+            candidate.version, prereleases=True
+        )
 
     def _get_requires_dist(self, candidate):
         """Return the Requires-Dist entries for a candidate's name and version.
@@ -426,7 +442,11 @@ class Resolver:
         self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
 
     def resolve(
-        self, requirements, python_version=None, exclude_newer_than=None
+        self,
+        requirements,
+        python_version=None,
+        exclude_newer_than=None,
+        allow_prereleases=False,
     ):
         """Resolve dependencies for the given requirements.
 
@@ -436,6 +456,9 @@ class Resolver:
                           Defaults to current Python version.
             exclude_newer_than: Optional datetime to exclude packages uploaded after
                           this date (for dependency cooldowns).
+            allow_prereleases: Consider pre-release versions for every package.
+                          By default pre-releases are only considered for a
+                          package whose specifier names one (e.g. ">=2.0b1").
 
         Returns:
             Dict mapping package names to metadata dicts with 'version' and 'extras'
@@ -457,6 +480,7 @@ class Resolver:
             python_version=python_version,
             exclude_newer_than=exclude_newer_than,
             user_requested=user_requested,
+            allow_prereleases=allow_prereleases,
         )
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)

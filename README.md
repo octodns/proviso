@@ -82,12 +82,19 @@ Or turn it off entirely to always take the newest releases:
 proviso --cooldown-days 0
 ```
 
+Pre-releases are skipped unless a requirement's specifier names one, such as
+`foo>=2.0b1`. To consider pre-releases for every package:
+
+```bash
+proviso --pre
+```
+
 #### Full command-line reference
 
 ```console
 usage: proviso [-h] [--directory DIRECTORY] [--extras EXTRAS] [--python-versions PYTHON_VERSIONS] [--filename FILENAME]
                [--level {DEBUG,ERROR,INFO,WARNING,debug,error,info,warning}] [--header HEADER] [--cache-db CACHE_DB]
-               [--cooldown-days COOLDOWN_DAYS]
+               [--cooldown-days COOLDOWN_DAYS] [--pre]
 
 Extract project requirements, resolve dependencies, and manage requirements.txt
 
@@ -111,6 +118,8 @@ options:
   --cooldown-days COOLDOWN_DAYS
                         Exclude packages uploaded within this many days (dependency cooldown). Default: 7. Use 0 to
                         disable.
+  --pre                 Include pre-release versions for all packages. By default, pre-releases are only used for a
+                        package whose specifier names one (e.g. "foo>=2.0b1").
 ```
 
 #### Features
@@ -118,6 +127,7 @@ options:
 - **Multi-version support**: Generates a single requirements.txt that works across multiple Python versions, using environment markers (e.g., `package==1.0.0; python_version=='3.10'`) when different versions are needed
 - **Complete dependency resolution**: Recursively resolves all transitive dependencies from PyPI
 - **Dependency cooldown**: Skips releases published within the last 7 days by default so brand-new releases don't get pinned immediately, configurable with `--cooldown-days` (`0` disables it)
+- **Stable releases by default**: Skips pre-releases unless a requirement asks for one or `--pre` is passed
 - **Automatic Python version detection**: Uses endoflife.date API to determine currently active Python versions
 - **Extras support**: Include optional dependency groups (dev, test, etc.) from your setup.py or pyproject.toml
 - **Flexible output**: Generate requirements files with custom names and locations

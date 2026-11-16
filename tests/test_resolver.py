@@ -1314,14 +1314,18 @@ class TestNarrowRequirementSelection(TestCase):
 class TestFindMatchesPrerelease(TestCase):
     """Tests for pip-aligned prerelease handling in find_matches."""
 
-    def _make_provider_with_packages(self, versions):
+    def _make_provider_with_packages(self, versions, allow_prereleases=False):
         """Helper: creates a provider whose finder returns packages at given versions."""
         session = MagicMock()
         with patch('proviso.resolver.PackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
-            provider = PyPIProvider(session, ['https://pypi.org/simple/'])
+            provider = PyPIProvider(
+                session,
+                ['https://pypi.org/simple/'],
+                allow_prereleases=allow_prereleases,
+            )
 
             packages = []
             for v in versions:
@@ -1366,6 +1370,92 @@ class TestFindMatchesPrerelease(TestCase):
         versions = [str(c.version) for c in result]
         self.assertIn('2.28.0', versions)
         self.assertIn('2.27.0', versions)
+
+    def test_prerelease_excluded_for_lower_bound(self):
+        """A newer pre-release isn't picked for a plain lower bound.
+
+        packaging 26 changed ``Version('10.0.0b3') in SpecifierSet('>=5.11.5')``
+        to return True, which led to pinning isort 10.0.0b3.  The default must
+        not depend on that.
+        """
+        provider = self._make_provider_with_packages(
+            ['10.0.0b3', '9.0.2', '5.11.5']
+        )
+        result = provider.find_matches(
+            'isort', {'isort': [Requirement('isort>=5.11.5')]}, {}
+        )
+        self.assertEqual(['9.0.2', '5.11.5'], [str(c.version) for c in result])
+
+    def test_prerelease_excluded_with_no_specifier(self):
+        """A bare requirement doesn't pick up pre-releases."""
+        provider = self._make_provider_with_packages(['2.0.0b1', '1.0.0'])
+        result = provider.find_matches('foo', {'foo': [Requirement('foo')]}, {})
+        self.assertEqual(['1.0.0'], [str(c.version) for c in result])
+
+    def test_prerelease_included_with_allow_prereleases(self):
+        """allow_prereleases (--pre) includes pre-releases for any specifier."""
+        provider = self._make_provider_with_packages(
+            ['10.0.0b3', '9.0.2'], allow_prereleases=True
+        )
+        result = provider.find_matches(
+            'isort', {'isort': [Requirement('isort>=5.11.5')]}, {}
+        )
+        self.assertEqual(
+            ['10.0.0b3', '9.0.2'], [str(c.version) for c in result]
+        )
+
+    def test_allow_prereleases_still_applies_specifiers(self):
+        """allow_prereleases doesn't bypass upper bounds."""
+        provider = self._make_provider_with_packages(
+            ['10.0.0b3', '9.1.0rc1', '9.0.2'], allow_prereleases=True
+        )
+        result = provider.find_matches(
+            'isort', {'isort': [Requirement('isort<10')]}, {}
+        )
+        self.assertEqual(
+            ['9.1.0rc1', '9.0.2'], [str(c.version) for c in result]
+        )
+
+    def test_prerelease_allowed_when_any_requirement_names_one(self):
+        """A pre-release specifier on one requirement allows pre-releases
+        that also satisfy the other requirements for the same package."""
+        provider = self._make_provider_with_packages(
+            ['2.1.0b1', '2.0.0', '1.0.0']
+        )
+        result = provider.find_matches(
+            'foo',
+            {'foo': [Requirement('foo>=1.0'), Requirement('foo>=2.1.0b1')]},
+            {},
+        )
+        self.assertEqual(['2.1.0b1'], [str(c.version) for c in result])
+
+    def test_is_satisfied_by_prerelease_candidate(self):
+        """is_satisfied_by accepts a pre-release candidate that matches the
+        specifier; the pre-release policy is applied in find_matches."""
+        provider = self._make_provider_with_packages([])
+        candidate = Candidate('foo', Version('2.1.0b1'))
+        self.assertTrue(
+            provider.is_satisfied_by(Requirement('foo>=1.0'), candidate)
+        )
+        self.assertFalse(
+            provider.is_satisfied_by(Requirement('foo<2'), candidate)
+        )
+
+    def test_resolve_passes_allow_prereleases_to_provider(self):
+        """Resolver.resolve threads allow_prereleases into the provider."""
+        resolver = Resolver(session=MagicMock())
+        for kwargs, expected in (
+            ({}, False),
+            ({'allow_prereleases': True}, True),
+        ):
+            with patch('proviso.resolver.PyPIProvider') as mock_provider:
+                with patch('proviso.resolver.ResolveLibResolver') as mock_rl:
+                    mock_rl.return_value.resolve.return_value.mapping = {}
+                    resolver.resolve([Requirement('foo')], **kwargs)
+                self.assertEqual(
+                    expected,
+                    mock_provider.call_args.kwargs['allow_prereleases'],
+                )
 
 
 class TestGetDependenciesPackageFastPath(TestCase):
