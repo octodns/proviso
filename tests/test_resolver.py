@@ -753,14 +753,12 @@ Requires-Dist: pytest>=7.0.0; extra == "test"
 
             with patch.object(
                 provider,
-                '_download_metadata',
-                return_value=Metadata.from_raw(
-                    {'requires_dist': ['six']}, validate=False
-                ),
-            ) as mock_download:
+                '_get_file_requires_dist',
+                return_value=[Requirement('six')],
+            ) as mock_file:
                 result = provider.get_dependencies(candidate)
 
-            mock_download.assert_called_once_with(candidate, mock_link)
+            mock_file.assert_called_once_with(candidate, mock_link)
             self.assertEqual([Requirement('six')], result)
             session.get.assert_not_called()
 
@@ -1925,8 +1923,10 @@ Requires-Dist: pytest; extra == "test"
                 tf.addfile(info, BytesIO(data))
         return path
 
-    def _provider(self):
-        return PyPIProvider(None, [], python_version='3.12')
+    def _provider(self, cache=None):
+        return PyPIProvider(
+            None, [], python_version='3.12', file_requires_dist_cache=cache
+        )
 
     def _candidate(self, path):
         package = MagicMock()
@@ -2043,12 +2043,55 @@ Requires-Dist: pytest; extra == "test"
         mock_download.assert_called_once()
         self.mock_build.assert_called_once()
 
-    def test_each_provider_downloads_and_builds(self):
-        # Requirements can vary by target Python, so nothing is shared
+    def test_shared_cache_downloads_and_builds_once(self):
         path = self._sdist()
-        self._dependencies(path, self._provider())
-        self._dependencies(path, self._provider())
-        self.assertEqual(2, self.mock_build.call_count)
+        cache = {}
+        providers = [self._provider(cache), self._provider(cache)]
+        with patch.object(
+            PackageFinder,
+            'download_and_unpack',
+            autospec=True,
+            side_effect=PackageFinder.download_and_unpack,
+        ) as mock_download:
+            for provider in providers:
+                self.assertEqual(
+                    [Requirement('built-dep')],
+                    self._dependencies(path, provider),
+                )
+        mock_download.assert_called_once()
+        self.mock_build.assert_called_once()
+        self.assertEqual(
+            {Link.from_path(path).url: [Requirement('built-dep')]}, cache
+        )
+
+    def test_build_logs_warning(self):
+        path = self._sdist()
+        with self.assertLogs('proviso.resolver', level='INFO') as logs:
+            self._dependencies(path)
+        warnings = [r for r in logs.records if r.levelname == 'WARNING']
+        self.assertEqual(1, len(warnings))
+        self.assertIn('foo==1.0', warnings[0].getMessage())
+        self.assertIn('every target Python', warnings[0].getMessage())
+
+    def test_pkg_info_does_not_log_warning(self):
+        path = self._sdist(self._metadata(version='2.2'))
+        with self.assertLogs('proviso.resolver', level='INFO') as logs:
+            self._dependencies(path)
+        self.assertEqual(['INFO'], sorted({r.levelname for r in logs.records}))
+
+    def test_resolver_shares_cache_with_providers(self):
+        resolver = Resolver(session=MagicMock())
+        with patch('proviso.resolver.ResolveLibResolver'):
+            with patch('proviso.resolver.PyPIProvider') as mock_provider:
+                resolver.resolve([Requirement('foo')], python_version='3.12')
+                resolver.resolve([Requirement('foo')], python_version='3.13')
+        caches = [
+            c.kwargs['file_requires_dist_cache']
+            for c in mock_provider.call_args_list
+        ]
+        self.assertEqual(2, len(caches))
+        self.assertIs(resolver._file_requires_dist_cache, caches[0])
+        self.assertIs(caches[0], caches[1])
 
     def test_dist_info_link_does_not_download(self):
         session = MagicMock()
@@ -2067,3 +2110,4 @@ Requires-Dist: pytest; extra == "test"
         )
         mock_dl.assert_not_called()
         self.mock_build.assert_not_called()
+        self.assertEqual({}, provider._file_requires_dist_cache)

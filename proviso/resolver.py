@@ -112,6 +112,7 @@ class PyPIProvider(AbstractProvider):
         exclude_newer_than=None,
         user_requested=None,
         allow_prereleases=False,
+        file_requires_dist_cache=None,
     ):
         self.session = session
         # When True, pre-releases are candidates for every package (like pip's
@@ -119,6 +120,12 @@ class PyPIProvider(AbstractProvider):
         self.allow_prereleases = allow_prereleases
         self._dependencies_cache = {}
         self._requires_dist_cache = {}
+        # Requires-Dist read from downloaded files, keyed by file URL.  The
+        # Resolver shares this across providers (one per target Python) so a
+        # file is downloaded, and an sdist built, at most once per run.
+        self._file_requires_dist_cache = (
+            {} if file_requires_dist_cache is None else file_requires_dist_cache
+        )
         self._matches_cache = {}
         # Conflict-promotion state (mirrors pip's PipProvider)
         self._conflict_counts = defaultdict(int)
@@ -385,13 +392,23 @@ class PyPIProvider(AbstractProvider):
             requires_dist = list(metadata.requires_dist or [])
         else:
             # No metadata from the index, e.g. for sdists, so get it from the
-            # file itself as pip does.  It's cached per provider, so per
-            # target Python, because an sdist's requirements can vary by it.
-            metadata = self._download_metadata(candidate, package.link)
-            requires_dist = list(metadata.requires_dist or [])
+            # file itself as pip does
+            requires_dist = self._get_file_requires_dist(
+                candidate, package.link
+            )
 
         self._requires_dist_cache[cache_key] = requires_dist
         return requires_dist
+
+    def _get_file_requires_dist(self, candidate, link):
+        """Return the Requires-Dist entries read from a candidate's file."""
+        url = link.url_without_fragment
+        if url not in self._file_requires_dist_cache:
+            metadata = self._download_metadata(candidate, link)
+            self._file_requires_dist_cache[url] = list(
+                metadata.requires_dist or []
+            )
+        return self._file_requires_dist_cache[url]
 
     def _download_metadata(self, candidate, link):
         """Download a candidate's file and return its Metadata.
@@ -433,13 +450,19 @@ class PyPIProvider(AbstractProvider):
 
             log.info(f'Building {name}=={version} to get its metadata')
             try:
-                return build_sdist_metadata(path)
+                metadata = build_sdist_metadata(path)
             except Exception as e:
                 raise MetadataUnavailableError(
                     name,
                     version,
                     f'building {link.filename} failed: {build_failure_reason(e)}',
                 ) from e
+            # See build_sdist_metadata and #53
+            log.warning(
+                f'Metadata for {name}=={version} was built under the Python '
+                'running proviso and is reused for every target Python version'
+            )
+            return metadata
 
     def get_dependencies(self, candidate):
         """Get dependencies for a candidate.
@@ -515,6 +538,8 @@ class Resolver:
             session = CachingClient()
         self._session = session
         self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
+        # Shared by every provider this resolver creates, see PyPIProvider
+        self._file_requires_dist_cache = {}
 
     def resolve(
         self,
@@ -556,6 +581,7 @@ class Resolver:
             exclude_newer_than=exclude_newer_than,
             user_requested=user_requested,
             allow_prereleases=allow_prereleases,
+            file_requires_dist_cache=self._file_requires_dist_cache,
         )
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)

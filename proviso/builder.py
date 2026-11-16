@@ -75,9 +75,10 @@ def build_sdist_metadata(source_dir):
     """Ask an unpacked sdist's build backend for its metadata.
 
     The backend runs in an isolated build environment, as pip does. Known
-    limitation: that environment uses the interpreter running proviso rather
-    than the target Python, so a backend that computes dependencies from the
-    running interpreter reports them for this one.
+    limitation (#53): that environment uses the interpreter running proviso
+    rather than the target Python, so a backend that computes dependencies
+    from the running interpreter reports them for this one, and the result is
+    reused for every target Python.
     """
     message = project_wheel_metadata(source_dir, isolated=True)
     # The message can't be reliably serialized back to text (multi-line
