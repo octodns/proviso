@@ -1,11 +1,15 @@
 import math
 from collections import namedtuple
 from datetime import datetime, timezone
+from functools import partial
+from os.path import join
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from packaging.requirements import Requirement
 from packaging.version import Version
+from unearth import PackageFinder
 
 from proviso.resolver import (
     _CONFLICT_PRIORITY_THRESHOLD,
@@ -542,7 +546,9 @@ class TestPyPIProvider(TestCase):
             )
 
             # Should be called with the bare identifier, not a specifier string
-            mock_finder.find_matches.assert_called_once_with('requests')
+            mock_finder.find_matches.assert_called_once_with(
+                'requests', allow_prereleases=True
+            )
 
     def test_find_matches_incompatibility_filtering_applied_per_call(self):
         """Test that incompatibility filtering is applied on each call, not cached,
@@ -1458,6 +1464,62 @@ class TestFindMatchesPrerelease(TestCase):
                 )
 
 
+class TestPrereleaseWithRealFinder(TestCase):
+    """Pre-release handling with a real unearth PackageFinder.
+
+    The finder reads a local find-links directory instead of being mocked, so
+    unearth's own filtering runs.  These tests catch unearth dropping
+    pre-releases before proviso's policy is applied, which happens with
+    packaging < 26 if the finder isn't asked for every version.
+    """
+
+    VERSIONS = ('0.1', '1.0', '2.0b1')
+
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        for version in self.VERSIONS:
+            filename = f'foo-{version}-py3-none-any.whl'
+            open(join(self._tmp.name, filename), 'wb').close()
+        finder = partial(PackageFinder, find_links=[self._tmp.name])
+        patcher = patch('proviso.resolver.PackageFinder', finder)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _versions(self, spec, allow_prereleases=False):
+        provider = PyPIProvider(
+            None, [], python_version='3.12', allow_prereleases=allow_prereleases
+        )
+        result = provider.find_matches('foo', {'foo': [Requirement(spec)]}, {})
+        return [str(c.version) for c in result]
+
+    def test_exact_prerelease_pin_without_pre(self):
+        """Pinning a pre-release with == selects it without --pre."""
+        self.assertEqual(['2.0b1'], self._versions('foo==2.0b1'))
+
+    def test_prerelease_lower_bound_without_pre(self):
+        """A lower bound that names a pre-release allows pre-releases."""
+        self.assertEqual(['2.0b1'], self._versions('foo>=2.0b1'))
+
+    def test_plain_specifier_skips_prerelease(self):
+        """A plain specifier skips pre-releases by default."""
+        self.assertEqual(['1.0'], self._versions('foo>=0.5'))
+
+    def test_plain_specifier_with_pre(self):
+        """--pre includes pre-releases for a plain specifier."""
+        self.assertEqual(
+            ['2.0b1', '1.0'], self._versions('foo>=0.5', allow_prereleases=True)
+        )
+
+    def test_resolve_exact_prerelease_pin_without_pre(self):
+        """Resolver.resolve pins a requested pre-release without --pre."""
+        resolver = Resolver(session=MagicMock())
+        result = resolver.resolve(
+            [Requirement('foo==2.0b1')], python_version='3.12'
+        )
+        self.assertEqual({'foo': {'version': '2.0b1', 'extras': []}}, result)
+
+
 class TestGetDependenciesPackageFastPath(TestCase):
     """Tests for the get_dependencies fast path that uses candidate.package."""
 
@@ -1622,7 +1684,7 @@ class TestExtras(TestCase):
 
         with patch('proviso.resolver.PackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
-            mock_finder.find_matches.side_effect = lambda name: [
+            mock_finder.find_matches.side_effect = lambda name, **kwargs: [
                 self._make_package(name, v) for v in self.VERSIONS[name]
             ]
             mock_finder_class.return_value = mock_finder
@@ -1703,7 +1765,9 @@ class TestExtras(TestCase):
             {'hishel[httpx]': [Requirement('hishel[httpx]')]},
             {},
         )
-        provider.finder.find_matches.assert_called_once_with('hishel')
+        provider.finder.find_matches.assert_called_once_with(
+            'hishel', allow_prereleases=True
+        )
 
     def test_get_dependencies_extras_candidate(self):
         provider = self._make_provider()

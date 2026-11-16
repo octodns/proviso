@@ -262,9 +262,14 @@ class PyPIProvider(AbstractProvider):
         else:
             log.debug(f'Finding matches for {name}: {reqs[0]}')
             # Query by name only so one cache entry covers all specifiers and
-            # extras seen during resolution.  unearth returns a lazy
-            # LazySequence so we materialise it immediately before caching.
-            result = list(self.finder.find_matches(name))
+            # extras seen during resolution.  Always ask for pre-releases and
+            # apply the pre-release policy below: with prereleases=None unearth
+            # defers to packaging's default, which differs between packaging
+            # 25 and 26.  unearth returns a lazy LazySequence so we materialise
+            # it immediately before caching.
+            result = list(
+                self.finder.find_matches(name, allow_prereleases=True)
+            )
             self._matches_cache[name] = result
 
         # Determine whether pre-releases are allowed: always with --pre,
