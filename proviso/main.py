@@ -63,7 +63,11 @@ def get_requirements_with_extras(metadata, extras):
 
 
 def find_requirements(
-    requirements, python_versions, session=None, exclude_newer_than=None
+    requirements,
+    python_versions,
+    session=None,
+    exclude_newer_than=None,
+    allow_prereleases=False,
 ):
 
     if not requirements:
@@ -85,6 +89,7 @@ def find_requirements(
             requirements,
             python_version=python_version,
             exclude_newer_than=exclude_newer_than,
+            allow_prereleases=allow_prereleases,
         )
 
         log.info(
@@ -261,6 +266,12 @@ def main():  # pragma: no cover
         default=7,
         help='Exclude packages uploaded within this many days (dependency cooldown). Default: 7. Use 0 to disable.',
     )
+    parser.add_argument(
+        '--pre',
+        action='store_true',
+        default=False,
+        help='Include pre-release versions for all packages. By default, pre-releases are only used for a package whose specifier names one (e.g. "foo>=2.0b1").',
+    )
 
     args = parser.parse_args()
 
@@ -312,6 +323,7 @@ def main():  # pragma: no cover
             python_versions=parsed['python_versions'],
             session=session,
             exclude_newer_than=exclude_newer_than,
+            allow_prereleases=args.pre,
         )
 
         write_requirements_to_file(

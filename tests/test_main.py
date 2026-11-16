@@ -238,6 +238,23 @@ class TestFindRequirements(TestCase):
                     exclude_newer_than, call_kwargs['exclude_newer_than']
                 )
 
+    def test_find_requirements_passes_allow_prereleases(self):
+        """allow_prereleases defaults to False and is passed to the resolver."""
+        requirements = [Requirement('requests>=2.0.0')]
+        for kwargs, expected in (
+            ({}, False),
+            ({'allow_prereleases': True}, True),
+        ):
+            with patch('proviso.main.Resolver') as mock_resolver_class:
+                mock_resolver = mock_resolver_class.return_value
+                mock_resolver.resolve.return_value = {}
+                with patch('proviso.main.log'):
+                    find_requirements(requirements, ['3.9'], **kwargs)
+                self.assertEqual(
+                    expected,
+                    mock_resolver.resolve.call_args.kwargs['allow_prereleases'],
+                )
+
 
 class TestParseAndValidateArgs(TestCase):
     def test_default_extras(self):
