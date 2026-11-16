@@ -1,4 +1,5 @@
 import math
+import sys
 from collections import defaultdict
 from logging import getLogger
 from operator import attrgetter
@@ -12,8 +13,9 @@ from packaging.utils import canonicalize_name
 from packaging.version import Version
 from resolvelib import AbstractProvider, BaseReporter
 from resolvelib import Resolver as ResolveLibResolver
-from unearth import TargetPython
+from unearth import Link, TargetPython
 from unearth.auth import MultiDomainBasicAuth
+from unearth.evaluator import LinkMismatchError
 
 from .builder import (
     build_failure_reason,
@@ -97,10 +99,20 @@ def filter_requirements(requirements, python_version=None, extras=()):
 
 
 class Candidate:
-    """Represents a concrete package version."""
+    """Represents a concrete package version.
+
+    A candidate built from a direct reference (``name @ url``) carries the
+    URL, which is None for a candidate from the index.
+    """
 
     def __init__(
-        self, name, version, extras=None, dependencies=None, package=None
+        self,
+        name,
+        version,
+        extras=None,
+        dependencies=None,
+        package=None,
+        url=None,
     ):
         self.name = canonicalize_name(name)
         self.version = version
@@ -109,8 +121,13 @@ class Candidate:
         # unearth package object carried from find_matches; avoids a redundant
         # find_best_match lookup in get_dependencies when present.
         self.package = package
+        self.url = url
 
     def __repr__(self):
+        if self.url:
+            return (
+                f"Candidate({self.name!r}, {self.version!r}, url={self.url!r})"
+            )
         return f"Candidate({self.name!r}, {self.version!r})"
 
     def __eq__(self, other):
@@ -120,20 +137,37 @@ class Candidate:
             self.name == other.name
             and self.version == other.version
             and self.extras == other.extras
+            and self.url == other.url
         )
 
     def __hash__(self):
-        return hash((self.name, self.version, self.extras))
+        return hash((self.name, self.version, self.extras, self.url))
 
 
 class MetadataUnavailableError(Exception):
-    """A package version's metadata, and so its dependencies, is unavailable."""
+    """A package version's metadata, and so its dependencies, is unavailable.
 
-    def __init__(self, name, version, reason):
+    For a direct reference the version isn't known, so url names the file.
+    """
+
+    def __init__(self, name, version, reason, url=None):
         self.name = name
         self.version = version
+        self.url = url
+        subject = f'{name} @ {url}' if url else f'{name}=={version}'
+        super().__init__(f'Unable to get the metadata for {subject}: {reason}')
+
+
+class MetadataMismatchError(Exception):
+    """A direct reference's file has metadata for a different package."""
+
+    def __init__(self, name, url, found):
+        self.name = name
+        self.url = url
+        self.found = found
         super().__init__(
-            f'Unable to get the metadata for {name}=={version}: {reason}'
+            f'Requirement {name} @ {url} refers to a file whose metadata '
+            f'names {found}'
         )
 
 
@@ -148,7 +182,7 @@ class PyPIProvider(AbstractProvider):
         exclude_newer_than=None,
         user_requested=None,
         allow_prereleases=False,
-        file_requires_dist_cache=None,
+        file_metadata_cache=None,
     ):
         self.session = session
         # When True, pre-releases are candidates for every package (like pip's
@@ -156,11 +190,12 @@ class PyPIProvider(AbstractProvider):
         self.allow_prereleases = allow_prereleases
         self._dependencies_cache = {}
         self._requires_dist_cache = {}
-        # Requires-Dist read from downloaded files, keyed by file URL.  The
+        # Metadata read from downloaded files, keyed by the index file's URL
+        # without its fragment or by a direct reference's URL as written.  The
         # Resolver shares this across providers (one per target Python) so a
         # file is downloaded, and an sdist built, at most once per run.
-        self._file_requires_dist_cache = (
-            {} if file_requires_dist_cache is None else file_requires_dist_cache
+        self._file_metadata_cache = (
+            {} if file_metadata_cache is None else file_metadata_cache
         )
         self._matches_cache = {}
         # Conflict-promotion state (mirrors pip's PipProvider)
@@ -307,6 +342,14 @@ class PyPIProvider(AbstractProvider):
             reqs.extend(requirements.get(name, []))
             incompat_candidates.extend(incompatibilities.get(name, []))
 
+        # A direct reference (name @ url) is the only source for its package,
+        # as in pip
+        urls = {r.url for r in reqs if r.url}
+        if urls:
+            return self._find_url_matches(
+                name, extras, urls, reqs, incompat_candidates
+            )
+
         # Fetch (and cache) all platform-compatible packages for this name.
         # The specifier/incompatibility filtering below is kept outside the cache
         # because `incompatibilities` changes on every backtracking round.
@@ -335,7 +378,9 @@ class PyPIProvider(AbstractProvider):
         )
 
         # Collect incompatible versions for fast O(1) membership tests.
-        incompat_versions = {c.version for c in incompat_candidates}
+        incompat_versions = {
+            c.version for c in incompat_candidates if c.url is None
+        }
 
         # Build the filtered, sorted candidate list.
         candidates = []
@@ -369,10 +414,77 @@ class PyPIProvider(AbstractProvider):
         log.debug(f'Found {len(candidates)} candidates for {identifier}')
         return sorted(candidates, key=attrgetter('version'), reverse=True)
 
+    def _find_url_matches(self, name, extras, urls, reqs, incompat_candidates):
+        """Return the candidate for a direct reference, if it's usable.
+
+        The candidate comes from the file at the URL alone; the index isn't
+        consulted and the cooldown doesn't apply.  It has to suit the target
+        Python and satisfy every other requirement for the package.
+        """
+        if len(urls) > 1:
+            log.info(
+                f'Conflicting direct references for {name}: '
+                f'{", ".join(sorted(urls))}'
+            )
+            return []
+        (url,) = urls
+        link = Link(url)
+
+        if link.is_wheel:
+            try:
+                self.finder.build_evaluator(name).check_wheel_tags(
+                    link.filename
+                )
+            except LinkMismatchError as e:
+                log.warning(f'Skipping {name} @ {link.redacted}: {e}')
+                return []
+
+        metadata = self._get_file_metadata(url, link, name)
+        found = canonicalize_name(metadata.name)
+        if found != name:
+            raise MetadataMismatchError(name, link.redacted, found)
+
+        series = self.series or PythonSeries(
+            '.'.join(map(str, sys.version_info[:3]))
+        )
+        if metadata.requires_python is not None and (
+            not series.specifier_satisfiable(metadata.requires_python)
+        ):
+            log.warning(
+                f'Skipping {name} @ {link.redacted}: no release of the target '
+                f'Python version ({series.version}) matches its '
+                f'Requires-Python {metadata.requires_python}'
+            )
+            return []
+
+        # The user named the file, so a pre-release is fine
+        version = metadata.version
+        if not all(
+            r.specifier.contains(version, prereleases=True) for r in reqs
+        ):
+            log.info(
+                f'{name} @ {link.redacted} is version {version}, which other '
+                'requirements exclude'
+            )
+            return []
+        if any(
+            c.version == version and c.url == url for c in incompat_candidates
+        ):
+            return []
+
+        return [Candidate(name, version, extras=extras, url=url)]
+
     def is_satisfied_by(self, requirement, candidate):
-        """Check if the candidate satisfies the requirement."""
+        """Check if the candidate satisfies the requirement.
+
+        A direct reference is only satisfied by a candidate from the same
+        URL.  Otherwise the candidate's version has to match, whether it came
+        from the index or a URL, as in pip.
+        """
         if canonicalize_name(requirement.name) != candidate.name:
             return False
+        if requirement.url:
+            return requirement.url == candidate.url
         # Candidates only come from find_matches, which already applied the
         # pre-release policy, so accept pre-releases here as pip does.
         return requirement.specifier.contains(
@@ -382,12 +494,21 @@ class PyPIProvider(AbstractProvider):
     def _get_requires_dist(self, candidate):
         """Return the Requires-Dist entries for a candidate's name and version.
 
-        The result is cached by name and version, so a package and its extras
-        candidates share a single metadata fetch.
+        The result is cached by name, version and URL, so a package and its
+        extras candidates share a single metadata fetch.
         """
-        cache_key = (candidate.name, candidate.version)
+        cache_key = (candidate.name, candidate.version, candidate.url)
         if cache_key in self._requires_dist_cache:
             return self._requires_dist_cache[cache_key]
+
+        if candidate.url:
+            # find_matches already read the direct reference's file
+            metadata = self._get_file_metadata(
+                candidate.url, Link(candidate.url), candidate.name
+            )
+            requires_dist = list(metadata.requires_dist or [])
+            self._requires_dist_cache[cache_key] = requires_dist
+            return requires_dist
 
         # Use the unearth package object carried from find_matches to avoid a
         # redundant index lookup.  Fall back to find_best_match for candidates
@@ -421,32 +542,45 @@ class PyPIProvider(AbstractProvider):
         else:
             # No metadata from the index, e.g. for sdists, so get it from the
             # file itself as pip does
-            requires_dist = self._get_file_requires_dist(
-                candidate, package.link
+            metadata = self._get_file_metadata(
+                package.link.url_without_fragment,
+                package.link,
+                candidate.name,
+                candidate.version,
             )
+            requires_dist = list(metadata.requires_dist or [])
 
         self._requires_dist_cache[cache_key] = requires_dist
         return requires_dist
 
-    def _get_file_requires_dist(self, candidate, link):
-        """Return the Requires-Dist entries read from a candidate's file."""
-        url = link.url_without_fragment
-        if url not in self._file_requires_dist_cache:
-            metadata = self._download_metadata(candidate, link)
-            self._file_requires_dist_cache[url] = list(
-                metadata.requires_dist or []
-            )
-        return self._file_requires_dist_cache[url]
+    def _get_file_metadata(self, key, link, name, version=None):
+        """Return the Metadata read from a file, downloading it once per key.
 
-    def _download_metadata(self, candidate, link):
-        """Download a candidate's file and return its Metadata.
+        version is None for a direct reference, whose version comes from the
+        file.
+        """
+        if key not in self._file_metadata_cache:
+            self._file_metadata_cache[key] = self._download_metadata(
+                link, name, version
+            )
+        return self._file_metadata_cache[key]
+
+    def _download_metadata(self, link, name, version=None):
+        """Download a file and return its Metadata.
 
         Wheels carry it in .dist-info/METADATA.  Sdists carry it in PKG-INFO,
         which is used when PEP 643 says it's reliable; otherwise the sdist's
-        build backend is asked for it.
+        build backend is asked for it, as it is for a VCS checkout or a local
+        directory.  version is None for a direct reference, whose metadata
+        must then supply the name and version.
         """
-        name, version = candidate.name, candidate.version
-        log.info(f'Downloading {link.filename} for {name}=={version} metadata')
+        url = None if version is not None else link.redacted
+        subject = f'{name} @ {url}' if url else f'{name}=={version}'
+
+        def error(reason):
+            return MetadataUnavailableError(name, version, reason, url=url)
+
+        log.info(f'Downloading {link.filename} for {subject} metadata')
         with TemporaryDirectory() as tmpdir:
             location = Path(tmpdir) / 'unpacked'
             location.mkdir()
@@ -455,9 +589,7 @@ class PyPIProvider(AbstractProvider):
                     link, location, download_dir=Path(tmpdir) / 'download'
                 )
             except Exception as e:
-                raise MetadataUnavailableError(
-                    name, version, f'downloading {link.redacted} failed: {e}'
-                ) from e
+                raise error(f'downloading {link.redacted} failed: {e}') from e
 
             try:
                 if link.is_wheel:
@@ -465,32 +597,35 @@ class PyPIProvider(AbstractProvider):
                 else:
                     metadata = sdist_pkg_info_metadata(path)
             except Exception as e:
-                raise MetadataUnavailableError(
-                    name, version, f'reading {link.filename} failed: {e}'
-                ) from e
+                raise error(f'reading {link.filename} failed: {e}') from e
 
-            if metadata is not None:
-                return metadata
-            if link.is_wheel:
-                raise MetadataUnavailableError(
-                    name, version, f'no METADATA in {link.filename}'
+            if metadata is None:
+                if link.is_wheel:
+                    raise error(f'no METADATA in {link.filename}')
+
+                log.info(f'Building {subject} to get its metadata')
+                try:
+                    metadata = build_sdist_metadata(path)
+                except Exception as e:
+                    raise error(
+                        f'building {link.filename} failed: '
+                        f'{build_failure_reason(e)}'
+                    ) from e
+                # See build_sdist_metadata and #53
+                log.warning(
+                    f'Metadata for {subject} was built under the Python '
+                    'running proviso and is reused for every target Python '
+                    'version'
                 )
 
-            log.info(f'Building {name}=={version} to get its metadata')
+        if url:
+            # Fail here, with the URL, if a field find_matches needs is
+            # missing or invalid
             try:
-                metadata = build_sdist_metadata(path)
+                metadata.name, metadata.version, metadata.requires_python
             except Exception as e:
-                raise MetadataUnavailableError(
-                    name,
-                    version,
-                    f'building {link.filename} failed: {build_failure_reason(e)}',
-                ) from e
-            # See build_sdist_metadata and #53
-            log.warning(
-                f'Metadata for {name}=={version} was built under the Python '
-                'running proviso and is reused for every target Python version'
-            )
-            return metadata
+                raise error(f'invalid metadata: {e}') from e
+        return metadata
 
     def get_dependencies(self, candidate):
         """Get dependencies for a candidate.
@@ -500,7 +635,12 @@ class PyPIProvider(AbstractProvider):
         package at the same version plus the dependencies that only its extras
         add; the base dependencies come in through the base package.
         """
-        cache_key = (candidate.name, candidate.version, candidate.extras)
+        cache_key = (
+            candidate.name,
+            candidate.version,
+            candidate.extras,
+            candidate.url,
+        )
 
         if cache_key in self._dependencies_cache:
             log.debug(
@@ -518,9 +658,13 @@ class PyPIProvider(AbstractProvider):
 
         dependencies = []
         if candidate.extras:
-            dependencies.append(
-                Requirement(f'{candidate.name}=={candidate.version}')
-            )
+            # Pin the base package to the same file for a direct reference,
+            # the same version otherwise
+            if candidate.url:
+                base = f'{candidate.name} @ {candidate.url}'
+            else:
+                base = f'{candidate.name}=={candidate.version}'
+            dependencies.append(Requirement(base))
 
         for req in self._get_requires_dist(candidate):
             if req.marker is None or marker_applies(
@@ -565,7 +709,7 @@ class Resolver:
         self._session = session
         self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
         # Shared by every provider this resolver creates, see PyPIProvider
-        self._file_requires_dist_cache = {}
+        self._file_metadata_cache = {}
 
     def resolve(
         self,
@@ -594,7 +738,8 @@ class Resolver:
                           extras are resolved.
 
         Returns:
-            Dict mapping package names to metadata dicts with 'version' and 'extras'
+            Dict mapping package names to metadata dicts with 'version' and
+            'extras', plus 'url' for a package from a direct reference
 
         Raises:
             resolvelib.ResolutionImpossible: If resolution fails
@@ -620,17 +765,20 @@ class Resolver:
             exclude_newer_than=exclude_newer_than,
             user_requested=user_requested,
             allow_prereleases=allow_prereleases,
-            file_requires_dist_cache=self._file_requires_dist_cache,
+            file_metadata_cache=self._file_metadata_cache,
         )
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)
 
-        # Resolve
+        # Resolve.  resolvelib adds the requirements in order and an extras
+        # requirement only sees the base package's requirements added before
+        # it, so add direct references first to have foo[x] pick up foo @ url.
+        requirements = sorted(requirements, key=lambda r: r.url is None)
         result = resolver.resolve(requirements, max_rounds=1000)
 
         # Convert result to our format, folding extras candidates into their
         # base package.  An extras candidate pins its base package to the same
-        # version, so the versions always agree.
+        # version, or URL, so they always agree.
         resolved = {}
         for candidate in result.mapping.values():
             info = resolved.setdefault(
@@ -638,6 +786,8 @@ class Resolver:
                 {'version': str(candidate.version), 'extras': set()},
             )
             info['extras'].update(candidate.extras)
+            if candidate.url:
+                info['url'] = candidate.url
 
         for info in resolved.values():
             info['extras'] = sorted(info['extras'])

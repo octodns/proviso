@@ -47,6 +47,10 @@ def format_and_print_metadata(metadata, extras, python_versions):
     )
 
 
+class DirectUrl(str):
+    """A package pinned to a direct reference's URL rather than a version."""
+
+
 def find_requirements(
     requirements,
     python_versions,
@@ -64,7 +68,8 @@ def find_requirements(
     # Create one resolver instance (shared session across all Python versions)
     resolver = Resolver(session=session)
 
-    # Collect versions: versions[package][version] = [python_versions]
+    # Collect versions: versions[package][version] = [python_versions], where
+    # version is a DirectUrl for a package from a direct reference
     versions = defaultdict(lambda: defaultdict(list))
 
     # Resolve for each Python version
@@ -85,7 +90,11 @@ def find_requirements(
 
         # Accumulate into versions dict
         for name, info in resolved.items():
-            versions[name][info['version']].append(python_version)
+            if 'url' in info:
+                version = DirectUrl(info['url'])
+            else:
+                version = info['version']
+            versions[name][version].append(python_version)
 
     return versions
 
@@ -111,9 +120,16 @@ def write_requirements_to_file(
             for ver, pythons in vers.items():
                 # same pkg ver for all pythons
                 fh.write(pkg)
-                fh.write('==')
-                fh.write(ver)
+                if isinstance(ver, DirectUrl):
+                    fh.write(' @ ')
+                    fh.write(ver)
+                else:
+                    fh.write('==')
+                    fh.write(ver)
                 if pythons != python_versions:
+                    # PEP 508 needs whitespace between a URL and its marker
+                    if isinstance(ver, DirectUrl):
+                        fh.write(' ')
                     fh.write('; ')
                     fh.write(
                         ' or '.join(series[p].match_marker() for p in pythons)

@@ -9,6 +9,7 @@ from build import BuildBackendException
 from packaging.requirements import Requirement
 
 from proviso.main import (
+    DirectUrl,
     build_project_metadata,
     find_requirements,
     format_and_print_metadata,
@@ -686,4 +687,76 @@ class TestWriteRequirementsToFile(TestCase):
             self.assertEqual(
                 ['x-python-version-not-supported', 'b==1.0'],
                 self._selected(content, full_version),
+            )
+
+
+class TestDirectUrl(TestCase):
+    URL = 'https://example.com/a-1.0-py3-none-any.whl#sha256=abc'
+
+    def _write(self, versions, python_versions):
+        with TemporaryDirectory() as tmpdir:
+            output_file = join(tmpdir, 'requirements.txt')
+            write_requirements_to_file(versions, python_versions, output_file)
+            with open(output_file) as fh:
+                return fh.read().splitlines()[1:]
+
+    def test_find_requirements(self):
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = [
+                {'a': {'version': '1.0', 'extras': [], 'url': self.URL}},
+                {'a': {'version': '2.0', 'extras': []}},
+                {'a': {'version': '1.0', 'extras': ['x'], 'url': self.URL}},
+            ]
+            with patch('proviso.main.log'):
+                result = find_requirements(
+                    [Requirement('a')], ['3.11', '3.12', '3.13']
+                )
+        self.assertEqual(
+            {self.URL: ['3.11', '3.13'], '2.0': ['3.12']}, result['a']
+        )
+        keys = list(result['a'])
+        self.assertIsInstance(keys[0], DirectUrl)
+        self.assertNotIsInstance(keys[1], DirectUrl)
+
+    def test_write_without_marker(self):
+        lines = self._write(
+            {'a': {DirectUrl(self.URL): ['3.12', '3.13']}}, ['3.12', '3.13']
+        )
+        self.assertEqual([f'a @ {self.URL}'], lines)
+        requirement = Requirement(lines[0])
+        self.assertEqual(self.URL, requirement.url)
+        self.assertIsNone(requirement.marker)
+
+    def test_write_mixed(self):
+        lines = self._write(
+            {
+                'a': {DirectUrl(self.URL): ['3.11', '3.13'], '2.0': ['3.12']},
+                'b': {'1.0': ['3.11', '3.12', '3.13']},
+            },
+            ['3.11', '3.12', '3.13'],
+        )
+        self.assertEqual(
+            [
+                f"a @ {self.URL} ; python_version=='3.11' or python_version=='3.13'",
+                "a==2.0; python_version=='3.12'",
+                'b==1.0',
+            ],
+            lines,
+        )
+        requirements = [Requirement(line) for line in lines]
+        self.assertEqual(self.URL, requirements[0].url)
+        for python_version, expected in (
+            ('3.11', ['a', 'b']),
+            ('3.12', ['a', 'b']),
+            ('3.13', ['a', 'b']),
+        ):
+            env = {'python_version': python_version}
+            selected = [
+                r
+                for r in requirements
+                if r.marker is None or r.marker.evaluate(env)
+            ]
+            self.assertEqual(expected, [r.name for r in selected])
+            self.assertEqual(
+                python_version != '3.12', selected[0].url == self.URL
             )

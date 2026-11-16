@@ -1,3 +1,4 @@
+import hashlib
 import math
 import tarfile
 from collections import namedtuple
@@ -16,12 +17,14 @@ from build import BuildBackendException
 from packaging.metadata import Metadata
 from packaging.requirements import Requirement
 from packaging.version import Version
+from resolvelib import ResolutionImpossible
 from unearth import Link, PackageFinder
 from unearth.errors import UnpackError
 
 from proviso.resolver import (
     _CONFLICT_PRIORITY_THRESHOLD,
     Candidate,
+    MetadataMismatchError,
     MetadataUnavailableError,
     PyPIProvider,
     Resolver,
@@ -608,7 +611,7 @@ class TestPyPIProvider(TestCase):
 
             # Pre-populate cache
             provider._dependencies_cache[
-                ('requests', Version('2.28.0'), frozenset())
+                ('requests', Version('2.28.0'), frozenset(), None)
             ] = cached_deps
 
             result = provider.get_dependencies(candidate)
@@ -638,7 +641,7 @@ class TestPyPIProvider(TestCase):
             self.assertEqual([], result)
             # Should be cached
             self.assertIn(
-                ('nonexistent', Version('1.0.0'), frozenset()),
+                ('nonexistent', Version('1.0.0'), frozenset(), None),
                 provider._dependencies_cache,
             )
 
@@ -747,12 +750,19 @@ Requires-Dist: pytest>=7.0.0; extra == "test"
 
             with patch.object(
                 provider,
-                '_get_file_requires_dist',
-                return_value=[Requirement('six')],
+                '_get_file_metadata',
+                return_value=Metadata.from_raw(
+                    {'requires_dist': ['six']}, validate=False
+                ),
             ) as mock_file:
                 result = provider.get_dependencies(candidate)
 
-            mock_file.assert_called_once_with(candidate, mock_link)
+            mock_file.assert_called_once_with(
+                mock_link.url_without_fragment,
+                mock_link,
+                'test-package',
+                Version('1.0.0'),
+            )
             self.assertEqual([Requirement('six')], result)
             session.get.assert_not_called()
 
@@ -2019,7 +2029,7 @@ Requires-Dist: pytest; extra == "test"
 
     def _provider(self, cache=None):
         return PyPIProvider(
-            None, [], python_version='3.12', file_requires_dist_cache=cache
+            None, [], python_version='3.12', file_metadata_cache=cache
         )
 
     def _candidate(self, path):
@@ -2154,8 +2164,9 @@ Requires-Dist: pytest; extra == "test"
                 )
         mock_download.assert_called_once()
         self.mock_build.assert_called_once()
-        self.assertEqual(
-            {Link.from_path(path).url: [Requirement('built-dep')]}, cache
+        self.assertEqual([Link.from_path(path).url], list(cache))
+        self.assertIs(
+            self.mock_build.return_value, cache[Link.from_path(path).url]
         )
 
     def test_build_logs_warning(self):
@@ -2180,11 +2191,11 @@ Requires-Dist: pytest; extra == "test"
                 resolver.resolve([Requirement('foo')], python_version='3.12')
                 resolver.resolve([Requirement('foo')], python_version='3.13')
         caches = [
-            c.kwargs['file_requires_dist_cache']
+            c.kwargs['file_metadata_cache']
             for c in mock_provider.call_args_list
         ]
         self.assertEqual(2, len(caches))
-        self.assertIs(resolver._file_requires_dist_cache, caches[0])
+        self.assertIs(resolver._file_metadata_cache, caches[0])
         self.assertIs(caches[0], caches[1])
 
     def test_dist_info_link_does_not_download(self):
@@ -2204,7 +2215,7 @@ Requires-Dist: pytest; extra == "test"
         )
         mock_dl.assert_not_called()
         self.mock_build.assert_not_called()
-        self.assertEqual({}, provider._file_requires_dist_cache)
+        self.assertEqual({}, provider._file_metadata_cache)
 
 
 class TestTargetPythonSeries(TestCase):
@@ -2301,3 +2312,437 @@ class TestTargetPythonSeries(TestCase):
             'https://example.com/foo-1.0.tar.gz', requires_python='>=3.13'
         )
         self.assertIsNone(evaluator.evaluate_link(link))
+
+
+class TestDirectUrl(TestCase):
+    """Requirements with a direct reference (name @ url).
+
+    Files are local file:// links, so unearth's real download_and_unpack
+    runs without touching the network.  The index and the build backend are
+    mocked.
+    """
+
+    def setUp(self):
+        # Requires-Dist for the fake index used by _provider
+        self.index = {
+            'foo': {'2.0': ()},
+            'six': {'1.16.0': ()},
+            'pytest': {'8.0': ()},
+        }
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        patcher = patch('proviso.resolver.build_sdist_metadata')
+        self.mock_build = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mock_build.return_value = Metadata.from_raw(
+            {'name': 'foo', 'version': '1.0', 'requires_dist': ['six']},
+            validate=False,
+        )
+
+    def _metadata(self, name, version, requires=(), requires_python=None):
+        lines = [
+            'Metadata-Version: 2.1',
+            f'Name: {name}',
+            f'Version: {version}',
+        ]
+        if requires_python:
+            lines.append(f'Requires-Python: {requires_python}')
+        lines.extend(f'Requires-Dist: {r}' for r in requires)
+        return '\n'.join(lines) + '\n'
+
+    def _wheel(
+        self,
+        version='1.0',
+        requires=('six',),
+        requires_python=None,
+        tag='py3-none-any',
+        metadata_name='foo',
+        metadata=True,
+    ):
+        """Write a foo wheel and return its file:// URL."""
+        path = self.dir / f'foo-{version}-{tag}.whl'
+        with ZipFile(path, 'w') as zf:
+            zf.writestr('foo/__init__.py', '')
+            if metadata:
+                zf.writestr(
+                    f'foo-{version}.dist-info/METADATA',
+                    self._metadata(
+                        metadata_name, version, requires, requires_python
+                    ),
+                )
+        return path.as_uri()
+
+    def _sdist(self, pkg_info=None):
+        """Write a foo sdist and return its file:// URL."""
+        path = self.dir / 'foo-1.0.tar.gz'
+        files = {'foo-1.0/setup.py': b''}
+        if pkg_info is not None:
+            files['foo-1.0/PKG-INFO'] = pkg_info.encode()
+        with tarfile.open(path, 'w:gz') as tf:
+            for name, data in files.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                tf.addfile(info, BytesIO(data))
+        return path.as_uri()
+
+    def _package(self, name, version):
+        package = MagicMock()
+        package.version = version
+        package.link.dist_info_link.url = f'https://pypi/{name}/{version}'
+        return package
+
+    def _provider(self, python_version='3.12', cache=None, **kwargs):
+        session = MagicMock()
+
+        def get(url):
+            name, version = url.split('/')[-2:]
+            response = MagicMock()
+            response.text = self._metadata(
+                name, version, self.index[name][version]
+            )
+            return response
+
+        session.get.side_effect = get
+        provider = PyPIProvider(
+            session,
+            [],
+            python_version=python_version,
+            file_metadata_cache=cache,
+            **kwargs,
+        )
+        provider.finder.find_matches = MagicMock(
+            side_effect=lambda name, **kwargs: [
+                self._package(name, v) for v in self.index[name]
+            ]
+        )
+        return provider
+
+    def _resolve(self, requirements, provider=None):
+        provider = provider or self._provider()
+        with patch('proviso.resolver.PyPIProvider', return_value=provider):
+            return Resolver(session=MagicMock()).resolve(
+                [Requirement(r) for r in requirements], python_version='3.12'
+            )
+
+    def _matches(self, provider, *requirements, incompatibilities=None):
+        reqs = [Requirement(r) for r in requirements]
+        identifier = provider.identify(reqs[0])
+        return provider.find_matches(
+            identifier, {identifier: reqs}, incompatibilities or {}
+        )
+
+    def _queried(self, provider):
+        return [c.args[0] for c in provider.finder.find_matches.call_args_list]
+
+    def test_index_without_url(self):
+        result = self._resolve(['foo'])
+        self.assertEqual({'version': '2.0', 'extras': []}, result['foo'])
+
+    def test_wheel_resolved_and_dependencies_followed(self):
+        url = self._wheel()
+        provider = self._provider()
+        result = self._resolve([f'foo @ {url}'], provider)
+        self.assertEqual(
+            {
+                'foo': {'version': '1.0', 'extras': [], 'url': url},
+                'six': {'version': '1.16.0', 'extras': []},
+            },
+            result,
+        )
+        # The index isn't asked about foo
+        self.assertEqual(['six'], self._queried(provider))
+
+    def test_find_matches(self):
+        url = self._wheel()
+        provider = self._provider()
+        self.assertEqual(
+            [Candidate('foo', Version('1.0'), url=url)],
+            self._matches(provider, f'foo @ {url}'),
+        )
+        provider.finder.find_matches.assert_not_called()
+
+    def test_url_with_hash_written_as_given(self):
+        url = self._wheel()
+        digest = hashlib.sha256(
+            (self.dir / 'foo-1.0-py3-none-any.whl').read_bytes()
+        ).hexdigest()
+        url = f'{url}#sha256={digest}'
+        result = self._resolve([f'foo @ {url}'])
+        self.assertEqual(url, result['foo']['url'])
+
+    def test_url_with_wrong_hash(self):
+        url = f'{self._wheel()}#sha256={"0" * 64}'
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._matches(self._provider(), f'foo @ {url}')
+        self.assertIn('foo @ file://', str(ctx.exception))
+        self.assertIn('downloading', str(ctx.exception))
+
+    def test_specifier_agrees(self):
+        url = self._wheel()
+        result = self._resolve([f'foo @ {url}', 'foo>=1.0,<2'])
+        self.assertEqual(url, result['foo']['url'])
+
+    def test_specifier_disagrees(self):
+        url = self._wheel()
+        provider = self._provider()
+        self.assertEqual([], self._matches(provider, f'foo @ {url}', 'foo>=2'))
+        provider.finder.find_matches.assert_not_called()
+        with self.assertRaises(ResolutionImpossible):
+            self._resolve([f'foo @ {url}', 'foo>=2'])
+
+    def test_prerelease_allowed(self):
+        url = self._wheel(version='1.0rc1')
+        candidates = self._matches(self._provider(), f'foo @ {url}')
+        self.assertEqual([Version('1.0rc1')], [c.version for c in candidates])
+
+    def test_cooldown_does_not_apply(self):
+        url = self._wheel()
+        provider = self._provider(
+            exclude_newer_than=datetime(2000, 1, 1, tzinfo=timezone.utc)
+        )
+        self.assertEqual(1, len(self._matches(provider, f'foo @ {url}')))
+
+    def test_two_urls_conflict(self):
+        first = self._wheel()
+        second = self._wheel(version='1.1')
+        provider = self._provider()
+        self.assertEqual(
+            [], self._matches(provider, f'foo @ {first}', f'foo @ {second}')
+        )
+        provider.finder.find_matches.assert_not_called()
+        with self.assertRaises(ResolutionImpossible):
+            self._resolve([f'foo @ {first}', f'foo @ {second}'])
+
+    def test_name_mismatch(self):
+        url = self._wheel(metadata_name='Bar')
+        with self.assertRaises(MetadataMismatchError) as ctx:
+            self._matches(self._provider(), f'foo @ {url}')
+        message = str(ctx.exception)
+        self.assertIn(f'foo @ {url}', message)
+        self.assertIn('names bar', message)
+        self.assertEqual('bar', ctx.exception.found)
+
+    def test_requires_python_unsatisfiable(self):
+        url = self._wheel(requires_python='>=3.13')
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            self.assertEqual(
+                [], self._matches(self._provider(), f'foo @ {url}')
+            )
+        self.assertIn('Requires-Python >=3.13', logs.output[0])
+        # A series with a release that matches is fine
+        self.assertEqual(
+            1, len(self._matches(self._provider('3'), f'foo @ {url}'))
+        )
+
+    def test_requires_python_without_target_uses_host(self):
+        url = self._wheel(requires_python='<3')
+        with self.assertLogs('proviso.resolver', level='WARNING'):
+            self.assertEqual(
+                [], self._matches(self._provider(None), f'foo @ {url}')
+            )
+
+    def test_wheel_tags_incompatible(self):
+        url = self._wheel(tag='py2-none-any')
+        with patch.object(PackageFinder, 'download_and_unpack') as mock_dl:
+            with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+                self.assertEqual(
+                    [], self._matches(self._provider(), f'foo @ {url}')
+                )
+        self.assertIn('not compatible', logs.output[0])
+        mock_dl.assert_not_called()
+
+    def test_incompatibilities(self):
+        url = self._wheel()
+        provider = self._provider()
+        candidate = Candidate('foo', Version('1.0'), url=url)
+        self.assertEqual(
+            [],
+            self._matches(
+                provider, f'foo @ {url}', incompatibilities={'foo': [candidate]}
+            ),
+        )
+        # An index candidate of the same version doesn't rule the URL out
+        index = Candidate('foo', Version('1.0'))
+        self.assertEqual(
+            [candidate],
+            self._matches(
+                provider, f'foo @ {url}', incompatibilities={'foo': [index]}
+            ),
+        )
+        # Nor does a URL candidate rule out the index's version
+        self.index['foo'] = {'1.0': ()}
+        self.assertEqual(
+            [index],
+            self._matches(
+                self._provider(), 'foo', incompatibilities={'foo': [candidate]}
+            ),
+        )
+
+    def test_is_satisfied_by(self):
+        provider = self._provider()
+        url = 'https://example.com/foo-1.0-py3-none-any.whl'
+        from_url = Candidate('foo', Version('1.0'), url=url)
+        from_index = Candidate('foo', Version('1.0'))
+        other_url = Candidate('foo', Version('1.0'), url=f'{url}?x')
+        direct = Requirement(f'foo @ {url}')
+        self.assertTrue(provider.is_satisfied_by(direct, from_url))
+        self.assertFalse(provider.is_satisfied_by(direct, from_index))
+        self.assertFalse(provider.is_satisfied_by(direct, other_url))
+        self.assertFalse(
+            provider.is_satisfied_by(Requirement(f'bar @ {url}'), from_url)
+        )
+        # A plain requirement only looks at the version, as in pip
+        self.assertTrue(
+            provider.is_satisfied_by(Requirement('foo>=1'), from_url)
+        )
+        self.assertFalse(
+            provider.is_satisfied_by(Requirement('foo>=2'), from_url)
+        )
+
+    def test_candidate_identity(self):
+        url = 'https://example.com/foo-1.0-py3-none-any.whl'
+        from_url = Candidate('foo', Version('1.0'), url=url)
+        from_index = Candidate('foo', Version('1.0'))
+        self.assertNotEqual(from_url, from_index)
+        self.assertEqual(from_url, Candidate('foo', Version('1.0'), url=url))
+        self.assertEqual(2, len({from_url, from_index}))
+        self.assertEqual(
+            f"Candidate('foo', <Version('1.0')>, url='{url}')", repr(from_url)
+        )
+
+    def test_dependencies_not_mixed_with_index(self):
+        url = self._wheel(requires=('pytest',))
+        provider = self._provider()
+        from_url = self._matches(provider, f'foo @ {url}')[0]
+        from_index = Candidate(
+            'foo', Version('1.0'), package=self._package('foo', '2.0')
+        )
+        self.assertEqual(
+            [Requirement('pytest')], provider.get_dependencies(from_url)
+        )
+        self.assertEqual([], provider.get_dependencies(from_index))
+        # Cached apart too
+        self.assertEqual(
+            [Requirement('pytest')], provider.get_dependencies(from_url)
+        )
+
+    def test_extras(self):
+        url = self._wheel(requires=('six', 'pytest; extra == "test"'))
+        provider = self._provider()
+        candidates = self._matches(provider, f'foo[test] @ {url}')
+        self.assertEqual(
+            [Candidate('foo', Version('1.0'), extras={'test'}, url=url)],
+            candidates,
+        )
+        # The base package is pinned to the same file
+        self.assertEqual(
+            [
+                Requirement(f'foo @ {url}'),
+                Requirement('pytest; extra == "test"'),
+            ],
+            provider.get_dependencies(candidates[0]),
+        )
+        result = self._resolve([f'foo[test] @ {url}'], provider)
+        self.assertEqual(
+            {
+                'foo': {'version': '1.0', 'extras': ['test'], 'url': url},
+                'six': {'version': '1.16.0', 'extras': []},
+                'pytest': {'version': '8.0', 'extras': []},
+            },
+            result,
+        )
+        self.assertNotIn('foo', self._queried(provider))
+
+    def test_extras_on_plain_requirement_follow_url(self):
+        url = self._wheel(requires=('six', 'pytest; extra == "test"'))
+        provider = self._provider()
+        result = self._resolve(['foo[test]', f'foo @ {url}'], provider)
+        self.assertEqual(
+            {'version': '1.0', 'extras': ['test'], 'url': url}, result['foo']
+        )
+        self.assertIn('pytest', result)
+        self.assertNotIn('foo', self._queried(provider))
+
+    def test_shared_cache_across_providers(self):
+        url = self._wheel()
+        cache = {}
+        providers = [
+            self._provider('3.12', cache),
+            self._provider('3.13', cache),
+        ]
+        with patch.object(
+            PackageFinder,
+            'download_and_unpack',
+            autospec=True,
+            side_effect=PackageFinder.download_and_unpack,
+        ) as mock_download:
+            for provider in providers:
+                candidate = self._matches(provider, f'foo @ {url}')[0]
+                provider.get_dependencies(candidate)
+        mock_download.assert_called_once()
+        self.assertEqual([url], list(cache))
+
+    def test_wheel_without_metadata(self):
+        url = self._wheel(metadata=False)
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._matches(self._provider(), f'foo @ {url}')
+        message = str(ctx.exception)
+        self.assertIn(f'Unable to get the metadata for foo @ {url}', message)
+        self.assertIn('no METADATA', message)
+        self.assertEqual(url, ctx.exception.url)
+        self.assertIsNone(ctx.exception.version)
+
+    def test_invalid_metadata(self):
+        url = self._sdist('Metadata-Version: 2.2\nName: foo\n')
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._matches(self._provider(), f'foo @ {url}')
+        self.assertIn('invalid metadata', str(ctx.exception))
+        self.assertIn('version', str(ctx.exception))
+
+    def test_sdist_pkg_info(self):
+        url = self._sdist(
+            'Metadata-Version: 2.2\nName: foo\nVersion: 1.0\n'
+            'Requires-Dist: pytest\n'
+        )
+        provider = self._provider()
+        candidate = self._matches(provider, f'foo @ {url}')[0]
+        self.assertEqual(Version('1.0'), candidate.version)
+        self.assertEqual(
+            [Requirement('pytest')], provider.get_dependencies(candidate)
+        )
+        self.mock_build.assert_not_called()
+
+    def test_sdist_built(self):
+        url = self._sdist()
+        provider = self._provider()
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            candidate = self._matches(provider, f'foo @ {url}')[0]
+        self.assertIn(f'foo @ {url}', logs.output[0])
+        self.assertEqual(
+            [Requirement('six')], provider.get_dependencies(candidate)
+        )
+        self.mock_build.assert_called_once()
+
+    def test_directory(self):
+        source = self.dir / 'src'
+        source.mkdir()
+        url = source.as_uri()
+        candidate = self._matches(self._provider(), f'foo @ {url}')[0]
+        self.assertEqual(Candidate('foo', Version('1.0'), url=url), candidate)
+        # The directory is built where it is
+        self.mock_build.assert_called_once_with(source)
+
+    def test_vcs_failure(self):
+        url = 'git+https://example.invalid/foo.git@v1.0'
+        provider = self._provider()
+        with patch(
+            'unearth.vcs.git.Git.fetch_new',
+            side_effect=UnpackError('git clone failed'),
+        ):
+            with self.assertRaises(MetadataUnavailableError) as ctx:
+                self._matches(provider, f'foo @ {url}')
+        message = str(ctx.exception)
+        self.assertIn('git clone failed', message)
+        self.assertIn('foo @ git+https://example.invalid/foo.git', message)
+        provider.finder.find_matches.assert_not_called()

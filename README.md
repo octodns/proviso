@@ -95,6 +95,22 @@ Pre-releases are skipped unless a requirement's specifier names one, such as
 proviso --pre
 ```
 
+#### Direct references
+
+A requirement with a direct reference, such as
+`foo @ https://example.com/foo-1.0-py3-none-any.whl`, resolves from that URL
+rather than the index. Its dependencies come from the file's metadata, the
+cooldown doesn't apply to it, and the output keeps the URL as written,
+including any `#sha256=` fragment:
+
+```
+foo @ https://example.com/foo-1.0-py3-none-any.whl
+```
+
+VCS URLs (`git+https://...`) and local directories (`file:///...`) work too.
+They're written as given, so a VCS URL isn't pinned to a commit; include one in
+the URL to pin it.
+
 #### Full command-line reference
 
 ```console

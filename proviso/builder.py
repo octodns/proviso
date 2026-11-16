@@ -84,6 +84,9 @@ def build_sdist_metadata(source_dir):
     # The message can't be reliably serialized back to text (multi-line
     # fields fail to fold), so only carry over what proviso uses.
     raw = {'requires_dist': message.get_all('Requires-Dist') or []}
+    for field in ('Name', 'Version', 'Requires-Python'):
+        if message.get(field) is not None:
+            raw[field.lower().replace('-', '_')] = message[field]
     return Metadata.from_raw(raw, validate=False)
 
 

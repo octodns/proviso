@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, mock_open, patch
 from build import BuildBackendException
 from packaging.metadata import Metadata
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.version import Version
 
 from proviso.builder import (
     Builder,
@@ -307,6 +309,19 @@ class TestBuildSdistMetadata(TestCase):
             [Requirement('six'), Requirement('pytest; extra == "test"')],
             metadata.requires_dist,
         )
+
+    def test_name_version_and_requires_python(self):
+        message = Message()
+        message['Name'] = 'Foo_Bar'
+        message['Version'] = '1.0rc1'
+        message['Requires-Python'] = '>=3.10'
+        with patch(
+            'proviso.builder.project_wheel_metadata', return_value=message
+        ):
+            metadata = build_sdist_metadata('/src')
+        self.assertEqual('Foo_Bar', metadata.name)
+        self.assertEqual(Version('1.0rc1'), metadata.version)
+        self.assertEqual(SpecifierSet('>=3.10'), metadata.requires_python)
 
     def test_no_requires_dist(self):
         with patch(
