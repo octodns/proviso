@@ -9,7 +9,7 @@ certifi==2026.10.23
 cffi==2.1.1
 changelet==0.6.1
 charset-normalizer==3.5.2
-click==8.5.0
+click==8.5.1
 comrak==0.0.16
 coverage==7.17.2
 cryptography==50.0.2
@@ -20,7 +20,7 @@ httpcore2==2.16.0
 httpx2==2.16.0
 id==1.6.1
 idna==3.20
-importlib-metadata==10.1.0; python_version=='3.11'
+importlib-metadata==10.2.0; python_version=='3.11'
 iniconfig==2.3.1
 isort==9.0.2
 jaraco-classes==3.4.0
@@ -28,7 +28,8 @@ jaraco-context==6.1.2
 jaraco-functools==4.6.0
 jeepney==0.9.0
 keyring==25.7.0
-markdown-it-py==4.2.0
+lazy-importer==0.1.0; python_version=='3.11'
+markdown-it-py==4.3.0
 mdurl==0.1.2
 more-itertools==11.2.1
 msgpack==1.2.4
@@ -54,7 +55,7 @@ resolvelib==1.2.1
 rfc3986==2.0.0
 rich==15.0.0
 secretstorage==3.5.0
-semver==3.1.0
+semver==3.1.1
 setuptools==84.2.1
 truststore==0.10.5
 twine==7.0.0
