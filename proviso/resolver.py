@@ -131,6 +131,34 @@ class Candidate:
         return hash((self.name, self.version, self.extras))
 
 
+class BasePin(Requirement):
+    """The pin on its base package that an extras candidate depends on.
+
+    It keeps the base package at the extras candidate's version. It isn't a
+    requirement in its own right, so it never makes a yanked release a
+    candidate, see PyPIProvider.pinned_exactly.
+    """
+
+    __slots__ = ()
+
+
+def is_exact_pin(specifier):
+    """Return whether specifier is an exact pin (``==`` or ``===``).
+
+    ``==`` with a ``.*`` wildcard isn't an exact pin.
+    """
+    if specifier.operator == '==' and '*' in specifier.version:
+        return False
+    return specifier.operator in ('==', '===')
+
+
+def pins_exactly(specifier, version):
+    """Return whether specifier is an exact pin on version."""
+    return is_exact_pin(specifier) and specifier.contains(
+        version, prereleases=True
+    )
+
+
 class MetadataUnavailableError(Exception):
     """A package version's metadata, and so its dependencies, is unavailable."""
 
@@ -156,6 +184,8 @@ class PyPIProvider(AbstractProvider):
         allow_prereleases=False,
         file_requires_dist_cache=None,
         build_sdists=False,
+        logged=None,
+        project_requirements=(),
     ):
         self.session = session
         # When True, an sdist's build backend may be run to learn its
@@ -174,11 +204,21 @@ class PyPIProvider(AbstractProvider):
             {} if file_requires_dist_cache is None else file_requires_dist_cache
         )
         self._matches_cache = {}
+        # (reason, name, version) or (reason, index) already logged about.
+        # The Resolver shares this across providers so each is logged once
+        # per run.
+        self._logged = set() if logged is None else logged
         # Conflict-promotion state (mirrors pip's PipProvider)
         self._conflict_counts = defaultdict(int)
         self._conflict_promoted = set()
         # Ordering of user-specified top-level requirements (name → index)
         self._user_requested = user_requested or {}
+        # The project's own requirements, a version they pin exactly is
+        # exempt from the cooldown
+        self._project_requirements = project_requirements
+        # Releases first uploaded after this are excluded (the cooldown).  The
+        # finder doesn't get it as unearth would apply it to each file.
+        self.exclude_newer_than = exclude_newer_than
 
         # The target Python series, None means the running interpreter
         self.series = PythonSeries(python_version) if python_version else None
@@ -190,12 +230,9 @@ class PyPIProvider(AbstractProvider):
         if self.series:
             target_python = TargetPython(py_ver=self.series.release)
 
-        # Create PackageFinder with the target Python version and optional date filter
+        # Create PackageFinder with the target Python version
         self.finder = SeriesPackageFinder(
-            session=session,
-            index_urls=index_urls,
-            target_python=target_python,
-            exclude_newer_than=exclude_newer_than,
+            session=session, index_urls=index_urls, target_python=target_python
         )
 
     def identify(self, requirement_or_candidate):
@@ -330,11 +367,18 @@ class PyPIProvider(AbstractProvider):
             # extras seen during resolution.  Always ask for pre-releases and
             # apply the pre-release policy below: with prereleases=None unearth
             # defers to packaging's default, which differs between packaging
-            # 25 and 26.  unearth returns a lazy LazySequence so we materialise
-            # it immediately before caching.
+            # 25 and 26.  Yanked files are included too and filtered below, as
+            # whether one is allowed depends on the requirements.  unearth
+            # sorts them after every other file, so the order of the rest
+            # doesn't change.  unearth returns a lazy LazySequence so we
+            # materialise it immediately before caching.
             result = list(
-                self.finder.find_matches(name, allow_prereleases=True)
+                self.finder.find_matches(
+                    name, allow_yanked=True, allow_prereleases=True
+                )
             )
+            if self.exclude_newer_than is not None:
+                result = self._apply_cooldown(name, result)
             self._matches_cache[name] = result
 
         # Determine whether pre-releases are allowed: always with --pre,
@@ -370,6 +414,12 @@ class PyPIProvider(AbstractProvider):
             if version in incompat_versions:
                 continue
 
+            # A yanked release is only a candidate when a requirement pins it
+            # exactly, as PEP 592 describes and pip does.
+            if package.link.is_yanked:
+                if not self.pinned_exactly(name, version, requirements):
+                    continue
+
             # Carry the unearth package object so get_dependencies can use it
             # directly without a redundant find_best_match lookup.
             candidates.append(
@@ -379,6 +429,95 @@ class PyPIProvider(AbstractProvider):
         # Return candidates sorted by version (newest first)
         log.debug(f'Found {len(candidates)} candidates for {identifier}')
         return sorted(candidates, key=attrgetter('version'), reverse=True)
+
+    def _apply_cooldown(self, name, packages):
+        """Return the packages of releases first uploaded before the cooldown.
+
+        A release is dated by its first upload, so a file added to it later
+        is still a candidate.  A release without any upload time is excluded,
+        as unearth does for a file.  A version the project pins exactly is
+        exempt.
+        """
+        result = []
+        excluded_undated = False
+        for package in packages:
+            version = Version(package.version)
+            first = self.finder.first_upload(name, version)
+            if first is not None and first <= self.exclude_newer_than:
+                result.append(package)
+            elif self._project_pins(name, version):
+                self._log_cooldown_exempt(name, version)
+                result.append(package)
+            elif first is None:
+                excluded_undated = True
+        if excluded_undated:
+            for index in self.finder.undated_indexes(name):
+                self._warn_no_upload_times(name, index)
+        return result
+
+    def _project_pins(self, name, version):
+        """Return whether a project requirement pins a version exactly."""
+        return any(
+            canonicalize_name(r.name) == name
+            and any(pins_exactly(s, version) for s in r.specifier)
+            for r in self._project_requirements
+        )
+
+    def _log_cooldown_exempt(self, name, version):
+        """Log, once per run, that a pin is used despite the cooldown."""
+        key = ('cooldown', name, version)
+        if key in self._logged:
+            return
+        self._logged.add(key)
+        log.info(
+            f'{name}=={version} is within the dependency cooldown; using it '
+            'because the project pins it exactly'
+        )
+
+    def _warn_no_upload_times(self, name, index):
+        """Log, once per run and index, that it gave no upload times."""
+        key = ('no-upload-times', index)
+        if key in self._logged:
+            return
+        self._logged.add(key)
+        log.warning(
+            f'{index} provided no upload times for {name}, which happens when '
+            'an index only serves the HTML "simple" API and not the JSON API; '
+            "its releases can't be dated, so the dependency cooldown excludes "
+            'all of them. Other packages may be affected too; '
+            '--cooldown-days 0 disables the cooldown'
+        )
+
+    def pinned_exactly(self, name, version, requirements):
+        """Return whether a requirement pins a package version exactly.
+
+        Requirements for the package with any extras count, as they're for
+        the same package.  The pin an extras candidate adds on its base package
+        doesn't, as it only follows the extras candidate's version.
+        """
+        for identifier in requirements:
+            if split_identifier(identifier)[0] != name:
+                continue
+            for req in requirements[identifier]:
+                if isinstance(req, BasePin):
+                    continue
+                if any(pins_exactly(s, version) for s in req.specifier):
+                    return True
+        return False
+
+    def warn_yanked(self, name, version, reason):
+        """Log, once per run, that a yanked release was selected."""
+        key = ('yanked', name, version)
+        if key in self._logged:
+            return
+        self._logged.add(key)
+        # The JSON API gives True for a release yanked without a reason
+        if not isinstance(reason, str) or not reason:
+            reason = 'no reason given'
+        log.warning(
+            f'{name}=={version} is yanked ({reason}); using it because it is '
+            'pinned exactly'
+        )
 
     def is_satisfied_by(self, requirement, candidate):
         """Check if the candidate satisfies the requirement."""
@@ -552,7 +691,7 @@ class PyPIProvider(AbstractProvider):
         dependencies = []
         if candidate.extras:
             dependencies.append(
-                Requirement(f'{candidate.name}=={candidate.version}')
+                BasePin(f'{candidate.name}=={candidate.version}')
             )
 
         for req in self._get_requires_dist(candidate):
@@ -599,6 +738,7 @@ class Resolver:
         self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
         # Shared by every provider this resolver creates, see PyPIProvider
         self._file_requires_dist_cache = {}
+        self._logged = set()
 
     def resolve(
         self,
@@ -618,8 +758,11 @@ class Resolver:
                           "3.12.5" for exactly that release. A dependency is
                           included when any release in the series needs it.
                           Defaults to the running Python.
-            exclude_newer_than: Optional datetime to exclude packages uploaded after
-                          this date (for dependency cooldowns).
+            exclude_newer_than: Optional datetime to exclude releases first
+                          uploaded after this date (for dependency cooldowns).
+                          A file added to an older release later is still
+                          used. A version that one of the requirements pins
+                          exactly with == or === is exempt.
             allow_prereleases: Consider pre-release versions for every package.
                           By default pre-releases are only considered for a
                           package whose specifier names one (e.g. ">=2.0b1").
@@ -663,18 +806,37 @@ class Resolver:
             allow_prereleases=allow_prereleases,
             file_requires_dist_cache=self._file_requires_dist_cache,
             build_sdists=build_sdists,
+            logged=self._logged,
+            project_requirements=requirements,
         )
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)
 
+        # resolvelib finds a package's candidates when a requirement for it is
+        # first merged, so a requirement with extras has to follow the ones
+        # without, or an exact pin that comes later wouldn't reach it, see
+        # PyPIProvider.pinned_exactly. pip sorts its requirements the same
+        # way. The sort is stable, so the order is otherwise kept.
+        ordered = sorted(requirements, key=lambda r: bool(r.extras))
+
         # Resolve
-        result = resolver.resolve(requirements, max_rounds=MAX_ROUNDS)
+        result = resolver.resolve(ordered, max_rounds=MAX_ROUNDS)
 
         # Convert result to our format, folding extras candidates into their
         # base package.  An extras candidate pins its base package to the same
         # version, so the versions always agree.
         resolved = {}
         for candidate in result.mapping.values():
+            # Warn for the selected files only, not for every one offered
+            if (
+                candidate.package is not None
+                and candidate.package.link.is_yanked
+            ):
+                provider.warn_yanked(
+                    candidate.name,
+                    candidate.version,
+                    candidate.package.link.yank_reason,
+                )
             info = resolved.setdefault(
                 candidate.name,
                 {'version': str(candidate.version), 'extras': set()},

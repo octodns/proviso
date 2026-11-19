@@ -1,7 +1,7 @@
 import math
 import tarfile
 from collections import namedtuple
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from io import BytesIO
 from os.path import join
@@ -12,21 +12,27 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 from zipfile import ZipFile
 
+import httpx2
 from build import BuildBackendException
 from packaging.metadata import InvalidMetadata, Metadata
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.version import Version
+from resolvelib import ResolutionImpossible
 from unearth import Link, PackageFinder
 from unearth.errors import UnpackError
+from unearth.fetchers import DEFAULT_SECURE_ORIGINS
 
 from proviso.resolver import (
     _CONFLICT_PRIORITY_THRESHOLD,
     MAX_ROUNDS,
+    BasePin,
     Candidate,
     MetadataUnavailableError,
     PyPIProvider,
     Resolver,
     filter_requirements,
+    is_exact_pin,
     make_identifier,
     split_identifier,
 )
@@ -36,6 +42,77 @@ from proviso.series import SeriesPackageFinder
 # resolvelib defines RequirementInformation(requirement, parent); we use the
 # same field names so tests read naturally.
 _RequirementInfo = namedtuple('_RequirementInfo', ['requirement', 'parent'])
+
+NOW = datetime.now(timezone.utc)
+
+
+def index_file(name, version, days=100, sdist=False, tag='py3', **kwargs):
+    """Return a PEP 691 file entry uploaded days ago, with extra keys."""
+    if sdist:
+        filename = f'{name}-{version}.tar.gz'
+    else:
+        filename = f'{name}-{version}-{tag}-none-any.whl'
+    entry = {
+        'filename': filename,
+        'url': f'https://files.example.com/{filename}',
+        'hashes': {},
+        'core-metadata': True,
+        'upload-time': (NOW - timedelta(days=days)).isoformat(),
+    }
+    entry.update(kwargs)
+    return entry
+
+
+class FakeIndex(httpx2.Client):
+    """A PEP 691 JSON index serving files and their metadata.
+
+    files maps a package name to its file entries, see index_file.
+    requires maps (name, version) to that release's Requires-Dist.
+    Index pages on html_hosts use the HTML API, which has no upload times.
+    """
+
+    def __init__(self, files, requires=None, html_hosts=()):
+        requires = requires or {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith('.metadata'):
+                name, version = path.split('/')[-1].split('-')[:2]
+                lines = [
+                    'Metadata-Version: 2.1',
+                    f'Name: {name}',
+                    f'Version: {version}',
+                ]
+                lines.extend(
+                    f'Requires-Dist: {r}'
+                    for r in requires.get((name, version), ())
+                )
+                return httpx2.Response(200, text='\n'.join(lines) + '\n')
+            name = path.rstrip('/').split('/')[-1]
+            if request.url.host in html_hosts:
+                anchors = ''.join(
+                    f'<a href="{f["url"]}">{f["filename"]}</a>'
+                    for f in files.get(name, [])
+                )
+                return httpx2.Response(
+                    200,
+                    headers={'Content-Type': 'text/html'},
+                    text=f'<html><body>{anchors}</body></html>',
+                )
+            return httpx2.Response(
+                200,
+                headers={'Content-Type': 'application/vnd.pypi.simple.v1+json'},
+                json={
+                    'meta': {'api-version': '1.1'},
+                    'name': name,
+                    'files': files.get(name, []),
+                },
+            )
+
+        super().__init__(transport=httpx2.MockTransport(handler))
+
+    def iter_secure_origins(self):
+        yield from DEFAULT_SECURE_ORIGINS
 
 
 class TestCandidate(TestCase):
@@ -171,10 +248,7 @@ class TestPyPIProvider(TestCase):
 
             # Verify PackageFinder was created correctly
             mock_finder.assert_called_once_with(
-                session=session,
-                index_urls=index_urls,
-                target_python=None,
-                exclude_newer_than=None,
+                session=session, index_urls=index_urls, target_python=None
             )
 
             # No target series when no python_version specified
@@ -435,10 +509,13 @@ class TestPyPIProvider(TestCase):
             # Mock package results
             mock_package1 = MagicMock()
             mock_package1.version = '2.28.0'
+            mock_package1.link.is_yanked = False
             mock_package2 = MagicMock()
             mock_package2.version = '2.27.0'
+            mock_package2.link.is_yanked = False
             mock_package3 = MagicMock()
             mock_package3.version = '2.26.0'
+            mock_package3.link.is_yanked = False
 
             mock_finder.find_matches.return_value = [
                 mock_package1,
@@ -471,8 +548,10 @@ class TestPyPIProvider(TestCase):
 
             mock_package1 = MagicMock()
             mock_package1.version = '2.28.0'
+            mock_package1.link.is_yanked = False
             mock_package2 = MagicMock()
             mock_package2.version = '2.27.0'
+            mock_package2.link.is_yanked = False
 
             mock_finder.find_matches.return_value = [
                 mock_package1,
@@ -507,8 +586,10 @@ class TestPyPIProvider(TestCase):
 
             mock_package1 = MagicMock()
             mock_package1.version = '2.28.0'
+            mock_package1.link.is_yanked = False
             mock_package2 = MagicMock()
             mock_package2.version = '2.27.0'
+            mock_package2.link.is_yanked = False
 
             mock_finder.find_matches.return_value = [
                 mock_package1,
@@ -551,7 +632,7 @@ class TestPyPIProvider(TestCase):
 
             # Should be called with the bare identifier, not a specifier string
             mock_finder.find_matches.assert_called_once_with(
-                'requests', allow_prereleases=True
+                'requests', allow_yanked=True, allow_prereleases=True
             )
 
     def test_find_matches_incompatibility_filtering_applied_per_call(self):
@@ -568,8 +649,10 @@ class TestPyPIProvider(TestCase):
 
             mock_package1 = MagicMock()
             mock_package1.version = '2.28.0'
+            mock_package1.link.is_yanked = False
             mock_package2 = MagicMock()
             mock_package2.version = '2.27.0'
+            mock_package2.link.is_yanked = False
 
             mock_finder.find_matches.return_value = [
                 mock_package1,
@@ -1126,29 +1209,25 @@ class TestPyPIProviderExcludeNewerThan(TestCase):
         exclude_newer_than = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
         with patch('proviso.resolver.SeriesPackageFinder') as mock_finder:
-            PyPIProvider(
+            provider = PyPIProvider(
                 session, index_urls, exclude_newer_than=exclude_newer_than
             )
 
-            # Verify PackageFinder was created with exclude_newer_than
+            # The provider applies the cooldown to each release, so the
+            # finder, which would apply it to each file, doesn't get it
             mock_finder.assert_called_once()
-            call_kwargs = mock_finder.call_args[1]
-            self.assertEqual(
-                exclude_newer_than, call_kwargs['exclude_newer_than']
-            )
+            self.assertNotIn('exclude_newer_than', mock_finder.call_args[1])
+            self.assertEqual(exclude_newer_than, provider.exclude_newer_than)
 
     def test_init_without_exclude_newer_than(self):
         """Test PyPIProvider initialization without exclude_newer_than."""
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder:
-            PyPIProvider(session, index_urls)
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            provider = PyPIProvider(session, index_urls)
 
-            # Verify PackageFinder was created with exclude_newer_than=None
-            mock_finder.assert_called_once()
-            call_kwargs = mock_finder.call_args[1]
-            self.assertIsNone(call_kwargs['exclude_newer_than'])
+            self.assertIsNone(provider.exclude_newer_than)
 
 
 class TestPyPIProviderExtrasBug(TestCase):
@@ -1390,6 +1469,7 @@ class TestFindMatchesPrerelease(TestCase):
             for v in versions:
                 pkg = MagicMock()
                 pkg.version = v
+                pkg.link.is_yanked = False
                 packages.append(pkg)
 
             mock_finder.find_matches.return_value = packages
@@ -1819,6 +1899,7 @@ class TestExtras(TestCase):
     def _make_package(self, name, version):
         package = MagicMock()
         package.version = version
+        package.link.is_yanked = False
         package.link.dist_info_link.url = f'https://pypi/{name}/{version}'
         return package
 
@@ -1923,7 +2004,7 @@ class TestExtras(TestCase):
             {},
         )
         provider.finder.find_matches.assert_called_once_with(
-            'hishel', allow_prereleases=True
+            'hishel', allow_yanked=True, allow_prereleases=True
         )
 
     def test_get_dependencies_extras_candidate(self):
@@ -2531,3 +2612,560 @@ class TestTargetPythonSeries(TestCase):
             'https://example.com/foo-1.0.tar.gz', requires_python='>=3.13'
         )
         self.assertIsNone(evaluator.evaluate_link(link))
+
+
+class TestYanked(TestCase):
+    """Yanked releases are candidates only for an exact pin (PEP 592)."""
+
+    FILES = {
+        'foo': [
+            index_file('foo', '1.0'),
+            index_file('foo', '1.1', yanked='broken build'),
+            index_file('foo', '1.2', yanked=True),
+        ],
+        'app': [index_file('app', '1.0')],
+    }
+    REQUIRES = {('app', '1.0'): ['foo==1.1']}
+
+    def _provider(self):
+        return PyPIProvider(
+            FakeIndex(self.FILES, self.REQUIRES),
+            ['https://pypi.org/simple/'],
+            python_version='3.12',
+        )
+
+    def _versions(self, identifier, requirements, provider=None):
+        provider = provider or self._provider()
+        requirements = {
+            k: [r if isinstance(r, Requirement) else Requirement(r) for r in v]
+            for k, v in requirements.items()
+        }
+        result = provider.find_matches(identifier, requirements, {})
+        return [str(c.version) for c in result]
+
+    def _resolve(self, *requirements):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        return {
+            name: info['version']
+            for name, info in resolver.resolve(
+                [Requirement(r) for r in requirements], python_version='3.12'
+            ).items()
+        }
+
+    def test_not_offered_without_exact_pin(self):
+        expected = {
+            'foo': ['1.0'],
+            'foo>=1.0': ['1.0'],
+            'foo==1.*': ['1.0'],
+            'foo>=1.1': [],
+            'foo~=1.1': [],
+            'foo!=1.0': [],
+        }
+        for spec, versions in expected.items():
+            with self.subTest(spec=spec):
+                with self.assertNoLogs('proviso.resolver', level='WARNING'):
+                    self.assertEqual(
+                        versions, self._versions('foo', {'foo': [spec]})
+                    )
+
+    def test_offered_for_exact_pin(self):
+        for spec in ('foo==1.1', 'foo==1.1.0', 'foo===1.1', 'foo>=1.0,==1.1'):
+            with self.subTest(spec=spec):
+                self.assertEqual(
+                    ['1.1'], self._versions('foo', {'foo': [spec]})
+                )
+
+    def test_exact_pin_on_another_version(self):
+        self.assertEqual(['1.0'], self._versions('foo', {'foo': ['foo==1.0']}))
+
+    def test_exact_pin_on_another_package(self):
+        self.assertEqual(
+            [],
+            self._versions('foo', {'foo': ['foo>=1.1'], 'bar': ['bar==1.1']}),
+        )
+
+    def test_not_offered_for_extras_base_pin(self):
+        """The pin an extras candidate adds isn't a real exact pin."""
+        self.assertEqual(
+            [], self._versions('foo', {'foo': [BasePin('foo==1.1')]})
+        )
+
+    def test_offered_for_exact_pin_with_extras(self):
+        """A real pin on the package with extras counts for the base too."""
+        requirements = {'foo[x]': ['foo[x]==1.1'], 'foo': [BasePin('foo==1.1')]}
+        self.assertEqual(['1.1'], self._versions('foo', requirements))
+        self.assertEqual(['1.1'], self._versions('foo[x]', requirements))
+
+    def test_get_dependencies_extras_pin(self):
+        provider = self._provider()
+        candidate = Candidate('foo', Version('1.1'), extras={'x'})
+        candidate.package = MagicMock()
+        candidate.package.link.dist_info_link = None
+        with patch.object(provider, '_get_requires_dist', return_value=[]):
+            (pin,) = provider.get_dependencies(candidate)
+        self.assertIsInstance(pin, BasePin)
+        self.assertEqual('foo==1.1', str(pin))
+
+    def test_resolve_project_pin(self):
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            self.assertEqual({'foo': '1.1'}, self._resolve('foo==1.1'))
+        self.assertEqual(
+            [
+                'WARNING:proviso.resolver:foo==1.1 is yanked (broken build); '
+                'using it because it is pinned exactly'
+            ],
+            logs.output,
+        )
+
+    def test_resolve_project_pin_with_extras(self):
+        self.assertEqual({'foo': '1.1'}, self._resolve('foo[x]==1.1'))
+
+    def test_resolve_transitive_pin(self):
+        self.assertEqual({'app': '1.0', 'foo': '1.1'}, self._resolve('app'))
+
+    def test_resolve_without_pin(self):
+        self.assertEqual({'foo': '1.0'}, self._resolve('foo'))
+
+    def test_warning_without_reason(self):
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            self.assertEqual({'foo': '1.2'}, self._resolve('foo==1.2'))
+        self.assertIn('foo==1.2 is yanked (no reason given)', logs.output[0])
+
+    def test_warning_logged_once_per_run(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            for python_version in ('3.12', '3.13'):
+                resolver.resolve(
+                    [Requirement('foo==1.1')], python_version=python_version
+                )
+            # A separate resolver is a separate run
+            Resolver(session=FakeIndex(self.FILES, self.REQUIRES)).resolve(
+                [Requirement('foo==1.1')], python_version='3.12'
+            )
+        yanked = [line for line in logs.output if 'is yanked' in line]
+        self.assertEqual(2, len(yanked))
+
+    def test_warning_once_for_extras_and_base(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            result = resolver.resolve(
+                [Requirement('foo[x]'), Requirement('foo==1.1')],
+                python_version='3.12',
+            )
+        self.assertEqual({'foo': {'version': '1.1', 'extras': ['x']}}, result)
+        self.assertEqual(1, len(logs.output))
+        self.assertIn('foo==1.1 is yanked', logs.output[0])
+
+    def test_no_warning_when_backtracked_away(self):
+        files = {
+            'foo': self.FILES['foo'],
+            'app': [index_file('app', '1.0'), index_file('app', '2.0')],
+        }
+        requires = {
+            ('app', '1.0'): ['foo>=1.0'],
+            ('app', '2.0'): ['foo==1.1', 'missing'],
+        }
+        resolver = Resolver(session=FakeIndex(files, requires))
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            result = resolver.resolve(
+                [Requirement('app')], python_version='3.12'
+            )
+        self.assertEqual(
+            {
+                'app': {'version': '1.0', 'extras': []},
+                'foo': {'version': '1.0', 'extras': []},
+            },
+            result,
+        )
+
+    def test_no_warning_when_unyanked_file_selected(self):
+        """Only some of a release's files are yanked."""
+        files = {
+            'foo': [
+                index_file('foo', '1.0'),
+                index_file('foo', '1.1', yanked='broken wheel'),
+                index_file('foo', '1.1', sdist=True),
+            ]
+        }
+        resolver = Resolver(session=FakeIndex(files))
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            result = resolver.resolve(
+                [Requirement('foo==1.1')], python_version='3.12'
+            )
+        self.assertEqual({'foo': {'version': '1.1', 'extras': []}}, result)
+
+    def test_warning_when_yanked_file_selected(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            resolver.resolve([Requirement('app')], python_version='3.12')
+        self.assertEqual(
+            [
+                'WARNING:proviso.resolver:foo==1.1 is yanked (broken build); '
+                'using it because it is pinned exactly'
+            ],
+            logs.output,
+        )
+
+    def test_candidate_without_package(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        result = MagicMock()
+        result.mapping = {'foo': Candidate('foo', Version('1.0'))}
+        with patch('proviso.resolver.ResolveLibResolver') as rl:
+            rl.return_value.resolve.return_value = result
+            with self.assertNoLogs('proviso.resolver', level='WARNING'):
+                self.assertEqual(
+                    {'foo': {'version': '1.0', 'extras': []}},
+                    resolver.resolve(
+                        [Requirement('foo')], python_version='3.12'
+                    ),
+                )
+
+    def test_resolve_extras_first_with_later_pin(self):
+        for order in (['foo[x]', 'foo==1.1'], ['foo==1.1', 'foo[x]']):
+            with self.subTest(order=order):
+                resolver = Resolver(
+                    session=FakeIndex(self.FILES, self.REQUIRES)
+                )
+                result = resolver.resolve(
+                    [Requirement(r) for r in order], python_version='3.12'
+                )
+                self.assertEqual(
+                    {'foo': {'version': '1.1', 'extras': ['x']}}, result
+                )
+
+    def test_extras_requirements_ordered_last(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        result = MagicMock()
+        result.mapping = {}
+        with patch('proviso.resolver.ResolveLibResolver') as rl:
+            rl.return_value.resolve.return_value = result
+            with patch('proviso.resolver.PyPIProvider') as provider:
+                resolver.resolve(
+                    [
+                        Requirement('foo[x]'),
+                        Requirement('bar'),
+                        Requirement('baz[y]'),
+                        Requirement('foo==1.1'),
+                    ],
+                    python_version='3.12',
+                )
+        passed = rl.return_value.resolve.call_args.args[0]
+        self.assertEqual(['bar', 'foo', 'foo', 'baz'], [r.name for r in passed])
+        self.assertEqual(
+            ['foo[x]', 'baz[y]'], [str(r) for r in passed if r.extras]
+        )
+        # The user's order is what's preferred, not the order passed on
+        self.assertEqual(
+            {'foo[x]': 0, 'foo': 0, 'bar': 1, 'baz[y]': 2, 'baz': 2},
+            provider.call_args.kwargs['user_requested'],
+        )
+
+    def test_yanked_files_sorted_last(self):
+        """Asking unearth for yanked files doesn't reorder the others."""
+        finder = self._provider().finder
+        with_yanked = list(
+            finder.find_matches(
+                'foo', allow_yanked=True, allow_prereleases=True
+            )
+        )
+        without = list(finder.find_matches('foo', allow_prereleases=True))
+        self.assertEqual(without, with_yanked[: len(without)])
+        self.assertEqual(
+            [False, True, True], [p.link.is_yanked for p in with_yanked]
+        )
+
+
+class TestIsExactPin(TestCase):
+    def test_is_exact_pin(self):
+        def pin(text):
+            return is_exact_pin(next(iter(SpecifierSet(text))))
+
+        self.assertTrue(pin('==1.0'))
+        self.assertTrue(pin('===1.0'))
+        self.assertFalse(pin('==1.*'))
+        self.assertFalse(pin('>=1.0'))
+        self.assertFalse(pin('~=1.0'))
+        self.assertFalse(pin('!=1.0'))
+
+
+class TestCooldown(TestCase):
+    """The cooldown dates a release by its first upload (#42)."""
+
+    CUTOFF = NOW - timedelta(days=7)
+
+    FILES = {
+        # 1.0 is old, a wheel was added to it inside the window
+        'foo': [
+            index_file('foo', '1.0', days=100, sdist=True),
+            index_file('foo', '1.0', days=2),
+            index_file('foo', '2.0', days=2, sdist=True),
+            index_file('foo', '2.0', days=2),
+            # Another project's file is ignored
+            index_file('other', '3.0', days=100),
+        ],
+        # 1.0 has only wheels; its first is incompatible with the target
+        'bar': [
+            index_file('bar', '1.0', days=100, tag='py2'),
+            index_file('bar', '1.0', days=2),
+        ],
+        # 1.0 has no upload times
+        'baz': [
+            index_file('baz', '1.0', **{'upload-time': None}),
+            index_file('baz', '0.9'),
+        ],
+        # 1.1 is new and preferred, but inside the window
+        'qux': [index_file('qux', '1.0'), index_file('qux', '1.1', days=1)],
+        'app': [index_file('app', '1.0')],
+    }
+    REQUIRES = {('app', '1.0'): ['qux==1.1']}
+
+    def _provider(self, **kwargs):
+        return PyPIProvider(
+            FakeIndex(self.FILES, self.REQUIRES),
+            ['https://pypi.org/simple/'],
+            python_version='3.12',
+            exclude_newer_than=self.CUTOFF,
+            **kwargs,
+        )
+
+    def _files(self, name, provider=None):
+        provider = provider or self._provider()
+        result = provider.find_matches(name, {name: [Requirement(name)]}, {})
+        return [c.package.link.filename for c in result]
+
+    def _resolve(self, *requirements):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        return {
+            name: info['version']
+            for name, info in resolver.resolve(
+                [Requirement(r) for r in requirements],
+                python_version='3.12',
+                exclude_newer_than=self.CUTOFF,
+            ).items()
+        }
+
+    def test_late_file_on_old_release(self):
+        self.assertEqual(
+            ['foo-1.0-py3-none-any.whl', 'foo-1.0.tar.gz'], self._files('foo')
+        )
+
+    def test_first_upload_of_incompatible_file(self):
+        """A file that isn't compatible with the target still dates it."""
+        self.assertEqual(['bar-1.0-py3-none-any.whl'], self._files('bar'))
+
+    def test_release_without_upload_time(self):
+        self.assertEqual(['baz-0.9-py3-none-any.whl'], self._files('baz'))
+
+    def test_new_release_excluded(self):
+        self.assertEqual(['qux-1.0-py3-none-any.whl'], self._files('qux'))
+        self.assertEqual({'qux': '1.0'}, self._resolve('qux'))
+
+    def test_without_cooldown(self):
+        provider = self._provider()
+        provider.exclude_newer_than = None
+        self.assertEqual(
+            ['qux-1.1-py3-none-any.whl', 'qux-1.0-py3-none-any.whl'],
+            self._files('qux', provider),
+        )
+
+    def test_first_upload(self):
+        provider = self._provider()
+        self._files('foo', provider)
+        self.assertEqual(
+            NOW - timedelta(days=100),
+            provider.finder.first_upload('Foo', Version('1.0')),
+        )
+        self.assertEqual(
+            NOW - timedelta(days=2),
+            provider.finder.first_upload('foo', Version('2.0')),
+        )
+        self.assertIsNone(provider.finder.first_upload('foo', Version('3.0')))
+        self.assertIsNone(provider.finder.first_upload('other', Version('3.0')))
+
+    def test_project_pin_inside_window(self):
+        for spec in ('qux==1.1', 'qux===1.1', 'qux[x]==1.1', 'qux==1.1.0'):
+            with self.subTest(spec=spec):
+                with self.assertLogs('proviso.resolver', level='INFO') as logs:
+                    self.assertEqual({'qux': '1.1'}, self._resolve(spec))
+                self.assertIn(
+                    'INFO:proviso.resolver:qux==1.1 is within the dependency '
+                    'cooldown; using it because the project pins it exactly',
+                    logs.output,
+                )
+
+    def test_project_pin_without_upload_time(self):
+        self.assertEqual({'baz': '1.0'}, self._resolve('baz==1.0'))
+
+    def test_project_pin_logged_once_per_run(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        with self.assertLogs('proviso.resolver', level='INFO') as logs:
+            for python_version in ('3.12', '3.13'):
+                resolver.resolve(
+                    [Requirement('qux==1.1')],
+                    python_version=python_version,
+                    exclude_newer_than=self.CUTOFF,
+                )
+        self.assertEqual(
+            1, len([line for line in logs.output if 'cooldown' in line])
+        )
+
+    def test_project_pin_not_exact(self):
+        for spec in ('qux>=1.1', 'qux~=1.1', 'qux==1.1.*'):
+            with self.subTest(spec=spec):
+                with self.assertRaises(ResolutionImpossible):
+                    self._resolve(spec)
+        self.assertEqual({'qux': '1.0'}, self._resolve('qux==1.*'))
+
+    def test_project_pin_on_another_package(self):
+        provider = self._provider(
+            project_requirements=[Requirement('foo==1.1')]
+        )
+        self.assertEqual(
+            ['qux-1.0-py3-none-any.whl'], self._files('qux', provider)
+        )
+
+    def test_transitive_pin_inside_window(self):
+        with self.assertRaises(ResolutionImpossible):
+            self._resolve('app')
+
+    def test_extras_base_pin_inside_window(self):
+        """The pin an extras candidate adds on its base isn't exempt."""
+        provider = self._provider()
+        requirements = {
+            'qux': [BasePin('qux==1.1')],
+            'qux[x]': [Requirement('qux[x]')],
+        }
+        self.assertEqual([], provider.find_matches('qux', requirements, {}))
+
+
+class TestCooldownWithoutUploadTimes(TestCase):
+    """An index that gives no upload times is reported once per run."""
+
+    CUTOFF = NOW - timedelta(days=7)
+    JSON_INDEX = 'https://pypi.org/simple/'
+    HTML_INDEX = 'https://html.example.com/simple/'
+
+    FILES = {
+        'foo': [index_file('foo', '1.0'), index_file('foo', '2.0')],
+        'bar': [index_file('bar', '1.0')],
+        # Only 1.0 lacks an upload time
+        'baz': [
+            index_file('baz', '1.0', **{'upload-time': None}),
+            index_file('baz', '0.9'),
+        ],
+    }
+
+    def _session(self):
+        return FakeIndex(self.FILES, html_hosts=('html.example.com',))
+
+    def _provider(self, index_urls=None, **kwargs):
+        kwargs.setdefault('exclude_newer_than', self.CUTOFF)
+        return PyPIProvider(
+            self._session(),
+            index_urls or [self.HTML_INDEX],
+            python_version='3.12',
+            **kwargs,
+        )
+
+    def _versions(self, provider, name):
+        result = provider.find_matches(name, {name: [Requirement(name)]}, {})
+        return [str(c.version) for c in result]
+
+    def _warnings(self, logs):
+        return [line for line in logs.output if 'no upload times' in line]
+
+    def test_warning(self):
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            self.assertEqual([], self._versions(self._provider(), 'foo'))
+        self.assertEqual(
+            [
+                'WARNING:proviso.resolver:https://html.example.com/simple/ '
+                'provided no upload times for foo, which happens when an '
+                'index only serves the HTML "simple" API and not the JSON '
+                "API; its releases can't be dated, so the dependency "
+                'cooldown excludes all of them. Other packages may be '
+                'affected too; --cooldown-days 0 disables the cooldown'
+            ],
+            logs.output,
+        )
+
+    def test_credentials_redacted(self):
+        provider = self._provider(
+            ['https://user:secret@html.example.com/simple/']
+        )
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            self._versions(provider, 'foo')
+        self.assertIn('***@html.example.com/simple/ provided', logs.output[0])
+        self.assertNotIn('secret', logs.output[0])
+
+    def test_once_per_run(self):
+        resolver = Resolver(
+            index_urls=[self.HTML_INDEX], session=self._session()
+        )
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            for python_version in ('3.12', '3.13'):
+                for name in ('foo', 'bar'):
+                    with self.assertRaises(ResolutionImpossible):
+                        resolver.resolve(
+                            [Requirement(name)],
+                            python_version=python_version,
+                            exclude_newer_than=self.CUTOFF,
+                        )
+        warnings = self._warnings(logs)
+        self.assertEqual(1, len(warnings))
+        self.assertIn('no upload times for foo', warnings[0])
+
+    def test_once_per_index(self):
+        """Only the HTML index is reported when it's mixed with a JSON one.
+
+        Both serve the same files.  foo's releases are dated by the JSON
+        index, baz 1.0 has no upload time on either.
+        """
+        resolver = Resolver(
+            index_urls=[self.JSON_INDEX, self.HTML_INDEX],
+            session=self._session(),
+        )
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            for name in ('foo', 'baz'):
+                resolver.resolve(
+                    [Requirement(name)],
+                    python_version='3.12',
+                    exclude_newer_than=self.CUTOFF,
+                )
+        warnings = self._warnings(logs)
+        self.assertEqual(1, len(warnings))
+        self.assertIn(
+            f'{self.HTML_INDEX} provided no upload times for baz', warnings[0]
+        )
+
+    def test_project_pin(self):
+        """A pin is still exempt, other releases are excluded and reported."""
+        provider = self._provider(
+            project_requirements=[Requirement('foo==1.0')]
+        )
+        with self.assertLogs('proviso.resolver', level='INFO') as logs:
+            self.assertEqual(['1.0'], self._versions(provider, 'foo'))
+        self.assertEqual(1, len(self._warnings(logs)))
+
+    def test_project_pin_only_release(self):
+        """Nothing is excluded when the pin is the only release."""
+        provider = self._provider(
+            project_requirements=[Requirement('bar==1.0')]
+        )
+        with self.assertLogs('proviso.resolver', level='INFO') as logs:
+            self.assertEqual(['1.0'], self._versions(provider, 'bar'))
+        self.assertEqual([], self._warnings(logs))
+
+    def test_some_upload_times(self):
+        provider = self._provider([self.JSON_INDEX])
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            self.assertEqual(['0.9'], self._versions(provider, 'baz'))
+
+    def test_no_files(self):
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            self.assertEqual([], self._versions(self._provider(), 'missing'))
+
+    def test_without_cooldown(self):
+        provider = self._provider(exclude_newer_than=None)
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            self.assertEqual(['2.0', '1.0'], self._versions(provider, 'foo'))

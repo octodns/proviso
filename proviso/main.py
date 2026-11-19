@@ -13,7 +13,12 @@ from resolvelib import ResolutionImpossible, ResolutionTooDeep
 
 from proviso.builder import Builder
 from proviso.python import Python
-from proviso.resolver import MetadataUnavailableError, Resolver, make_identifier
+from proviso.resolver import (
+    MetadataUnavailableError,
+    Resolver,
+    is_exact_pin,
+    make_identifier,
+)
 from proviso.series import PythonSeries
 from proviso.utils import CachingClient
 
@@ -103,9 +108,16 @@ def _resolution_error_message(error, python_version, cooldown=False):
             shown = ', '.join(parents[:3])
             if len(parents) > 3:
                 shown = f'{shown} and {len(parents) - 3} more'
+            # the cooldown exempts a version a project requirement pins
+            # exactly, so it can't be why no version of that matched
+            exempt = any(
+                cause.parent is None
+                and any(is_exact_pin(s) for s in cause.requirement.specifier)
+                for cause in error.causes
+            )
             hint = (
                 '; releases inside the --cooldown-days window are excluded'
-                if cooldown
+                if cooldown and not exempt
                 else ''
             )
             return (
@@ -368,7 +380,7 @@ def main():  # pragma: no cover
         '--cooldown-days',
         type=non_negative_int,
         default=7,
-        help='Exclude packages uploaded within this many days (dependency cooldown). Default: 7. Use 0 to disable.',
+        help='Exclude releases first uploaded within this many days (dependency cooldown). Files added later to an older release are still used, and a version the project pins exactly with == or === is exempt. Default: 7. Use 0 to disable.',
     )
     parser.add_argument(
         '--pre',
