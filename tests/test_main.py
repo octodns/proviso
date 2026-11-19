@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from build import BuildBackendException
 from packaging.requirements import Requirement
+from packaging.version import Version
 
 from proviso.main import (
     build_project_metadata,
@@ -15,6 +16,7 @@ from proviso.main import (
     parse_and_validate_args,
     write_requirements_to_file,
 )
+from proviso.resolver import MetadataUnavailableError
 
 
 class TestBuildProjectMetadata(TestCase):
@@ -193,6 +195,39 @@ class TestFindRequirements(TestCase):
                     expected,
                     mock_resolver.resolve.call_args.kwargs['allow_prereleases'],
                 )
+
+    def test_find_requirements_passes_build_sdists(self):
+        """build_sdists defaults to False and is passed to the resolver."""
+        requirements = [Requirement('requests>=2.0.0')]
+        for kwargs, expected in (({}, False), ({'build_sdists': True}, True)):
+            with patch('proviso.main.Resolver') as mock_resolver_class:
+                mock_resolver = mock_resolver_class.return_value
+                mock_resolver.resolve.return_value = {}
+                with patch('proviso.main.log'):
+                    find_requirements(requirements, ['3.9'], **kwargs)
+                self.assertEqual(
+                    expected,
+                    mock_resolver.resolve.call_args.kwargs['build_sdists'],
+                )
+
+    def test_find_requirements_metadata_unavailable(self):
+        """A MetadataUnavailableError is logged as one error and exits 1."""
+        requirements = [Requirement('requests>=2.0.0')]
+        error = MetadataUnavailableError(
+            'foo', Version('1.0'), 'pass --build-sdists to allow that'
+        )
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = error
+            with patch('proviso.main.exit', side_effect=SystemExit(1)) as ex:
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(requirements, ['3.9'])
+        ex.assert_called_once_with(1)
+        mock_log.error.assert_called_once()
+        message = mock_log.error.call_args[0][0]
+        self.assertIn('foo==1.0', message)
+        self.assertIn('pass --build-sdists to allow that', message)
+        self.assertIn('3.9', message)
 
     def test_find_requirements_passes_extras(self):
         """extras defaults to empty and is passed to the resolver."""

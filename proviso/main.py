@@ -11,7 +11,7 @@ from build import BuildBackendException
 
 from proviso.builder import Builder
 from proviso.python import Python
-from proviso.resolver import Resolver
+from proviso.resolver import MetadataUnavailableError, Resolver
 from proviso.series import PythonSeries
 from proviso.utils import CachingClient
 
@@ -55,6 +55,7 @@ def find_requirements(
     exclude_newer_than=None,
     allow_prereleases=False,
     extras=(),
+    build_sdists=False,
 ):
 
     if not requirements:
@@ -72,13 +73,21 @@ def find_requirements(
     for python_version in python_versions:
         log.info(f'Resolving dependencies for Python {python_version}')
 
-        resolved = resolver.resolve(
-            requirements,
-            python_version=python_version,
-            exclude_newer_than=exclude_newer_than,
-            allow_prereleases=allow_prereleases,
-            extras=extras,
-        )
+        try:
+            resolved = resolver.resolve(
+                requirements,
+                python_version=python_version,
+                exclude_newer_than=exclude_newer_than,
+                allow_prereleases=allow_prereleases,
+                extras=extras,
+                build_sdists=build_sdists,
+            )
+        except MetadataUnavailableError as e:
+            log.error(
+                f'Unable to resolve dependencies for Python {python_version}: '
+                f'{e}'
+            )
+            exit(1)
 
         log.info(
             f'Resolved {len(resolved)} dependencies for Python {python_version}'
@@ -265,6 +274,12 @@ def main():  # pragma: no cover
         default=False,
         help='Include pre-release versions for all packages. By default, pre-releases are only used for a package whose specifier names one (e.g. "foo>=2.0b1").',
     )
+    parser.add_argument(
+        '--build-sdists',
+        action='store_true',
+        default=False,
+        help="Allow proviso to run a package's build backend to learn its dependencies when neither the index nor the sdist provides usable metadata. The build runs under the Python running proviso, not the target Python, and executes the package's build code.",
+    )
 
     args = parser.parse_args()
 
@@ -318,6 +333,7 @@ def main():  # pragma: no cover
             exclude_newer_than=exclude_newer_than,
             allow_prereleases=args.pre,
             extras=parsed['extras'],
+            build_sdists=args.build_sdists,
         )
 
         write_requirements_to_file(

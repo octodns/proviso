@@ -1,11 +1,19 @@
 from functools import cached_property
 from os import environ
-from os.path import join
-from subprocess import run
+from os.path import isfile, join
+from subprocess import CalledProcessError, run
 from tempfile import TemporaryDirectory
+from zipfile import ZipFile
 
 from build import ProjectBuilder
-from packaging.metadata import Metadata
+from build.util import project_wheel_metadata
+from packaging.metadata import Metadata, parse_email
+from packaging.utils import canonicalize_name
+from packaging.version import Version
+
+# PEP 643: from Metadata-Version 2.2 on, an sdist's PKG-INFO fields are
+# reliable unless they're listed in Dynamic.
+_RELIABLE_PKG_INFO_VERSION = Version('2.2')
 
 
 def _runner(cmd, cwd=None, extra_environ=None):
@@ -27,3 +35,108 @@ class Builder:
             metadata_path = builder.metadata_path(tmpdir)
             with open(join(metadata_path, 'METADATA')) as f:
                 return Metadata.from_email(f.read())
+
+
+def wheel_metadata(path, name):
+    """Return the Metadata in a wheel's .dist-info/METADATA, or None.
+
+    As pip does, requires exactly one top-level .dist-info directory and that
+    it belongs to the named project. Raises if Requires-Dist can't be decoded.
+    """
+    with ZipFile(path) as zf:
+        names = zf.namelist()
+        info_dirs = sorted(
+            {
+                n.partition('/')[0]
+                for n in names
+                if '/' in n and n.partition('/')[0].endswith('.dist-info')
+            }
+        )
+        if not info_dirs:
+            return None
+        if len(info_dirs) > 1:
+            raise ValueError(
+                f'multiple .dist-info directories found: {", ".join(info_dirs)}'
+            )
+        info_dir = info_dirs[0]
+        canonical_name = canonicalize_name(name)
+        if not canonicalize_name(info_dir).startswith(canonical_name):
+            raise ValueError(
+                f'.dist-info directory {info_dir!r} does not start with '
+                f'{canonical_name!r}'
+            )
+        metadata_path = f'{info_dir}/METADATA'
+        if metadata_path not in names:
+            return None
+        data = zf.read(metadata_path)
+
+    raw, unparsed = parse_email(data)
+    if 'requires-dist' in unparsed:
+        raise ValueError('Requires-Dist could not be decoded')
+    return Metadata.from_raw(raw, validate=False)
+
+
+def sdist_pkg_info_metadata(source_dir):
+    """Return the Metadata in an unpacked sdist's PKG-INFO.
+
+    Returns None when there's no PKG-INFO or when its Requires-Dist can't be
+    trusted under PEP 643: Metadata-Version is older than 2.2, Requires-Dist
+    is listed in Dynamic, or either header can't be decoded.
+    """
+    path = join(source_dir, 'PKG-INFO')
+    if not isfile(path):
+        return None
+    with open(path, 'rb') as f:
+        data = f.read()
+
+    raw, unparsed = parse_email(data)
+    # A header with an undecodable value is dropped from raw, so Requires-Dist
+    # or Dynamic can't be trusted
+    if 'requires-dist' in unparsed or 'dynamic' in unparsed:
+        return None
+    metadata_version = raw.get('metadata_version', '0')
+    dynamic = {d.lower() for d in raw.get('dynamic', [])}
+    if (
+        Version(metadata_version) < _RELIABLE_PKG_INFO_VERSION
+        or 'requires-dist' in dynamic
+    ):
+        return None
+
+    return Metadata.from_email(data, validate=False)
+
+
+def build_sdist_metadata(source_dir):
+    """Ask an unpacked sdist's build backend for its metadata.
+
+    The backend runs in an isolated build environment, as pip does. Known
+    limitation (#53): that environment uses the interpreter running proviso
+    rather than the target Python, so a backend that computes dependencies
+    from the running interpreter reports them for this one, and the result is
+    reused for every target Python.
+    """
+    message = project_wheel_metadata(source_dir, isolated=True)
+    # The message can't be reliably serialized back to text (multi-line
+    # fields fail to fold), so only carry over what proviso uses.
+    raw = {'requires_dist': message.get_all('Requires-Dist') or []}
+    return Metadata.from_raw(raw, validate=False)
+
+
+def build_failure_reason(exception):
+    """Describe a build failure, including any captured process output."""
+    reason = str(exception) or repr(exception)
+    # build wraps subprocess failures in BuildBackendException and
+    # FailedProcessError, both of which keep the original in .exception
+    cpe = getattr(exception, 'exception', exception)
+    if isinstance(cpe, CalledProcessError):
+        for label, output in (('stdout', cpe.output), ('stderr', cpe.stderr)):
+            if not output:
+                continue
+            if isinstance(output, bytes):
+                output = output.decode('utf-8', errors='replace')
+            reason += f'''
+
+captured {label}:
+--------------------------------------------------------------------------------
+{output}
+--------------------------------------------------------------------------------'''
+    return reason

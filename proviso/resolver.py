@@ -2,9 +2,11 @@ import math
 from collections import defaultdict
 from logging import getLogger
 from operator import attrgetter
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from packaging.markers import default_environment
-from packaging.metadata import Metadata
+from packaging.metadata import InvalidMetadata, Metadata
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -13,6 +15,12 @@ from resolvelib import Resolver as ResolveLibResolver
 from unearth import TargetPython
 from unearth.auth import MultiDomainBasicAuth
 
+from .builder import (
+    build_failure_reason,
+    build_sdist_metadata,
+    sdist_pkg_info_metadata,
+    wheel_metadata,
+)
 from .series import PythonSeries, SeriesPackageFinder
 from .utils import CachingClient
 
@@ -118,6 +126,18 @@ class Candidate:
         return hash((self.name, self.version, self.extras))
 
 
+class MetadataUnavailableError(Exception):
+    """A package version's metadata, and so its dependencies, is unavailable."""
+
+    def __init__(self, name, version, reason):
+        self.name = name
+        self.version = version
+        self.reason = reason
+        super().__init__(
+            f'Unable to get the metadata for {name}=={version}: {reason}'
+        )
+
+
 class PyPIProvider(AbstractProvider):
     """Provider that queries PyPI for packages and their dependencies."""
 
@@ -129,13 +149,25 @@ class PyPIProvider(AbstractProvider):
         exclude_newer_than=None,
         user_requested=None,
         allow_prereleases=False,
+        file_requires_dist_cache=None,
+        build_sdists=False,
     ):
         self.session = session
+        # When True, an sdist's build backend may be run to learn its
+        # dependencies.  When False that raises MetadataUnavailableError
+        # instead, as it executes the package's build code.
+        self.build_sdists = build_sdists
         # When True, pre-releases are candidates for every package (like pip's
         # --pre).  When False, only for packages whose specifiers name one.
         self.allow_prereleases = allow_prereleases
         self._dependencies_cache = {}
         self._requires_dist_cache = {}
+        # Requires-Dist read from downloaded files, keyed by file URL.  The
+        # Resolver shares this across providers (one per target Python) so a
+        # file is downloaded, and an sdist built, at most once per run.
+        self._file_requires_dist_cache = (
+            {} if file_requires_dist_cache is None else file_requires_dist_cache
+        )
         self._matches_cache = {}
         # Conflict-promotion state (mirrors pip's PipProvider)
         self._conflict_counts = defaultdict(int)
@@ -393,11 +425,93 @@ class PyPIProvider(AbstractProvider):
             metadata = Metadata.from_email(response.text, validate=False)
             requires_dist = list(metadata.requires_dist or [])
         else:
-            # Fallback: no metadata available
-            requires_dist = []
+            # No metadata from the index, e.g. for sdists, so get it from the
+            # file itself as pip does
+            requires_dist = self._get_file_requires_dist(
+                candidate, package.link
+            )
 
         self._requires_dist_cache[cache_key] = requires_dist
         return requires_dist
+
+    def _get_file_requires_dist(self, candidate, link):
+        """Return the Requires-Dist entries read from a candidate's file."""
+        url = link.url_without_fragment
+        if url not in self._file_requires_dist_cache:
+            metadata = self._download_metadata(candidate, link)
+            try:
+                requires_dist = list(metadata.requires_dist or [])
+            except InvalidMetadata as e:
+                raise MetadataUnavailableError(
+                    candidate.name,
+                    candidate.version,
+                    f'invalid Requires-Dist in {link.filename}: {e}',
+                ) from e
+            self._file_requires_dist_cache[url] = requires_dist
+        return self._file_requires_dist_cache[url]
+
+    def _download_metadata(self, candidate, link):
+        """Download a candidate's file and return its Metadata.
+
+        Wheels carry it in .dist-info/METADATA.  Sdists carry it in PKG-INFO,
+        which is used when PEP 643 says it's reliable; otherwise the sdist's
+        build backend is asked for it, if build_sdists allows that.
+        """
+        name, version = candidate.name, candidate.version
+        log.info(f'Downloading {link.filename} for {name}=={version} metadata')
+        with TemporaryDirectory() as tmpdir:
+            location = Path(tmpdir) / 'unpacked'
+            location.mkdir()
+            try:
+                path = self.finder.download_and_unpack(
+                    link, location, download_dir=Path(tmpdir) / 'download'
+                )
+            except Exception as e:
+                raise MetadataUnavailableError(
+                    name, version, f'downloading {link.redacted} failed: {e}'
+                ) from e
+
+            try:
+                if link.is_wheel:
+                    metadata = wheel_metadata(path, name)
+                else:
+                    metadata = sdist_pkg_info_metadata(path)
+            except Exception as e:
+                raise MetadataUnavailableError(
+                    name, version, f'reading {link.filename} failed: {e}'
+                ) from e
+
+            if metadata is not None:
+                return metadata
+            if link.is_wheel:
+                raise MetadataUnavailableError(
+                    name, version, f'no METADATA in {link.filename}'
+                )
+
+            if not self.build_sdists:
+                raise MetadataUnavailableError(
+                    name,
+                    version,
+                    f'its dependencies can only be learned by building '
+                    f'{link.filename}, which runs the package\'s build code; '
+                    'pass --build-sdists to allow that',
+                )
+
+            log.info(f'Building {name}=={version} to get its metadata')
+            try:
+                metadata = build_sdist_metadata(path)
+            except Exception as e:
+                raise MetadataUnavailableError(
+                    name,
+                    version,
+                    f'building {link.filename} failed: {build_failure_reason(e)}',
+                ) from e
+            # See build_sdist_metadata and #53
+            log.warning(
+                f'Metadata for {name}=={version} was built under the Python '
+                'running proviso and is reused for every target Python version'
+            )
+            return metadata
 
     def get_dependencies(self, candidate):
         """Get dependencies for a candidate.
@@ -471,6 +585,8 @@ class Resolver:
             session = CachingClient()
         self._session = session
         self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
+        # Shared by every provider this resolver creates, see PyPIProvider
+        self._file_requires_dist_cache = {}
 
     def resolve(
         self,
@@ -479,6 +595,7 @@ class Resolver:
         exclude_newer_than=None,
         allow_prereleases=False,
         extras=(),
+        build_sdists=False,
     ):
         """Resolve dependencies for the given requirements.
 
@@ -497,12 +614,19 @@ class Resolver:
             extras: Names of the project extras that are selected. Only the
                           requirements that apply to python_version with these
                           extras are resolved.
+            build_sdists: Allow running a package's build backend, under the
+                          Python running proviso, to learn the dependencies of
+                          an sdist when neither the index nor the sdist's
+                          PKG-INFO provides them. This executes the package's
+                          build code. By default MetadataUnavailableError is
+                          raised for such a package instead.
 
         Returns:
             Dict mapping package names to metadata dicts with 'version' and 'extras'
 
         Raises:
             resolvelib.ResolutionImpossible: If resolution fails
+            MetadataUnavailableError: If a package's metadata can't be obtained
         """
         requirements = filter_requirements(
             requirements, python_version=python_version, extras=extras
@@ -525,6 +649,8 @@ class Resolver:
             exclude_newer_than=exclude_newer_than,
             user_requested=user_requested,
             allow_prereleases=allow_prereleases,
+            file_requires_dist_cache=self._file_requires_dist_cache,
+            build_sdists=build_sdists,
         )
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)

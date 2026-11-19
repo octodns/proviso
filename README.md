@@ -96,12 +96,36 @@ Pre-releases are skipped unless a requirement's specifier names one, such as
 proviso --pre
 ```
 
+#### Packages without index metadata
+
+When the index serves no metadata for a package's file, proviso downloads it and
+reads the dependencies from the file itself: a wheel's `METADATA`, or an sdist's
+`PKG-INFO` when it's reliable (Metadata-Version 2.2 or later with
+`Requires-Dist` not `Dynamic`). Neither runs any package code.
+
+Some sdist-only packages can only report their dependencies by running their
+build backend. That's off by default, and proviso fails with an error naming the
+package and version. To allow it:
+
+```bash
+proviso --build-sdists
+```
+
+Caveats:
+
+- Building executes the package's build code, so only use `--build-sdists` for
+  packages you trust. A warning names each package that's built.
+- The build runs under the Python running proviso, not the target Python, and
+  the result is reused for every target Python version. A package whose
+  dependencies vary by Python version may be resolved incorrectly (see
+  [#53](https://github.com/octodns/proviso/issues/53)).
+
 #### Full command-line reference
 
 ```console
 usage: proviso [-h] [--directory DIRECTORY] [--extras EXTRAS] [--python-versions PYTHON_VERSIONS] [--filename FILENAME]
                [--level {DEBUG,ERROR,INFO,WARNING,debug,error,info,warning}] [--header HEADER] [--cache-db CACHE_DB]
-               [--cooldown-days COOLDOWN_DAYS] [--pre]
+               [--cooldown-days COOLDOWN_DAYS] [--pre] [--build-sdists]
 
 Extract project requirements, resolve dependencies, and manage requirements.txt
 
@@ -127,6 +151,9 @@ options:
                         disable.
   --pre                 Include pre-release versions for all packages. By default, pre-releases are only used for a
                         package whose specifier names one (e.g. "foo>=2.0b1").
+  --build-sdists        Allow proviso to run a package's build backend to learn its dependencies when neither the index nor
+                        the sdist provides usable metadata. The build runs under the Python running proviso, not the target
+                        Python, and executes the package's build code.
 ```
 
 #### Features

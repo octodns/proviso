@@ -1,9 +1,21 @@
+from email.message import Message
+from os.path import join
+from subprocess import CalledProcessError
+from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import MagicMock, mock_open, patch
 
+from build import BuildBackendException
 from packaging.metadata import Metadata
+from packaging.requirements import Requirement
 
-from proviso.builder import Builder, _runner
+from proviso.builder import (
+    Builder,
+    _runner,
+    build_failure_reason,
+    build_sdist_metadata,
+    sdist_pkg_info_metadata,
+)
 
 
 class TestRunner(TestCase):
@@ -278,3 +290,60 @@ Version: 1.0.0
                         mock_file.assert_called_once_with(
                             '/expected/path/METADATA'
                         )
+
+
+class TestBuildSdistMetadata(TestCase):
+    def test_requires_dist(self):
+        message = Message()
+        message['Name'] = 'foo'
+        message['Requires-Dist'] = 'six'
+        message['Requires-Dist'] = 'pytest; extra == "test"'
+        with patch(
+            'proviso.builder.project_wheel_metadata', return_value=message
+        ) as mock_metadata:
+            metadata = build_sdist_metadata('/src')
+        mock_metadata.assert_called_once_with('/src', isolated=True)
+        self.assertEqual(
+            [Requirement('six'), Requirement('pytest; extra == "test"')],
+            metadata.requires_dist,
+        )
+
+    def test_no_requires_dist(self):
+        with patch(
+            'proviso.builder.project_wheel_metadata', return_value=Message()
+        ):
+            metadata = build_sdist_metadata('/src')
+        self.assertEqual([], metadata.requires_dist)
+
+
+class TestSdistPkgInfoMetadata(TestCase):
+    def test_missing_metadata_version_is_unreliable(self):
+        with TemporaryDirectory() as tmpdir:
+            with open(join(tmpdir, 'PKG-INFO'), 'w') as fh:
+                fh.write('Name: foo\nVersion: 1.0\nRequires-Dist: six\n')
+            self.assertIsNone(sdist_pkg_info_metadata(tmpdir))
+
+
+class TestBuildFailureReason(TestCase):
+    def test_plain_exception(self):
+        self.assertEqual('boom', build_failure_reason(ValueError('boom')))
+
+    def test_exception_without_message(self):
+        self.assertEqual('ValueError()', build_failure_reason(ValueError()))
+
+    def test_called_process_error_text_output(self):
+        error = CalledProcessError(1, ['pip'], output='pip output')
+        reason = build_failure_reason(error)
+        self.assertIn('captured stdout:', reason)
+        self.assertIn('pip output', reason)
+        self.assertNotIn('captured stderr:', reason)
+
+    def test_wrapped_called_process_error_bytes_output(self):
+        error = CalledProcessError(1, ['python'], stderr=b'bad \xff backend')
+        reason = build_failure_reason(
+            BuildBackendException(error, 'Backend failed')
+        )
+        self.assertTrue(reason.startswith('Backend failed'))
+        self.assertNotIn('captured stdout:', reason)
+        self.assertIn('captured stderr:', reason)
+        self.assertIn('bad � backend', reason)
