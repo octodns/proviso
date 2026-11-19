@@ -38,6 +38,11 @@ log = getLogger('proviso.resolver')
 _CONFLICT_PRIORITY_THRESHOLD = 5
 
 
+# The most rounds resolvelib may take before giving up.  This matches pip's
+# limit (pip/_internal/resolution/resolvelib/resolver.py, max_rounds).
+MAX_ROUNDS = 200000
+
+
 def make_identifier(name, extras=None):
     """Return the resolver identifier for a package name and extras.
 
@@ -423,7 +428,14 @@ class PyPIProvider(AbstractProvider):
 
             # Disable validation to handle metadata version mismatches
             metadata = Metadata.from_email(response.text, validate=False)
-            requires_dist = list(metadata.requires_dist or [])
+            try:
+                requires_dist = list(metadata.requires_dist or [])
+            except InvalidMetadata as e:
+                raise MetadataUnavailableError(
+                    candidate.name,
+                    candidate.version,
+                    f'invalid Requires-Dist in the index metadata: {e}',
+                ) from e
         else:
             # No metadata from the index, e.g. for sdists, so get it from the
             # file itself as pip does
@@ -656,7 +668,7 @@ class Resolver:
         resolver = ResolveLibResolver(provider, reporter)
 
         # Resolve
-        result = resolver.resolve(requirements, max_rounds=1000)
+        result = resolver.resolve(requirements, max_rounds=MAX_ROUNDS)
 
         # Convert result to our format, folding extras candidates into their
         # base package.  An extras candidate pins its base package to the same

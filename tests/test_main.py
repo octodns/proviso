@@ -1,22 +1,27 @@
+from argparse import ArgumentTypeError
 from datetime import datetime, timezone
 from os.path import join
 from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
+import httpx2
 from build import BuildBackendException
 from packaging.requirements import Requirement
 from packaging.version import Version
+from resolvelib import ResolutionImpossible, ResolutionTooDeep
+from resolvelib.structs import RequirementInformation
 
 from proviso.main import (
     build_project_metadata,
     find_requirements,
     format_and_print_metadata,
+    non_negative_int,
     parse_and_validate_args,
     write_requirements_to_file,
 )
-from proviso.resolver import MetadataUnavailableError
+from proviso.resolver import Candidate, MetadataUnavailableError
 
 
 class TestBuildProjectMetadata(TestCase):
@@ -229,6 +234,91 @@ class TestFindRequirements(TestCase):
         self.assertIn('pass --build-sdists to allow that', message)
         self.assertIn('3.9', message)
 
+    def _resolve_failure(self, error):
+        requirements = [Requirement('requests>=2.0.0')]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = error
+            with patch('proviso.main.exit', side_effect=SystemExit(1)) as ex:
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(requirements, ['3.9'])
+        ex.assert_called_once_with(1)
+        mock_log.error.assert_called_once()
+        return mock_log.error.call_args[0][0]
+
+    def test_find_requirements_resolution_impossible(self):
+        """Conflicting requirements are listed one per line with sources."""
+        bar = Candidate('bar', Version('1.0'))
+        error = ResolutionImpossible(
+            [
+                RequirementInformation(Requirement('foo>=2'), bar),
+                RequirementInformation(Requirement('foo<2'), None),
+            ]
+        )
+        message = self._resolve_failure(error)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9, these '
+            'requirements conflict:\n'
+            '  foo>=2 (from bar==1.0)\n'
+            '  foo<2 (from the project)',
+            message,
+        )
+
+    def test_find_requirements_resolution_too_deep(self):
+        """Hitting the round limit is one line naming Python and the limit."""
+        message = self._resolve_failure(ResolutionTooDeep(200000))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: gave up after '
+            'the limit of 200000 resolution rounds',
+            message,
+        )
+
+    def test_find_requirements_http_error_with_request(self):
+        """A transport error names the URL and the underlying error."""
+        request = httpx2.Request('GET', 'https://pypi.org/simple/foo/')
+        error = httpx2.ConnectTimeout('timed out', request=request)
+        message = self._resolve_failure(error)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: request failed: '
+            'https://pypi.org/simple/foo/: timed out',
+            message,
+        )
+
+    def test_find_requirements_http_status_error(self):
+        """An error status names the URL and the status."""
+        request = httpx2.Request('GET', 'https://pypi.org/metadata')
+        response = httpx2.Response(503, request=request)
+        error = httpx2.HTTPStatusError(
+            'Server error 503', request=request, response=response
+        )
+        message = self._resolve_failure(error)
+        self.assertIn('https://pypi.org/metadata', message)
+        self.assertIn('Server error 503', message)
+
+    def test_find_requirements_http_error_without_request(self):
+        """An error with no request attached still reports the error."""
+        message = self._resolve_failure(httpx2.ReadError('connection reset'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: request failed: '
+            'connection reset',
+            message,
+        )
+
+    def test_find_requirements_http_error_without_text(self):
+        """An error with an empty message reports its type."""
+        message = self._resolve_failure(httpx2.ReadTimeout(''))
+        self.assertIn('ReadTimeout', message)
+
+    def test_find_requirements_unknown_error_propagates(self):
+        """Other exceptions are not handled."""
+        requirements = [Requirement('requests>=2.0.0')]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = KeyError('x')
+            with patch('proviso.main.exit') as ex:
+                with self.assertRaises(KeyError):
+                    find_requirements(requirements, ['3.9'])
+        ex.assert_not_called()
+
     def test_find_requirements_passes_extras(self):
         """extras defaults to empty and is passed to the resolver."""
         requirements = [Requirement('requests>=2.0.0')]
@@ -366,10 +456,89 @@ class TestParseAndValidateArgs(TestCase):
             mock_exit.assert_not_called()
             self.assertEqual(versions.split(','), result['python_versions'])
 
-    def test_invalid_python_version_still_raises(self):
-        """Test that an invalid target still raises ValueError."""
-        with self.assertRaises(ValueError):
-            self._parse_versions('3.12,3.13rc1')
+    def test_invalid_python_version_exits(self):
+        """An invalid target is one error naming it, single or among others."""
+        for versions, bad in (
+            ('3.12,3.13rc1', '3.13rc1'),
+            ('3.13rc1', '3.13rc1'),
+            ('3.12.5.1', '3.12.5.1'),
+            ('abc', 'abc'),
+        ):
+            _, mock_log, mock_exit = self._parse_versions(versions)
+            mock_log.error.assert_called_once_with(
+                f'Invalid Python version {bad!r}, expected X, X.Y or X.Y.Z'
+            )
+            mock_exit.assert_called_once_with(1)
+
+    def test_extras_requested_without_any_available(self):
+        """--extras on a project with no extras reports none available."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = None
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = 'dev'
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.exit') as mock_exit:
+            with patch('proviso.main.log') as mock_log:
+                with patch('proviso.main.argv', ['proviso']):
+                    parse_and_validate_args(mock_metadata, mock_args)
+
+        mock_log.error.assert_called_once_with(
+            'Invalid extras requested: dev. Available extras: none'
+        )
+        mock_exit.assert_called_once_with(1)
+
+    def _default_versions_failure(self, error):
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = None
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.Python') as mock_python_class:
+            mock_python_class.API_URL = 'https://endoflife.date/api/python.json'
+            type(mock_python_class.return_value).active = PropertyMock(
+                side_effect=error
+            )
+            with patch('proviso.main.exit') as mock_exit:
+                with patch('proviso.main.log') as mock_log:
+                    with patch('proviso.main.argv', ['proviso']):
+                        parse_and_validate_args(mock_metadata, mock_args)
+        mock_exit.assert_called_once_with(1)
+        mock_log.error.assert_called_once()
+        return mock_log.error.call_args[0][0]
+
+    def test_default_python_versions_http_error(self):
+        """A failed endoflife.date lookup is one error naming the URL."""
+        request = httpx2.Request(
+            'GET', 'https://endoflife.date/api/python.json'
+        )
+        message = self._default_versions_failure(
+            httpx2.ConnectError('name resolution failed', request=request)
+        )
+        self.assertEqual(
+            'Unable to look up the active Python versions from '
+            'https://endoflife.date/api/python.json: '
+            'https://endoflife.date/api/python.json: name resolution failed',
+            message,
+        )
+
+    def test_default_python_versions_http_error_without_request(self):
+        """The URL is still named when the error has no request."""
+        message = self._default_versions_failure(httpx2.ReadTimeout('slow'))
+        self.assertEqual(
+            'Unable to look up the active Python versions from '
+            'https://endoflife.date/api/python.json: slow',
+            message,
+        )
 
     def test_default_python_versions(self):
         """Test that Python versions default to active versions."""
@@ -770,3 +939,19 @@ class TestWriteRequirementsToFile(TestCase):
                 ['x-python-version-not-supported', 'b==1.0'],
                 self._selected(content, full_version),
             )
+
+
+class TestNonNegativeInt(TestCase):
+    def test_accepts_zero_and_positive(self):
+        self.assertEqual(0, non_negative_int('0'))
+        self.assertEqual(14, non_negative_int('14'))
+
+    def test_rejects_negative(self):
+        with self.assertRaises(ArgumentTypeError) as ctx:
+            non_negative_int('-1')
+        self.assertEqual('must be 0 or greater, got -1', str(ctx.exception))
+
+    def test_rejects_non_integer(self):
+        with self.assertRaises(ArgumentTypeError) as ctx:
+            non_negative_int('abc')
+        self.assertEqual("invalid int value: 'abc'", str(ctx.exception))

@@ -1,4 +1,4 @@
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from itertools import combinations
@@ -7,7 +7,9 @@ from os import getcwd, getenv
 from os.path import dirname, expanduser, join
 from sys import argv, exit
 
+import httpx2
 from build import BuildBackendException
+from resolvelib import ResolutionImpossible, ResolutionTooDeep
 
 from proviso.builder import Builder
 from proviso.python import Python
@@ -48,6 +50,51 @@ def format_and_print_metadata(metadata, extras, python_versions):
     )
 
 
+def non_negative_int(value):
+    """argparse type for an option that takes zero or more days."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise ArgumentTypeError(f'invalid int value: {value!r}') from None
+    if number < 0:
+        raise ArgumentTypeError(f'must be 0 or greater, got {number}')
+    return number
+
+
+def _http_error_message(error):
+    """Describe an httpx2 transport or status error, naming the URL if known."""
+    detail = str(error) or type(error).__name__
+    try:
+        return f'{error.request.url}: {detail}'
+    except RuntimeError:
+        # the request was never attached to the error
+        return detail
+
+
+def _resolution_error_message(error, python_version):
+    """Return the one error message that describes a resolution failure."""
+    prefix = f'Unable to resolve dependencies for Python {python_version}'
+    if isinstance(error, ResolutionImpossible):
+        conflicts = '\n'.join(
+            (
+                f'  {cause.requirement} (from '
+                f'{cause.parent.name}=={cause.parent.version})'
+                if cause.parent is not None
+                else f'  {cause.requirement} (from the project)'
+            )
+            for cause in error.causes
+        )
+        return f'{prefix}, these requirements conflict:\n{conflicts}'
+    if isinstance(error, ResolutionTooDeep):
+        return (
+            f'{prefix}: gave up after the limit of {error.round_count} '
+            'resolution rounds'
+        )
+    if isinstance(error, httpx2.HTTPError):
+        return f'{prefix}: request failed: {_http_error_message(error)}'
+    return f'{prefix}: {error}'
+
+
 def find_requirements(
     requirements,
     python_versions,
@@ -82,11 +129,13 @@ def find_requirements(
                 extras=extras,
                 build_sdists=build_sdists,
             )
-        except MetadataUnavailableError as e:
-            log.error(
-                f'Unable to resolve dependencies for Python {python_version}: '
-                f'{e}'
-            )
+        except (
+            MetadataUnavailableError,
+            ResolutionImpossible,
+            ResolutionTooDeep,
+            httpx2.HTTPError,
+        ) as e:
+            log.error(_resolution_error_message(e, python_version))
             exit(1)
 
         log.info(
@@ -155,7 +204,7 @@ def parse_and_validate_args(metadata, args, session=None):
     else:
         extras = set(e.strip() for e in args.extras.split(',') if e.strip())
         # Validate that requested extras exist
-        available_extras = set(metadata.provides_extra)
+        available_extras = set(metadata.provides_extra or [])
         invalid_extras = extras - available_extras
         if invalid_extras:
             log.error(
@@ -167,16 +216,33 @@ def parse_and_validate_args(metadata, args, session=None):
     if args.python_versions is None:
         # If no python versions specified, use active versions from endoflife.date
         python = Python(session=session)
-        python_versions = [release['cycle'] for release in python.active]
+        try:
+            python_versions = [release['cycle'] for release in python.active]
+        except httpx2.HTTPError as e:
+            log.error(
+                'Unable to look up the active Python versions from '
+                f'{Python.API_URL}: {_http_error_message(e)}'
+            )
+            exit(1)
+            python_versions = []
     else:
         python_versions = [
             v.strip() for v in args.python_versions.split(',') if v.strip()
         ]
 
+    series = []
+    for v in python_versions:
+        try:
+            series.append((v, PythonSeries(v)))
+        except ValueError:
+            log.error(f'Invalid Python version {v!r}, expected X, X.Y or X.Y.Z')
+            exit(1)
+            break
+
     # Each release may be covered by only one target, otherwise the output
     # would pin a package twice for the same interpreter
-    for a, b in combinations(python_versions, 2):
-        if PythonSeries(a).overlaps(PythonSeries(b)):
+    for (a, sa), (b, sb) in combinations(series, 2):
+        if sa.overlaps(sb):
             log.error(
                 f'Python versions {a} and {b} overlap; each release may be covered by only one target'
             )
@@ -264,7 +330,7 @@ def main():  # pragma: no cover
     )
     parser.add_argument(
         '--cooldown-days',
-        type=int,
+        type=non_negative_int,
         default=7,
         help='Exclude packages uploaded within this many days (dependency cooldown). Default: 7. Use 0 to disable.',
     )
