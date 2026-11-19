@@ -26,8 +26,10 @@ from proviso.resolver import (
     MetadataUnavailableError,
     PyPIProvider,
     Resolver,
+    UnsupportedRequirementError,
     filter_requirements,
     make_identifier,
+    redact_requirement,
     split_identifier,
 )
 from proviso.series import SeriesPackageFinder
@@ -2531,3 +2533,104 @@ class TestTargetPythonSeries(TestCase):
             'https://example.com/foo-1.0.tar.gz', requires_python='>=3.13'
         )
         self.assertIsNone(evaluator.evaluate_link(link))
+
+
+class TestDirectReferences(TestCase):
+    """Direct references (name @ url) aren't supported."""
+
+    def _provider(self, requires_dist):
+        session = MagicMock()
+        response = MagicMock()
+        response.text = (
+            'Metadata-Version: 2.1\nName: pkg\nVersion: 1.0\n'
+            + ''.join(f'Requires-Dist: {r}\n' for r in requires_dist)
+        )
+        session.get.return_value = response
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            return PyPIProvider(session, ['https://pypi.org/simple/'], '3.12')
+
+    def _candidate(self, extras=()):
+        package = MagicMock()
+        package.link.dist_info_link.url = 'https://pypi/pkg/1.0'
+        return Candidate('pkg', Version('1.0'), extras=extras, package=package)
+
+    def test_redact_requirement(self):
+        for written, expected in (
+            (
+                'foo @ https://user:token@example.com/foo-1.0.whl',
+                'foo @ https://example.com/foo-1.0.whl',
+            ),
+            (
+                'foo @ https://token@example.com:8443/foo-1.0.whl',
+                'foo @ https://example.com:8443/foo-1.0.whl',
+            ),
+            (
+                'foo[a,b] @ git+https://u:p@example.com/foo.git@v1.0 ; '
+                'python_version < "3.11"',
+                'foo[a,b] @ git+https://example.com/foo.git@v1.0 ; '
+                'python_version < "3.11"',
+            ),
+            (
+                'foo @ https://example.com/foo-1.0.whl',
+                'foo @ https://example.com/foo-1.0.whl',
+            ),
+            ('foo @ file:///tmp/foo-1.0.whl', 'foo @ file:///tmp/foo-1.0.whl'),
+        ):
+            requirement = Requirement(written)
+            self.assertEqual(expected, redact_requirement(requirement))
+            # The requirement itself is unchanged
+            self.assertEqual(written, str(requirement))
+
+    def test_dependency_with_url_raises(self):
+        provider = self._provider(
+            ['ok>=1', 'bar @ https://user:token@example.com/bar-1.0.whl']
+        )
+        with self.assertRaises(UnsupportedRequirementError) as ctx:
+            provider.get_dependencies(self._candidate())
+        error = ctx.exception
+        self.assertEqual('bar', error.requirement.name)
+        self.assertEqual('pkg', error.name)
+        self.assertEqual(Version('1.0'), error.version)
+        self.assertEqual(
+            'pkg==1.0 requires a direct reference, which proviso does not '
+            'support: bar @ https://example.com/bar-1.0.whl',
+            str(error),
+        )
+        self.assertNotIn('token', str(error))
+        self.assertNotIn('user', str(error))
+
+    def test_dependency_with_url_not_applying_is_ignored(self):
+        provider = self._provider(
+            [
+                'ok>=1',
+                'bar @ https://example.com/bar.whl ; python_version < "3.11"',
+                'baz @ https://example.com/baz.whl ; extra == "fast"',
+            ]
+        )
+        self.assertEqual(
+            ['ok>=1'],
+            [str(r) for r in provider.get_dependencies(self._candidate())],
+        )
+
+    def test_extra_dependency_with_url_raises(self):
+        provider = self._provider(
+            ['ok>=1', 'baz @ https://example.com/baz.whl ; extra == "fast"']
+        )
+        with self.assertRaises(UnsupportedRequirementError) as ctx:
+            provider.get_dependencies(self._candidate(extras={'fast'}))
+        self.assertEqual('baz', ctx.exception.requirement.name)
+
+    def test_resolve_dependency_with_url_raises(self):
+        provider = self._provider(['bar @ https://example.com/bar-1.0.whl'])
+        package = MagicMock()
+        package.version = '1.0'
+        package.link.dist_info_link.url = 'https://pypi/pkg/1.0'
+        provider.finder.find_matches.return_value = [package]
+        with patch('proviso.resolver.PyPIProvider', return_value=provider):
+            resolver = Resolver(session=MagicMock())
+            with self.assertRaises(UnsupportedRequirementError):
+                resolver.resolve([Requirement('pkg')], python_version='3.12')
+        # The direct reference was never looked up by name
+        provider.finder.find_matches.assert_called_once_with(
+            'pkg', allow_prereleases=True
+        )

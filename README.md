@@ -120,6 +120,16 @@ Caveats:
   dependencies vary by Python version may be resolved incorrectly (see
   [#53](https://github.com/octodns/proviso/issues/53)).
 
+#### Direct references
+
+proviso resolves every requirement from the package index and doesn't support
+direct references such as `foo @ https://example.com/foo-1.0-py3-none-any.whl`.
+If the project requires one, whatever its environment marker, proviso fails
+with an error that lists each of them. If a dependency requires one for a
+target Python, proviso fails with an error that names the requirement and the
+package that requires it. Neither writes a requirements file, and credentials
+in a URL are left out of the error.
+
 #### Full command-line reference
 
 ```console

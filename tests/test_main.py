@@ -27,7 +27,11 @@ from proviso.main import (
     parse_and_validate_args,
     write_requirements_to_file,
 )
-from proviso.resolver import Candidate, MetadataUnavailableError
+from proviso.resolver import (
+    Candidate,
+    MetadataUnavailableError,
+    UnsupportedRequirementError,
+)
 
 
 class TestBuildProjectMetadata(TestCase):
@@ -543,6 +547,66 @@ class TestFindRequirements(TestCase):
                 with self.assertRaises(KeyError):
                     find_requirements(requirements, ['3.9'])
         ex.assert_not_called()
+
+    def test_find_requirements_unsupported_requirement(self):
+        """A dependency's direct reference is one line naming its source."""
+        error = UnsupportedRequirementError(
+            Requirement('bar @ https://user:token@example.com/bar-1.0.whl'),
+            'foo',
+            Version('1.0'),
+        )
+        message = self._resolve_failure(error)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: foo==1.0 '
+            'requires a direct reference, which proviso does not support: '
+            'bar @ https://example.com/bar-1.0.whl',
+            message,
+        )
+
+    def test_find_requirements_project_direct_references(self):
+        """Every project direct reference is listed, whatever its marker."""
+        requirements = [
+            Requirement('requests>=2.0.0'),
+            Requirement(
+                'foo @ https://user:token@example.com/foo-1.0.whl ; '
+                'python_version < "3.0"'
+            ),
+            Requirement(
+                'bar[x] @ git+https://example.com/bar.git ; extra == "dev"'
+            ),
+        ]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            with patch('proviso.main.exit', side_effect=SystemExit(1)) as ex:
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(requirements, ['3.9', '3.10'])
+        ex.assert_called_once_with(1)
+        mock_log.error.assert_called_once_with(
+            'The project requires direct references, which proviso does not '
+            'support: foo @ https://example.com/foo-1.0.whl ; '
+            'python_version < "3.0", bar[x] @ git+https://example.com/bar.git '
+            '; extra == "dev"'
+        )
+        # Credentials are never logged
+        for call in mock_log.method_calls:
+            self.assertNotIn('token', str(call))
+        # Nothing is resolved
+        mock_resolver_class.assert_not_called()
+
+    def test_find_requirements_without_direct_references_resolves(self):
+        """Ordinary requirements are resolved as before."""
+        requirements = [Requirement('requests>=2.0.0')]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver = mock_resolver_class.return_value
+            mock_resolver.resolve.return_value = {
+                'requests': {'version': '2.28.0', 'extras': []}
+            }
+            with patch('proviso.main.exit') as ex:
+                with patch('proviso.main.log') as mock_log:
+                    result = find_requirements(requirements, ['3.9'])
+        ex.assert_not_called()
+        mock_log.error.assert_not_called()
+        self.assertEqual({'2.28.0': ['3.9']}, result['requests'])
 
     def test_find_requirements_passes_extras(self):
         """extras defaults to empty and is passed to the resolver."""

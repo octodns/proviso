@@ -1,9 +1,11 @@
 import math
 from collections import defaultdict
+from copy import copy
 from logging import getLogger
 from operator import attrgetter
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit, urlunsplit
 
 from packaging.markers import default_environment
 from packaging.metadata import InvalidMetadata, Metadata
@@ -140,6 +142,37 @@ class MetadataUnavailableError(Exception):
         self.reason = reason
         super().__init__(
             f'Unable to get the metadata for {name}=={version}: {reason}'
+        )
+
+
+def redact_requirement(requirement):
+    """Return a direct reference requirement as a string without credentials.
+
+    A URL can carry credentials (https://user:token@host/...), so the
+    userinfo part is removed before the requirement is logged or reported.
+    """
+    parts = urlsplit(requirement.url)
+    redacted = copy(requirement)
+    redacted.url = urlunsplit(
+        parts._replace(netloc=parts.netloc.rpartition('@')[2])
+    )
+    return str(redacted)
+
+
+class UnsupportedRequirementError(Exception):
+    """A package requires a direct reference (name @ url).
+
+    Direct references aren't supported, every requirement is resolved from
+    the package index.
+    """
+
+    def __init__(self, requirement, name, version):
+        self.requirement = requirement
+        self.name = name
+        self.version = version
+        super().__init__(
+            f'{name}=={version} requires a direct reference, which proviso '
+            f'does not support: {redact_requirement(requirement)}'
         )
 
 
@@ -570,6 +603,14 @@ class PyPIProvider(AbstractProvider):
                     dependencies.append(req)
                     break
 
+        # Direct references aren't supported, fail rather than resolve one by
+        # name from the index
+        for req in dependencies:
+            if req.url is not None:
+                raise UnsupportedRequirementError(
+                    req, candidate.name, candidate.version
+                )
+
         log.debug(
             f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
@@ -639,6 +680,8 @@ class Resolver:
         Raises:
             resolvelib.ResolutionImpossible: If resolution fails
             MetadataUnavailableError: If a package's metadata can't be obtained
+            UnsupportedRequirementError: If a package requires a direct
+                          reference (name @ url)
         """
         requirements = filter_requirements(
             requirements, python_version=python_version, extras=extras

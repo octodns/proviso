@@ -13,7 +13,13 @@ from resolvelib import ResolutionImpossible, ResolutionTooDeep
 
 from proviso.builder import Builder
 from proviso.python import Python
-from proviso.resolver import MetadataUnavailableError, Resolver, make_identifier
+from proviso.resolver import (
+    MetadataUnavailableError,
+    Resolver,
+    UnsupportedRequirementError,
+    make_identifier,
+    redact_requirement,
+)
 from proviso.series import PythonSeries
 from proviso.utils import CachingClient
 
@@ -140,6 +146,16 @@ def find_requirements(
     if not requirements:
         return {}
 
+    # Direct references aren't supported. Check every requirement, whatever
+    # its marker, so the result doesn't depend on the target Pythons
+    direct = [redact_requirement(r) for r in requirements if r.url is not None]
+    if direct:
+        log.error(
+            'The project requires direct references, which proviso does not '
+            f'support: {", ".join(direct)}'
+        )
+        exit(1)
+
     log.info(f'Requirements: {", ".join([str(r) for r in requirements])}')
 
     # Create one resolver instance (shared session across all Python versions)
@@ -165,6 +181,7 @@ def find_requirements(
             MetadataUnavailableError,
             ResolutionImpossible,
             ResolutionTooDeep,
+            UnsupportedRequirementError,
             httpx2.HTTPError,
         ) as e:
             log.error(
