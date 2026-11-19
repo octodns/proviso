@@ -2017,9 +2017,13 @@ Requires-Dist: pytest; extra == "test"
                 tf.addfile(info, BytesIO(data))
         return path
 
-    def _provider(self, cache=None):
+    def _provider(self, cache=None, build_sdists=True):
         return PyPIProvider(
-            None, [], python_version='3.12', file_requires_dist_cache=cache
+            None,
+            [],
+            python_version='3.12',
+            file_requires_dist_cache=cache,
+            build_sdists=build_sdists,
         )
 
     def _candidate(self, path):
@@ -2103,6 +2107,62 @@ Requires-Dist: pytest; extra == "test"
         self.assertIn('backend stdout', message)
         self.assertIn('backend stderr', message)
 
+    def test_build_disabled_by_default(self):
+        provider = PyPIProvider(None, [], python_version='3.12')
+        self.assertFalse(provider.build_sdists)
+
+    def test_sdist_without_pkg_info_fails_without_build_sdists(self):
+        path = self._sdist()
+        provider = self._provider(build_sdists=False)
+        with self.assertLogs('proviso.resolver', level='INFO') as logs:
+            with self.assertRaises(MetadataUnavailableError) as ctx:
+                self._dependencies(path, provider)
+        message = str(ctx.exception)
+        self.assertIn('foo==1.0', message)
+        self.assertIn('can only be learned by building', message)
+        self.assertIn('foo-1.0.tar.gz', message)
+        self.assertIn('--build-sdists', message)
+        self.assertEqual('foo', ctx.exception.name)
+        self.assertEqual(Version('1.0'), ctx.exception.version)
+        self.assertIn('--build-sdists', ctx.exception.reason)
+        self.mock_build.assert_not_called()
+        # Nothing is cached, so a later attempt fails the same way
+        self.assertEqual({}, provider._file_requires_dist_cache)
+        self.assertFalse([r for r in logs.records if r.levelname == 'WARNING'])
+
+    def test_sdist_unreliable_pkg_info_fails_without_build_sdists(self):
+        for pkg_info in (
+            self._metadata(version='2.1'),
+            self._metadata(version='2.4', extra='Dynamic: Requires-Dist\n'),
+        ):
+            path = self._sdist(pkg_info)
+            with self.assertRaises(MetadataUnavailableError) as ctx:
+                self._dependencies(path, self._provider(build_sdists=False))
+            self.assertIn('--build-sdists', str(ctx.exception))
+        self.mock_build.assert_not_called()
+
+    def test_sdist_reliable_pkg_info_without_build_sdists(self):
+        path = self._sdist(self._metadata(version='2.2'))
+        provider = self._provider(build_sdists=False)
+        self.assertEqual(
+            [Requirement('six')], self._dependencies(path, provider)
+        )
+        self.mock_build.assert_not_called()
+
+    def test_wheel_without_build_sdists(self):
+        path = self._wheel(self._metadata(version='2.1'))
+        provider = self._provider(build_sdists=False)
+        self.assertEqual(
+            [Requirement('six')], self._dependencies(path, provider)
+        )
+        self.mock_build.assert_not_called()
+
+    def test_wheel_without_metadata_does_not_mention_build_sdists(self):
+        path = self._wheel()
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path, self._provider(build_sdists=False))
+        self.assertNotIn('--build-sdists', str(ctx.exception))
+
     def test_download_failure(self):
         provider = self._provider()
         candidate = self._candidate(self.dir / 'foo-1.0.tar.gz')
@@ -2166,6 +2226,9 @@ Requires-Dist: pytest; extra == "test"
         self.assertEqual(1, len(warnings))
         self.assertIn('foo==1.0', warnings[0].getMessage())
         self.assertIn('every target Python', warnings[0].getMessage())
+        self.assertIn(
+            'under the Python running proviso', warnings[0].getMessage()
+        )
 
     def test_pkg_info_does_not_log_warning(self):
         path = self._sdist(self._metadata(version='2.2'))
@@ -2186,6 +2249,17 @@ Requires-Dist: pytest; extra == "test"
         self.assertEqual(2, len(caches))
         self.assertIs(resolver._file_requires_dist_cache, caches[0])
         self.assertIs(caches[0], caches[1])
+
+    def test_resolve_passes_build_sdists_to_provider(self):
+        resolver = Resolver(session=MagicMock())
+        for kwargs, expected in (({}, False), ({'build_sdists': True}, True)):
+            with patch('proviso.resolver.PyPIProvider') as mock_provider:
+                with patch('proviso.resolver.ResolveLibResolver') as mock_rl:
+                    mock_rl.return_value.resolve.return_value.mapping = {}
+                    resolver.resolve([Requirement('foo')], **kwargs)
+                self.assertEqual(
+                    expected, mock_provider.call_args.kwargs['build_sdists']
+                )
 
     def test_dist_info_link_does_not_download(self):
         session = MagicMock()

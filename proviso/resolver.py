@@ -132,6 +132,7 @@ class MetadataUnavailableError(Exception):
     def __init__(self, name, version, reason):
         self.name = name
         self.version = version
+        self.reason = reason
         super().__init__(
             f'Unable to get the metadata for {name}=={version}: {reason}'
         )
@@ -149,8 +150,13 @@ class PyPIProvider(AbstractProvider):
         user_requested=None,
         allow_prereleases=False,
         file_requires_dist_cache=None,
+        build_sdists=False,
     ):
         self.session = session
+        # When True, an sdist's build backend may be run to learn its
+        # dependencies.  When False that raises MetadataUnavailableError
+        # instead, as it executes the package's build code.
+        self.build_sdists = build_sdists
         # When True, pre-releases are candidates for every package (like pip's
         # --pre).  When False, only for packages whose specifiers name one.
         self.allow_prereleases = allow_prereleases
@@ -443,7 +449,7 @@ class PyPIProvider(AbstractProvider):
 
         Wheels carry it in .dist-info/METADATA.  Sdists carry it in PKG-INFO,
         which is used when PEP 643 says it's reliable; otherwise the sdist's
-        build backend is asked for it.
+        build backend is asked for it, if build_sdists allows that.
         """
         name, version = candidate.name, candidate.version
         log.info(f'Downloading {link.filename} for {name}=={version} metadata')
@@ -474,6 +480,15 @@ class PyPIProvider(AbstractProvider):
             if link.is_wheel:
                 raise MetadataUnavailableError(
                     name, version, f'no METADATA in {link.filename}'
+                )
+
+            if not self.build_sdists:
+                raise MetadataUnavailableError(
+                    name,
+                    version,
+                    f'its dependencies can only be learned by building '
+                    f'{link.filename}, which runs the package\'s build code; '
+                    'pass --build-sdists to allow that',
                 )
 
             log.info(f'Building {name}=={version} to get its metadata')
@@ -574,6 +589,7 @@ class Resolver:
         exclude_newer_than=None,
         allow_prereleases=False,
         extras=(),
+        build_sdists=False,
     ):
         """Resolve dependencies for the given requirements.
 
@@ -592,12 +608,19 @@ class Resolver:
             extras: Names of the project extras that are selected. Only the
                           requirements that apply to python_version with these
                           extras are resolved.
+            build_sdists: Allow running a package's build backend, under the
+                          Python running proviso, to learn the dependencies of
+                          an sdist when neither the index nor the sdist's
+                          PKG-INFO provides them. This executes the package's
+                          build code. By default MetadataUnavailableError is
+                          raised for such a package instead.
 
         Returns:
             Dict mapping package names to metadata dicts with 'version' and 'extras'
 
         Raises:
             resolvelib.ResolutionImpossible: If resolution fails
+            MetadataUnavailableError: If a package's metadata can't be obtained
         """
         requirements = filter_requirements(
             requirements, python_version=python_version, extras=extras
@@ -621,6 +644,7 @@ class Resolver:
             user_requested=user_requested,
             allow_prereleases=allow_prereleases,
             file_requires_dist_cache=self._file_requires_dist_cache,
+            build_sdists=build_sdists,
         )
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)
