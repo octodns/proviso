@@ -703,6 +703,25 @@ class TestPyPIProvider(TestCase):
 
             self.assertEqual(cached_deps, result)
 
+    def test_get_dependencies_environment_built_once(self):
+        """The marker environment is read once per provider, not per call."""
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            with patch('proviso.resolver.default_environment') as de:
+                de.return_value = {'sys_platform': 'linux'}
+                provider = PyPIProvider(
+                    MagicMock(), ['https://pypi.org/simple/']
+                )
+                de.assert_called_once_with()
+                provider._get_requires_dist = MagicMock(
+                    return_value=[Requirement('six; sys_platform == "linux"')]
+                )
+                for name in ('a', 'b', 'c'):
+                    deps = provider.get_dependencies(
+                        Candidate(name, Version('1.0'))
+                    )
+                    self.assertEqual(['six'], [d.name for d in deps])
+                de.assert_called_once_with()
+
     def test_get_dependencies_no_package_found(self):
         """Test get_dependencies when no package is found."""
         session = MagicMock()
@@ -1658,7 +1677,7 @@ class TestPrereleaseWithRealFinder(TestCase):
         result = resolver.resolve(
             [Requirement('foo==2.0b1')], python_version='3.12'
         )
-        self.assertEqual({'foo': {'version': '2.0b1', 'extras': []}}, result)
+        self.assertEqual({'foo': {'version': '2.0b1'}}, result)
 
 
 class TestGetDependenciesPackageFastPath(TestCase):
@@ -2059,11 +2078,11 @@ class TestExtras(TestCase):
 
         self.assertEqual(
             {
-                'app': {'version': '1.0.0', 'extras': []},
-                'hishel': {'version': '2.0.0', 'extras': ['httpx']},
-                'httpx': {'version': '0.28.1', 'extras': []},
-                'anyio': {'version': '4.16.0', 'extras': []},
-                'msgpack': {'version': '1.2.4', 'extras': []},
+                'app': {'version': '1.0.0'},
+                'hishel': {'version': '2.0.0'},
+                'httpx': {'version': '0.28.1'},
+                'anyio': {'version': '4.16.0'},
+                'msgpack': {'version': '1.2.4'},
             },
             result,
         )
@@ -2076,9 +2095,7 @@ class TestExtras(TestCase):
                 [Requirement('hishel[httpx,async]'), Requirement('hishel<2')]
             )
 
-        self.assertEqual(
-            {'version': '1.0.0', 'extras': ['async', 'httpx']}, result['hishel']
-        )
+        self.assertEqual({'version': '1.0.0'}, result['hishel'])
         self.assertIn('anysqlite', result)
         self.assertIn('httpx', result)
 
@@ -3209,7 +3226,7 @@ class TestYanked(TestCase):
                 [Requirement('foo[x]'), Requirement('foo==1.1')],
                 python_version='3.12',
             )
-        self.assertEqual({'foo': {'version': '1.1', 'extras': ['x']}}, result)
+        self.assertEqual({'foo': {'version': '1.1'}}, result)
         self.assertEqual(1, len(logs.output))
         self.assertIn('foo==1.1 is yanked', logs.output[0])
 
@@ -3228,11 +3245,7 @@ class TestYanked(TestCase):
                 [Requirement('app')], python_version='3.12'
             )
         self.assertEqual(
-            {
-                'app': {'version': '1.0', 'extras': []},
-                'foo': {'version': '1.0', 'extras': []},
-            },
-            result,
+            {'app': {'version': '1.0'}, 'foo': {'version': '1.0'}}, result
         )
 
     def test_no_warning_when_unyanked_file_selected(self):
@@ -3249,7 +3262,7 @@ class TestYanked(TestCase):
             result = resolver.resolve(
                 [Requirement('foo==1.1')], python_version='3.12'
             )
-        self.assertEqual({'foo': {'version': '1.1', 'extras': []}}, result)
+        self.assertEqual({'foo': {'version': '1.1'}}, result)
 
     def test_warning_when_yanked_file_selected(self):
         resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
@@ -3271,7 +3284,7 @@ class TestYanked(TestCase):
             rl.return_value.resolve.return_value = result
             with self.assertNoLogs('proviso.resolver', level='WARNING'):
                 self.assertEqual(
-                    {'foo': {'version': '1.0', 'extras': []}},
+                    {'foo': {'version': '1.0'}},
                     resolver.resolve(
                         [Requirement('foo')], python_version='3.12'
                     ),
@@ -3286,9 +3299,7 @@ class TestYanked(TestCase):
                 result = resolver.resolve(
                     [Requirement(r) for r in order], python_version='3.12'
                 )
-                self.assertEqual(
-                    {'foo': {'version': '1.1', 'extras': ['x']}}, result
-                )
+                self.assertEqual({'foo': {'version': '1.1'}}, result)
 
     def test_extras_requirements_ordered_last(self):
         resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))

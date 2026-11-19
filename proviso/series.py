@@ -118,8 +118,9 @@ class PythonSeries:
             for a, b in _QUOTED.findall(str(marker))
             for word in re.split(r'[\s,]+', a or b)
         ]
+        # One copy for every release, each overwrites the Python values
+        env = dict(environment, extra=extra)
         for release in self.releases(literals):
-            env = dict(environment, extra=extra)
             env.update(self.release_environment(release))
             if marker.evaluate(env):
                 return True

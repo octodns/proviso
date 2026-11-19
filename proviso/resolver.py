@@ -307,6 +307,10 @@ class PyPIProvider(AbstractProvider):
         # finder doesn't get it as unearth would apply it to each file.
         self.exclude_newer_than = exclude_newer_than
 
+        # Markers are evaluated for the target series on top of the running
+        # interpreter's environment, which is the same for every call
+        self._environment = default_environment()
+
         # The target Python series, None means the running interpreter
         self.series = PythonSeries(python_version) if python_version else None
 
@@ -796,9 +800,7 @@ class PyPIProvider(AbstractProvider):
             f'Getting dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
 
-        # Markers are evaluated for the target series on top of the running
-        # interpreter's environment
-        environment = default_environment()
+        environment = self._environment
 
         dependencies = []
         if candidate.extras:
@@ -965,7 +967,7 @@ class Resolver:
                           treats them like any other requirement.
 
         Returns:
-            Dict mapping package names to metadata dicts with 'version' and 'extras'
+            Dict mapping package names to metadata dicts with 'version'
 
         Raises:
             resolvelib.ResolutionImpossible: If resolution fails
@@ -1036,13 +1038,8 @@ class Resolver:
                     candidate.version,
                     candidate.package.link.yank_reason,
                 )
-            info = resolved.setdefault(
-                candidate.name,
-                {'version': str(candidate.version), 'extras': set()},
-            )
-            info['extras'].update(candidate.extras)
-
-        for info in resolved.values():
-            info['extras'] = sorted(info['extras'])
+            # An extras candidate pins its base package to the same version,
+            # so one version per name is all there is to keep
+            resolved[candidate.name] = {'version': str(candidate.version)}
 
         return resolved
