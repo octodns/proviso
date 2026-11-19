@@ -1,22 +1,33 @@
+from argparse import ArgumentTypeError
 from datetime import datetime, timezone
 from os.path import join
 from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
+import httpx2
 from build import BuildBackendException
 from packaging.requirements import Requirement
 from packaging.version import Version
+from resolvelib import (
+    AbstractProvider,
+    BaseReporter,
+    ResolutionImpossible,
+    ResolutionTooDeep,
+)
+from resolvelib import Resolver as ResolveLibResolver
+from resolvelib.structs import RequirementInformation
 
 from proviso.main import (
     build_project_metadata,
     find_requirements,
     format_and_print_metadata,
+    non_negative_int,
     parse_and_validate_args,
     write_requirements_to_file,
 )
-from proviso.resolver import MetadataUnavailableError
+from proviso.resolver import Candidate, MetadataUnavailableError
 
 
 class TestBuildProjectMetadata(TestCase):
@@ -229,6 +240,310 @@ class TestFindRequirements(TestCase):
         self.assertIn('pass --build-sdists to allow that', message)
         self.assertIn('3.9', message)
 
+    def _resolve_failure(self, error):
+        requirements = [Requirement('requests>=2.0.0')]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = error
+            with patch('proviso.main.exit', side_effect=SystemExit(1)) as ex:
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(requirements, ['3.9'])
+        ex.assert_called_once_with(1)
+        mock_log.error.assert_called_once()
+        return mock_log.error.call_args[0][0]
+
+    def test_find_requirements_resolution_impossible(self):
+        """Conflicting requirements are listed one per line with sources."""
+        bar = Candidate('bar', Version('1.0'))
+        error = ResolutionImpossible(
+            [
+                RequirementInformation(Requirement('foo>=2'), bar),
+                RequirementInformation(Requirement('foo<2'), None),
+            ]
+        )
+        message = self._resolve_failure(error)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9, these '
+            'requirements conflict:\n'
+            '  foo>=2 (from bar==1.0)\n'
+            '  foo<2 (from the project)',
+            message,
+        )
+
+    def test_find_requirements_resolution_too_deep(self):
+        """Hitting the round limit is one line naming Python and the limit."""
+        message = self._resolve_failure(ResolutionTooDeep(200000))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: gave up after '
+            'the limit of 200000 resolution rounds',
+            message,
+        )
+
+    def test_find_requirements_http_error_with_request(self):
+        """A transport error names the URL and the underlying error."""
+        request = httpx2.Request('GET', 'https://pypi.org/simple/foo/')
+        error = httpx2.ConnectTimeout('timed out', request=request)
+        message = self._resolve_failure(error)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: request failed: '
+            'https://pypi.org/simple/foo/: timed out',
+            message,
+        )
+
+    def test_find_requirements_http_status_error(self):
+        """An error status is one line with the URL, status and reason."""
+        request = httpx2.Request('GET', 'https://pypi.org/x/metadata')
+        with self.assertRaises(httpx2.HTTPStatusError) as caught:
+            httpx2.Response(503, request=request).raise_for_status()
+        message = self._resolve_failure(caught.exception)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: request failed: '
+            'https://pypi.org/x/metadata: HTTP 503 Service Unavailable',
+            message,
+        )
+
+    def test_find_requirements_no_matching_version(self):
+        """A lone cause says no version matched rather than a conflict."""
+        error = ResolutionImpossible(
+            [RequirementInformation(Requirement('nosuchpkg'), None)]
+        )
+        message = self._resolve_failure(error)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'nosuchpkg satisfies nosuchpkg (from the project)',
+            message,
+        )
+
+    def test_find_requirements_no_matching_version_cooldown(self):
+        """The cooldown hint is added only when a cooldown is active."""
+        bar = Candidate('bar', Version('1.0'), extras=['x'])
+        error = ResolutionImpossible(
+            [RequirementInformation(Requirement('foo>=2'), bar)]
+        )
+        requirements = [Requirement('requests>=2.0.0')]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = error
+            with patch('proviso.main.exit', side_effect=SystemExit(1)):
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(
+                            requirements,
+                            ['3.9'],
+                            exclude_newer_than=datetime(
+                                2026, 1, 1, tzinfo=timezone.utc
+                            ),
+                        )
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'foo satisfies foo>=2 (from bar[x]==1.0); releases inside the '
+            '--cooldown-days window are excluded',
+            mock_log.error.call_args[0][0],
+        )
+
+    def _causes(self, *pairs):
+        return ResolutionImpossible(
+            [
+                RequirementInformation(
+                    Requirement(requirement),
+                    None if parent is None else Candidate('a', Version(parent)),
+                )
+                for requirement, parent in pairs
+            ]
+        )
+
+    def _resolve_failure_cooldown(self, error):
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = error
+            with patch('proviso.main.exit', side_effect=SystemExit(1)):
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(
+                            [Requirement('a')],
+                            ['3.9'],
+                            exclude_newer_than=datetime(
+                                2026, 1, 1, tzinfo=timezone.utc
+                            ),
+                        )
+        return mock_log.error.call_args[0][0]
+
+    def test_find_requirements_same_requirement_many_parents(self):
+        """One requirement from several parent releases is not a conflict."""
+        error = self._causes(('missing', '2.0'), ('missing', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==2.0, a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_same_requirement_many_parents_cooldown(self):
+        """The cooldown hint follows the merged parent list."""
+        error = self._causes(('missing', '2.0'), ('missing', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==2.0, a==1.0); releases '
+            'inside the --cooldown-days window are excluded',
+            self._resolve_failure_cooldown(error),
+        )
+
+    def test_find_requirements_same_requirement_parent_cap(self):
+        """Only the first three parents are shown, then a count."""
+        error = self._causes(
+            *[('missing', f'{v}.0') for v in (10, 9, 8, 7, 6, 5, 4, 3, 2, 1)]
+        )
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==10.0, a==9.0, a==8.0 and 7 '
+            'more)',
+            self._resolve_failure(error),
+        )
+        error = self._causes(*[('missing', f'{v}.0') for v in (4, 3, 2, 1)])
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==4.0, a==3.0, a==2.0 and 1 '
+            'more)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_same_requirement_three_parents(self):
+        """Exactly three parents are all shown with no suffix."""
+        error = self._causes(*[('missing', f'{v}.0') for v in (3, 2, 1)])
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==3.0, a==2.0, a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_same_requirement_project_and_parent(self):
+        """The project counts as a parent like any other."""
+        error = self._causes(('missing', None), ('missing', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from the project, a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_same_requirement_duplicate_parents(self):
+        """A parent that repeats is listed once."""
+        error = self._causes(('missing', '1.0'), ('missing', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_different_requirements_same_package(self):
+        """Different requirements on one package still conflict."""
+        error = self._causes(('foo>=2', '2.0'), ('foo<2', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9, these '
+            'requirements conflict:\n'
+            '  foo>=2 (from a==2.0)\n'
+            '  foo<2 (from a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_conflict_duplicate_lines(self):
+        """Exact duplicate conflict lines are collapsed, keeping order."""
+        error = self._causes(
+            ('foo>=2', '1.0'),
+            ('foo<2', None),
+            ('foo>=2', '1.0'),
+            ('foo<2', None),
+        )
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9, these '
+            'requirements conflict:\n'
+            '  foo>=2 (from a==1.0)\n'
+            '  foo<2 (from the project)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_real_resolvelib_causes(self):
+        """resolvelib records one cause per rejected parent release."""
+        index = {'a': {'2.0': ['missing'], '1.0': ['missing']}, 'missing': {}}
+
+        class Provider(AbstractProvider):
+            def identify(self, requirement_or_candidate):
+                return requirement_or_candidate.name
+
+            def get_preference(self, identifier, *args, **kwargs):
+                return identifier
+
+            def find_matches(self, identifier, requirements, incompatibilities):
+                bad = {c.version for c in incompatibilities[identifier]}
+                return [
+                    Candidate(identifier, Version(v))
+                    for v in sorted(
+                        index[identifier], key=Version, reverse=True
+                    )
+                    if Version(v) not in bad
+                    and all(
+                        r.specifier.contains(v)
+                        for r in requirements[identifier]
+                    )
+                ]
+
+            def is_satisfied_by(self, requirement, candidate):
+                return requirement.specifier.contains(candidate.version)
+
+            def get_dependencies(self, candidate):
+                return [
+                    Requirement(r)
+                    for r in index[candidate.name][str(candidate.version)]
+                ]
+
+        with self.assertRaises(ResolutionImpossible) as caught:
+            ResolveLibResolver(Provider(), BaseReporter()).resolve(
+                [Requirement('a')]
+            )
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==2.0, a==1.0)',
+            self._resolve_failure(caught.exception),
+        )
+
+    def test_find_requirements_conflict_extras_parent(self):
+        """A parent with extras is named with them."""
+        b = Candidate('b', Version('1.0'), extras=['x'])
+        error = ResolutionImpossible(
+            [
+                RequirementInformation(Requirement('b==1.0'), b),
+                RequirementInformation(Requirement('b<1'), None),
+            ]
+        )
+        message = self._resolve_failure(error)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9, these '
+            'requirements conflict:\n'
+            '  b==1.0 (from b[x]==1.0)\n'
+            '  b<1 (from the project)',
+            message,
+        )
+
+    def test_find_requirements_http_error_without_request(self):
+        """An error with no request attached still reports the error."""
+        message = self._resolve_failure(httpx2.ReadError('connection reset'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: request failed: '
+            'connection reset',
+            message,
+        )
+
+    def test_find_requirements_http_error_without_text(self):
+        """An error with an empty message reports its type."""
+        message = self._resolve_failure(httpx2.ReadTimeout(''))
+        self.assertIn('ReadTimeout', message)
+
+    def test_find_requirements_unknown_error_propagates(self):
+        """Other exceptions are not handled."""
+        requirements = [Requirement('requests>=2.0.0')]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = KeyError('x')
+            with patch('proviso.main.exit') as ex:
+                with self.assertRaises(KeyError):
+                    find_requirements(requirements, ['3.9'])
+        ex.assert_not_called()
+
     def test_find_requirements_passes_extras(self):
         """extras defaults to empty and is passed to the resolver."""
         requirements = [Requirement('requests>=2.0.0')]
@@ -366,10 +681,103 @@ class TestParseAndValidateArgs(TestCase):
             mock_exit.assert_not_called()
             self.assertEqual(versions.split(','), result['python_versions'])
 
-    def test_invalid_python_version_still_raises(self):
-        """Test that an invalid target still raises ValueError."""
-        with self.assertRaises(ValueError):
-            self._parse_versions('3.12,3.13rc1')
+    def test_invalid_python_version_exits(self):
+        """An invalid target is one error naming it, single or among others."""
+        for versions, bad in (
+            ('3.12,3.13rc1', '3.13rc1'),
+            ('3.13rc1', '3.13rc1'),
+            ('3.12.5.1', '3.12.5.1'),
+            ('abc', 'abc'),
+        ):
+            _, mock_log, mock_exit = self._parse_versions(versions)
+            mock_log.error.assert_called_once_with(
+                f'Invalid Python version {bad!r}, expected X, X.Y or X.Y.Z'
+            )
+            mock_exit.assert_called_once_with(1)
+
+    def test_extras_requested_without_any_available(self):
+        """--extras on a project with no extras reports none available."""
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = None
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = 'dev'
+        mock_args.python_versions = '3.9'
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.exit') as mock_exit:
+            with patch('proviso.main.log') as mock_log:
+                with patch('proviso.main.argv', ['proviso']):
+                    parse_and_validate_args(mock_metadata, mock_args)
+
+        mock_log.error.assert_called_once_with(
+            'Invalid extras requested: dev. Available extras: none'
+        )
+        mock_exit.assert_called_once_with(1)
+
+    def _default_versions_failure(self, error):
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = None
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+
+        with patch('proviso.main.Python') as mock_python_class:
+            mock_python_class.API_URL = 'https://endoflife.date/api/python.json'
+            type(mock_python_class.return_value).active = PropertyMock(
+                side_effect=error
+            )
+            with patch('proviso.main.exit') as mock_exit:
+                with patch('proviso.main.log') as mock_log:
+                    with patch('proviso.main.argv', ['proviso']):
+                        parse_and_validate_args(mock_metadata, mock_args)
+        mock_exit.assert_called_once_with(1)
+        mock_log.error.assert_called_once()
+        return mock_log.error.call_args[0][0]
+
+    def test_default_python_versions_http_error(self):
+        """A failed endoflife.date lookup is one error naming the URL."""
+        request = httpx2.Request(
+            'GET', 'https://endoflife.date/api/python.json'
+        )
+        message = self._default_versions_failure(
+            httpx2.ConnectError('name resolution failed', request=request)
+        )
+        self.assertEqual(
+            'Unable to look up the active Python versions from '
+            'https://endoflife.date/api/python.json: name resolution failed',
+            message,
+        )
+
+    def test_default_python_versions_http_status_error(self):
+        """An error status from endoflife.date names the URL once."""
+        request = httpx2.Request(
+            'GET', 'https://endoflife.date/api/python.json'
+        )
+        with self.assertRaises(httpx2.HTTPStatusError) as caught:
+            httpx2.Response(503, request=request).raise_for_status()
+        message = self._default_versions_failure(caught.exception)
+        self.assertEqual(
+            'Unable to look up the active Python versions from '
+            'https://endoflife.date/api/python.json: '
+            'HTTP 503 Service Unavailable',
+            message,
+        )
+
+    def test_default_python_versions_http_error_without_request(self):
+        """The URL is still named when the error has no request."""
+        message = self._default_versions_failure(httpx2.ReadTimeout('slow'))
+        self.assertEqual(
+            'Unable to look up the active Python versions from '
+            'https://endoflife.date/api/python.json: slow',
+            message,
+        )
 
     def test_default_python_versions(self):
         """Test that Python versions default to active versions."""
@@ -770,3 +1178,19 @@ class TestWriteRequirementsToFile(TestCase):
                 ['x-python-version-not-supported', 'b==1.0'],
                 self._selected(content, full_version),
             )
+
+
+class TestNonNegativeInt(TestCase):
+    def test_accepts_zero_and_positive(self):
+        self.assertEqual(0, non_negative_int('0'))
+        self.assertEqual(14, non_negative_int('14'))
+
+    def test_rejects_negative(self):
+        with self.assertRaises(ArgumentTypeError) as ctx:
+            non_negative_int('-1')
+        self.assertEqual('must be 0 or greater, got -1', str(ctx.exception))
+
+    def test_rejects_non_integer(self):
+        with self.assertRaises(ArgumentTypeError) as ctx:
+            non_negative_int('abc')
+        self.assertEqual("invalid int value: 'abc'", str(ctx.exception))
