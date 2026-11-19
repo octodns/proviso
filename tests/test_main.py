@@ -593,6 +593,41 @@ class TestFindRequirements(TestCase):
         # Nothing is resolved
         mock_resolver_class.assert_not_called()
 
+    def test_find_requirements_project_direct_reference_redaction(self):
+        """Unparseable URLs and URL secrets are never logged."""
+        urls = (
+            'https://u:SECRET@[::1/x.whl',
+            'https://u:SECRET@[notip]/x.whl',
+            'https://u:SECRET@host]/x.whl',
+            'https://u:SECRET@[::1]x/x.whl',
+            'https://example.com/x.whl?token=SECRET',
+            'https://example.com/x.whl?X-Amz-Credential=SECRET&X-Amz-Signature=SECRET',
+            'https://example.com/x.whl#token=SECRET',
+            'https://example.com/x.whl#sha256=SECRET',
+        )
+        for url in urls:
+            requirements = [
+                Requirement(f'foo[a] @ {url} ; python_version > "3"')
+            ]
+            with patch('proviso.main.Resolver'):
+                with patch(
+                    'proviso.main.exit', side_effect=SystemExit(1)
+                ) as ex:
+                    with patch('proviso.main.log') as mock_log:
+                        with self.assertRaises(SystemExit):
+                            find_requirements(requirements, ['3.9'])
+            ex.assert_called_once_with(1)
+            message = mock_log.error.call_args.args[0]
+            self.assertNotIn('SECRET', message)
+            self.assertNotIn('Amz', message)
+            self.assertTrue(
+                message.startswith(
+                    'The project requires direct references, which proviso '
+                    'does not support: foo[a] @ '
+                )
+            )
+            self.assertTrue(message.endswith(' ; python_version > "3"'))
+
     def test_find_requirements_without_direct_references_resolves(self):
         """Ordinary requirements are resolved as before."""
         requirements = [Requirement('requests>=2.0.0')]

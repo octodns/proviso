@@ -148,14 +148,23 @@ class MetadataUnavailableError(Exception):
 def redact_requirement(requirement):
     """Return a direct reference requirement as a string without credentials.
 
-    A URL can carry credentials (https://user:token@host/...), so the
-    userinfo part is removed before the requirement is logged or reported.
+    A URL can carry credentials in the userinfo (https://user:token@host/...),
+    the query string (?token=...) or the fragment (#token=...). All three are
+    removed before the requirement is logged or reported, leaving the scheme,
+    host, port and path. A URL that can't be parsed can't be safely redacted,
+    so it's replaced by a placeholder.
     """
-    parts = urlsplit(requirement.url)
     redacted = copy(requirement)
-    redacted.url = urlunsplit(
-        parts._replace(netloc=parts.netloc.rpartition('@')[2])
-    )
+    try:
+        parts = urlsplit(requirement.url)
+    except ValueError:
+        redacted.url = '<unparseable URL>'
+    else:
+        redacted.url = urlunsplit(
+            parts._replace(
+                netloc=parts.netloc.rpartition('@')[2], query='', fragment=''
+            )
+        )
     return str(redacted)
 
 

@@ -2575,11 +2575,67 @@ class TestDirectReferences(TestCase):
                 'foo @ https://example.com/foo-1.0.whl',
             ),
             ('foo @ file:///tmp/foo-1.0.whl', 'foo @ file:///tmp/foo-1.0.whl'),
+            (
+                'foo @ https://example.com/foo.whl?token=SECRET#sha256=SECRET',
+                'foo @ https://example.com/foo.whl',
+            ),
+            (
+                'foo @ git+https://example.com/foo.git@v1.0#subdirectory=x',
+                'foo @ git+https://example.com/foo.git@v1.0',
+            ),
         ):
             requirement = Requirement(written)
             self.assertEqual(expected, redact_requirement(requirement))
             # The requirement itself is unchanged
             self.assertEqual(written, str(requirement))
+
+    # URLs packaging accepts, but urlsplit can't parse
+    UNPARSEABLE = (
+        'https://u:SECRET@[::1/x.whl',
+        'https://u:SECRET@[notip]/x.whl',
+        'https://u:SECRET@host]/x.whl',
+        'https://u:SECRET@[::1]x/x.whl',
+    )
+    # URLs with credentials outside of the userinfo
+    SECRET_URLS = (
+        'https://example.com/x.whl?token=SECRET',
+        'https://example.com/x.whl?X-Amz-Credential=SECRET&X-Amz-Signature=SECRET',
+        'https://example.com/x.whl#token=SECRET',
+        'https://example.com/x.whl#sha256=SECRET',
+        'https://u:SECRET@example.com/x.whl?a=SECRET#b=SECRET',
+    )
+
+    def test_redact_requirement_unparseable(self):
+        for url in self.UNPARSEABLE:
+            requirement = Requirement(
+                f'foo[a,b] @ {url} ; python_version < "3.11"'
+            )
+            self.assertEqual(
+                'foo[a,b] @ <unparseable URL> ; python_version < "3.11"',
+                redact_requirement(requirement),
+            )
+            error = UnsupportedRequirementError(
+                requirement, 'pkg', Version('1.0')
+            )
+            self.assertEqual(
+                'pkg==1.0 requires a direct reference, which proviso does not '
+                'support: foo[a,b] @ <unparseable URL> ; '
+                'python_version < "3.11"',
+                str(error),
+            )
+
+    def test_redact_requirement_query_and_fragment(self):
+        for url in self.SECRET_URLS:
+            requirement = Requirement(f'foo @ {url}')
+            self.assertEqual(
+                'foo @ https://example.com/x.whl',
+                redact_requirement(requirement),
+            )
+            error = UnsupportedRequirementError(
+                requirement, 'pkg', Version('1.0')
+            )
+            self.assertNotIn('SECRET', str(error))
+            self.assertNotIn('Amz', str(error))
 
     def test_dependency_with_url_raises(self):
         provider = self._provider(
