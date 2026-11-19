@@ -344,6 +344,14 @@ class TestSeriesEvaluator(TestCase):
                 Link('https://example.com/foo.tar.gz', requires_python='>=x')
             )
         self.assertEqual('Invalid requires-python: >=x', str(ctx.exception))
+        # The message gives the file's value, not the one unearth fixed up
+        with self.assertWarns(FutureWarning):
+            self.assertEqual(
+                'Invalid requires-python: >=x.*', self._message('>=x.*')
+            )
+        self.assertEqual(
+            'Invalid requires-python: >=x.*', self._message('>=x.*')
+        )
 
     def test_mismatch_message(self):
         with self.assertRaises(LinkMismatchError) as ctx:
