@@ -832,8 +832,10 @@ class PyPIProvider(AbstractProvider):
         log.debug(
             f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
-        # Each dependency is a copy of the cached Requires-Dist entry, so it
-        # belongs to this candidate alone and is kept alive by the cache
+        # The Requires-Dist entries are copied, as their cache is shared by a
+        # package's extras candidates, so each dependency belongs to this
+        # candidate alone.  The dependencies cache keeps it alive, so its id
+        # isn't reused.
         for req in dependencies:
             self._parents[id(req)] = (req, candidate)
         self._dependencies_cache[cache_key] = dependencies
