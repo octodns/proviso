@@ -618,6 +618,76 @@ class TestPyPIProvider(TestCase):
                 [str(c.version) for c in result2],
             )
 
+    def _find_files(self, files, requirements=None, **kwargs):
+        """Return (version, file) of each candidate found for foo."""
+        provider = PyPIProvider(
+            MagicMock(), ['https://pypi.org/simple/'], **kwargs
+        )
+        provider.finder = MagicMock()
+        provider.finder.find_matches.return_value = [
+            self._file(*f) for f in files
+        ]
+        result = provider.find_matches(
+            'foo', requirements or {'foo': [Requirement('foo')]}, {}
+        )
+        return [(str(c.version), c.package.name) for c in result]
+
+    @staticmethod
+    def _file(version, filename, yanked=False):
+        package = MagicMock()
+        package.version = version
+        package.name = filename
+        package.link.is_yanked = yanked
+        return package
+
+    def test_find_matches_one_candidate_per_version(self):
+        """A version with several files is one candidate, with the first."""
+        self.assertEqual(
+            [('2.0', '2.0-whl'), ('1.0', '1.0-whl-a')],
+            self._find_files(
+                [
+                    ('2.0', '2.0-whl'),
+                    ('2.0', '2.0-sdist'),
+                    ('1.0', '1.0-whl-a'),
+                    ('1.0', '1.0-whl-b'),
+                    ('1.0', '1.0-sdist'),
+                ]
+            ),
+        )
+
+    def test_find_matches_equal_versions_are_one_candidate(self):
+        self.assertEqual(
+            [('1.0', '1.0-whl')],
+            self._find_files([('1.0', '1.0-whl'), ('1.0.0', '1.0.0-whl')]),
+        )
+
+    def test_find_matches_yanked_and_unyanked_files(self):
+        """A version with a file that isn't yanked is not yanked."""
+        files = [
+            ('1.0', '1.0-yanked', True),
+            ('1.0', '1.0-whl'),
+            ('1.0', '1.0-yanked-too', True),
+            ('2.0', '2.0-whl'),
+            ('2.0', '2.0-yanked', True),
+        ]
+        expected = [('2.0', '2.0-whl'), ('1.0', '1.0-whl')]
+        self.assertEqual(expected, self._find_files(files))
+        pins = {'foo': [Requirement('foo==1.0')]}
+        self.assertEqual([('1.0', '1.0-whl')], self._find_files(files, pins))
+
+    def test_find_matches_yanked_versions(self):
+        """A version with only yanked files is a candidate if pinned."""
+        files = [
+            ('1.0', '1.0-yanked-a', True),
+            ('1.0', '1.0-yanked-b', True),
+            ('2.0', '2.0-whl'),
+        ]
+        self.assertEqual([('2.0', '2.0-whl')], self._find_files(files))
+        pins = {'foo': [Requirement('foo==1.0')]}
+        self.assertEqual(
+            [('1.0', '1.0-yanked-a')], self._find_files(files, pins)
+        )
+
     def test_find_matches_cache_keyed_by_name(self):
         """Test that find_matches queries unearth with the bare package name."""
         session = MagicMock()
@@ -3697,9 +3767,9 @@ class TestCooldown(TestCase):
         }
 
     def test_late_file_on_old_release(self):
-        self.assertEqual(
-            ['foo-1.0-py3-none-any.whl', 'foo-1.0.tar.gz'], self._files('foo')
-        )
+        # The release is dated by its sdist, uploaded 100 days ago, though
+        # the wheel that's kept for it is only 2 days old
+        self.assertEqual(['foo-1.0-py3-none-any.whl'], self._files('foo'))
 
     def test_first_upload_of_incompatible_file(self):
         """A file that isn't compatible with the target still dates it."""

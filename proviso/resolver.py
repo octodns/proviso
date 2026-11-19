@@ -464,7 +464,7 @@ class PyPIProvider(AbstractProvider):
             # sorts them after every other file, so the order of the rest
             # doesn't change.  unearth returns a lazy LazySequence so we
             # materialise it immediately before caching.
-            result = list(
+            result = self._one_per_version(
                 self.finder.find_matches(
                     name, allow_yanked=True, allow_prereleases=True
                 )
@@ -488,9 +488,7 @@ class PyPIProvider(AbstractProvider):
         candidates = []
         # Versions only the base package's requirements exclude
         base_excluded = []
-        for package in result:
-            version = Version(package.version)
-
+        for version, package in result:
             # Exclude pre-releases unless a specifier explicitly allows them.
             if version.is_prerelease and not allow_prereleases:
                 continue
@@ -546,8 +544,28 @@ class PyPIProvider(AbstractProvider):
         log.debug(f'Found {len(candidates)} candidates for {identifier}')
         return sorted(candidates, key=attrgetter('version'), reverse=True)
 
-    def _apply_cooldown(self, name, packages):
-        """Return the packages of releases first uploaded before the cooldown.
+    @staticmethod
+    def _one_per_version(packages):
+        """Return (Version, package) for each version, in order of appearance.
+
+        unearth lists one package per file.  The one kept for a version is the
+        first, which is the best compatible file, and its metadata is what
+        _get_requires_dist ends up using.  A yanked file is passed over for one
+        that isn't: unearth lists those last, and a version is yanked only
+        when every one of its files is.
+        """
+        releases = {}
+        for package in packages:
+            version = Version(package.version)
+            kept = releases.get(version)
+            if kept is None or (
+                kept.link.is_yanked and not package.link.is_yanked
+            ):
+                releases[version] = package
+        return list(releases.items())
+
+    def _apply_cooldown(self, name, releases):
+        """Return the releases first uploaded before the cooldown.
 
         A release is dated by its first upload, so a file added to it later
         is still a candidate.  A release without any upload time is excluded,
@@ -556,14 +574,13 @@ class PyPIProvider(AbstractProvider):
         """
         result = []
         excluded_undated = False
-        for package in packages:
-            version = Version(package.version)
+        for version, package in releases:
             first = self.finder.first_upload(name, version)
             if first is not None and first <= self.exclude_newer_than:
-                result.append(package)
+                result.append((version, package))
             elif self._project_pins(name, version):
                 self._log_cooldown_exempt(name, version)
-                result.append(package)
+                result.append((version, package))
             elif first is None:
                 excluded_undated = True
         if excluded_undated:
