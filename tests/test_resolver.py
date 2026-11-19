@@ -2757,6 +2757,25 @@ class TestDirectReferences(TestCase):
             provider.get_dependencies(self._candidate(extras={'fast'}))
         self.assertEqual('baz', ctx.exception.requirement.name)
 
+    def test_resolve_dependency_on_project_with_url_raises(self):
+        """Only the project's requirements on itself are exempt."""
+        provider = self._provider(['mypkg @ https://example.com/mypkg.whl'])
+        package = MagicMock()
+        package.version = '1.0'
+        package.link.dist_info_link.url = 'https://pypi/pkg/1.0'
+        package.link.is_yanked = False
+        provider.finder.find_matches.return_value = [package]
+        with patch('proviso.resolver.PyPIProvider', return_value=provider):
+            resolver = Resolver(session=MagicMock())
+            with self.assertRaises(UnsupportedRequirementError) as ctx:
+                resolver.resolve(
+                    [Requirement('pkg')],
+                    python_version='3.12',
+                    project_name='mypkg',
+                )
+        self.assertEqual('mypkg', ctx.exception.requirement.name)
+        self.assertEqual('pkg', ctx.exception.name)
+
     def test_extras_candidate_base_pin_is_not_a_direct_reference(self):
         # The pin an extras candidate adds on its base package isn't a
         # direct reference
@@ -2964,6 +2983,24 @@ class TestSelfReferentialExtras(TestCase):
         ]
         self.assertEqual(
             ['mypkg-extra[test]; extra == "dev"'],
+            self._names(
+                requirements,
+                python_version='3.12',
+                extras=['dev'],
+                project_name='mypkg',
+            ),
+        )
+
+    def test_self_reference_direct_reference(self):
+        """A self-reference with a URL is left out and its extras expanded."""
+        requirements = [
+            'a',
+            'pytest; extra == "test"',
+            'black; extra == "lint"',
+            'mypkg[test] @ file:///src/mypkg ; extra == "dev"',
+        ]
+        self.assertEqual(
+            ['a', 'pytest; extra == "test"'],
             self._names(
                 requirements,
                 python_version='3.12',

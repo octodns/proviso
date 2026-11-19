@@ -18,6 +18,7 @@ from proviso.resolver import (
     Resolver,
     UnsupportedRequirementError,
     is_exact_pin,
+    is_self_reference,
     make_identifier,
     redact_requirement,
 )
@@ -156,8 +157,14 @@ def find_requirements(
         return {}
 
     # Direct references aren't supported. Check every requirement, whatever
-    # its marker, so the result doesn't depend on the target Pythons
-    direct = [redact_requirement(r) for r in requirements if r.url is not None]
+    # its marker, so the result doesn't depend on the target Pythons. One on
+    # the project itself is a self-reference, it's never resolved and its URL
+    # is ignored, see filter_requirements
+    direct = [
+        redact_requirement(r)
+        for r in requirements
+        if r.url is not None and not is_self_reference(r, project_name)
+    ]
     if direct:
         log.error(
             'The project requires direct references, which proviso does not '
@@ -165,7 +172,11 @@ def find_requirements(
         )
         exit(1)
 
-    log.info(f'Requirements: {", ".join([str(r) for r in requirements])}')
+    # A self-reference can still have a URL, which is redacted
+    shown = [
+        str(r) if r.url is None else redact_requirement(r) for r in requirements
+    ]
+    log.info(f'Requirements: {", ".join(shown)}')
 
     # Create one resolver instance (shared session across all Python versions)
     resolver = Resolver(session=session)

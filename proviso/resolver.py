@@ -81,6 +81,17 @@ def marker_applies(marker, environment, series=None, extra=''):
     return series.marker_applies(marker, environment, extra)
 
 
+def is_self_reference(requirement, project_name):
+    """Return whether requirement is on the project itself.
+
+    Names are compared in their canonical form. With no project_name nothing
+    is a self-reference.
+    """
+    return project_name is not None and canonicalize_name(
+        requirement.name
+    ) == canonicalize_name(project_name)
+
+
 def filter_requirements(
     requirements, python_version=None, extras=(), project_name=None
 ):
@@ -105,12 +116,9 @@ def filter_requirements(
         )
 
     if project_name is not None:
-        project_name = canonicalize_name(project_name)
-        own = [
-            r for r in requirements if canonicalize_name(r.name) == project_name
-        ]
+        own = [r for r in requirements if is_self_reference(r, project_name)]
         requirements = [
-            r for r in requirements if canonicalize_name(r.name) != project_name
+            r for r in requirements if not is_self_reference(r, project_name)
         ]
         # Extra names are compared in their canonical form, as packaging does
         # when it evaluates an extra marker

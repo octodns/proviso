@@ -700,6 +700,136 @@ class TestFindRequirements(TestCase):
                     mock_resolver.resolve.call_args.kwargs['project_name'],
                 )
 
+    def _resolve_self_reference(self, requirements, **kwargs):
+        """Run find_requirements with the real Resolver up to resolvelib.
+
+        resolvelib resolves each requirement it's passed to version 1.0.
+        Returns the result, the requirements passed to resolvelib and the
+        mocked log.
+        """
+        passed = []
+
+        def resolve(requirements, max_rounds):
+            passed.extend(requirements)
+            result = MagicMock()
+            result.mapping = {
+                r.name: Candidate(r.name, Version('1.0')) for r in requirements
+            }
+            return result
+
+        with patch('proviso.resolver.PyPIProvider'):
+            with patch('proviso.resolver.ResolveLibResolver') as rl:
+                rl.return_value.resolve.side_effect = resolve
+                with patch('proviso.main.exit') as ex:
+                    with patch('proviso.main.log') as mock_log:
+                        result = find_requirements(
+                            requirements,
+                            ['3.12'],
+                            session=MagicMock(),
+                            extras=['dev'],
+                            **kwargs,
+                        )
+        ex.assert_not_called()
+        mock_log.error.assert_not_called()
+        return result, passed, mock_log
+
+    SELF_REFERENCE = (
+        'a',
+        'pytest ; extra == "test"',
+        'black ; extra == "lint"',
+        'ipython ; extra == "dev"',
+    )
+
+    def test_find_requirements_self_reference_direct_reference(self):
+        """A direct reference to the project itself is a self-reference."""
+        for name, written in (
+            ('mypkg', 'mypkg'),
+            ('My_Pkg', 'my-pkg'),
+            ('my-pkg', 'My.Pkg'),
+        ):
+            requirements = [
+                Requirement(r)
+                for r in (
+                    *self.SELF_REFERENCE,
+                    f'{written}[test] @ file:///src/mypkg ; extra == "dev"',
+                )
+            ]
+            result, passed, _ = self._resolve_self_reference(
+                requirements, project_name=name
+            )
+            # The test extra is selected, the project isn't resolved
+            self.assertEqual(
+                ['a', 'pytest', 'ipython'], [r.name for r in passed]
+            )
+            self.assertEqual(['a', 'ipython', 'pytest'], sorted(result))
+
+    def test_find_requirements_self_reference_redaction(self):
+        """A self-reference's URL is never logged unredacted."""
+        requirements = [
+            Requirement(r)
+            for r in (
+                *self.SELF_REFERENCE,
+                'mypkg[test] @ https://user:SECRET@example.com/mypkg.whl'
+                '?token=SECRET#sha256=SECRET ; extra == "dev"',
+            )
+        ]
+        _, passed, mock_log = self._resolve_self_reference(
+            requirements, project_name='mypkg'
+        )
+        self.assertEqual(['a', 'pytest', 'ipython'], [r.name for r in passed])
+        for call in mock_log.method_calls:
+            self.assertNotIn('SECRET', str(call))
+            self.assertNotIn('user', str(call))
+        mock_log.info.assert_any_call(
+            'Requirements: a, pytest; extra == "test", black; extra == "lint", '
+            'ipython; extra == "dev", mypkg[test] @ '
+            'https://example.com/mypkg.whl ; extra == "dev"'
+        )
+
+    def test_find_requirements_self_reference_other_direct_reference(self):
+        """Other direct references are still rejected, and only they're listed."""
+        requirements = [
+            Requirement('mypkg[test] @ file:///src/mypkg ; extra == "dev"'),
+            Requirement('pytest ; extra == "test"'),
+            Requirement('other @ https://user:token@example.com/other.whl'),
+        ]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            with patch('proviso.main.exit', side_effect=SystemExit(1)) as ex:
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(
+                            requirements,
+                            ['3.12'],
+                            extras=['dev'],
+                            project_name='mypkg',
+                        )
+        ex.assert_called_once_with(1)
+        mock_log.error.assert_called_once_with(
+            'The project requires direct references, which proviso does not '
+            'support: other @ https://example.com/other.whl'
+        )
+        mock_resolver_class.assert_not_called()
+
+    def test_find_requirements_self_reference_without_project_name(self):
+        """Without a project_name a self-reference is rejected as before."""
+        requirements = [
+            Requirement('mypkg[test] @ file:///src/mypkg ; extra == "dev"'),
+            Requirement('pytest ; extra == "test"'),
+        ]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            with patch('proviso.main.exit', side_effect=SystemExit(1)) as ex:
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(
+                            requirements, ['3.12'], extras=['dev']
+                        )
+        ex.assert_called_once_with(1)
+        mock_log.error.assert_called_once_with(
+            'The project requires direct references, which proviso does not '
+            'support: mypkg[test] @ file:///src/mypkg ; extra == "dev"'
+        )
+        mock_resolver_class.assert_not_called()
+
     def test_find_requirements_passes_extras(self):
         """extras defaults to empty and is passed to the resolver."""
         requirements = [Requirement('requests>=2.0.0')]
