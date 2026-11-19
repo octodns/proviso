@@ -3,10 +3,11 @@
 #
 
 import re
-from dataclasses import fields
+from dataclasses import dataclass, fields
+from functools import cache
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
-from packaging.utils import canonicalize_name
+from packaging.utils import canonicalize_name, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
 from unearth import PackageFinder
 from unearth.evaluator import Evaluator, LinkMismatchError
@@ -166,13 +167,41 @@ def _index_url(page_url):
     return Link(page_url.rstrip('/').rpartition('/')[0] + '/').redacted
 
 
+@cache
+def _requires_python_mismatch(py_ver, requires_python, specifier):
+    """Return why a series can't use a file, or None if it can.
+
+    py_ver is the series' release tuple, requires_python the file's
+    Requires-Python and specifier that with unearth's legacy fixes applied.
+    It's memoised as an index gives the same few Requires-Python values for
+    many files.
+    """
+    try:
+        specifier = SpecifierSet(specifier)
+    except InvalidSpecifier:
+        return f'Invalid requires-python: {requires_python}'
+    series = PythonSeries('.'.join(map(str, py_ver)))
+    if series.specifier_satisfiable(specifier):
+        return None
+    return (
+        f'No release of the target python version ({series.version}) '
+        f'matches the requires-python specifier {requires_python}'
+    )
+
+
+@dataclass
 class SeriesEvaluator(Evaluator):
     """unearth Evaluator that checks Requires-Python against a whole series.
 
     A file is compatible with the target Python when any release in the
     target's series satisfies its Requires-Python. Without a target Python
     unearth's own check against the running interpreter is used.
+
+    supported_tags is the target Python's supported wheel tags as a frozenset.
+    SeriesPackageFinder builds it once for all of its evaluators.
     """
+
+    supported_tags: frozenset | None = None
 
     def check_requires_python(self, link):
         py_ver = self.target_python.py_ver
@@ -180,19 +209,27 @@ class SeriesEvaluator(Evaluator):
             return super().check_requires_python(link)
         if self.ignore_compatibility or not link.requires_python:
             return
-        try:
-            requires_python = SpecifierSet(
-                fix_legacy_specifier(link.requires_python)
-            )
-        except InvalidSpecifier as e:
+        # Fixed here rather than in the memo so that unearth's FutureWarning
+        # about a legacy specifier is still reported against evaluate_link
+        specifier = fix_legacy_specifier(link.requires_python)
+        message = _requires_python_mismatch(
+            tuple(py_ver), link.requires_python, specifier
+        )
+        if message is not None:
+            raise LinkMismatchError(message)
+
+    def check_wheel_tags(self, filename):
+        # unearth checks the wheel's tags against a list of the supported
+        # ones, which hashes all of them, over a thousand, for every wheel.
+        # Checking against a frozenset only hashes the wheel's few tags.
+        if self.ignore_compatibility:
+            return
+        supported = self.supported_tags
+        if supported is None:
+            supported = frozenset(self.target_python.supported_tags())
+        if parse_wheel_filename(filename)[-1].isdisjoint(supported):
             raise LinkMismatchError(
-                f'Invalid requires-python: {link.requires_python}'
-            ) from e
-        series = PythonSeries('.'.join(map(str, py_ver)))
-        if not series.specifier_satisfiable(requires_python):
-            raise LinkMismatchError(
-                f'No release of the target python version ({series.version}) '
-                f'matches the requires-python specifier {link.requires_python}'
+                f'The wheel tags in {filename} are not compatible'
             )
 
 
@@ -204,6 +241,8 @@ class SeriesPackageFinder(PackageFinder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # The target's supported wheel tags, see SeriesEvaluator
+        self._supported_tags = frozenset(self.target_python.supported_tags())
         # (canonical name, Version) -> earliest upload time of its files
         self._first_uploads = {}
         # canonical name -> indexes that gave files for it, none with an
@@ -213,7 +252,8 @@ class SeriesPackageFinder(PackageFinder):
     def build_evaluator(self, package_name, allow_yanked=False):
         evaluator = super().build_evaluator(package_name, allow_yanked)
         return SeriesEvaluator(
-            **{f.name: getattr(evaluator, f.name) for f in fields(evaluator)}
+            **{f.name: getattr(evaluator, f.name) for f in fields(evaluator)},
+            supported_tags=self._supported_tags,
         )
 
     # This overrides a private unearth method, written against unearth

@@ -321,6 +321,13 @@ class TestSeriesEvaluator(TestCase):
         with self.assertWarns(FutureWarning):
             self.assertFalse(self._check('>=3.13.*'))
 
+    def test_legacy_specifier_warning_location(self):
+        # The warning names the caller of check_requires_python, as it does
+        # for unearth's own check
+        with self.assertWarns(FutureWarning) as ctx:
+            self.assertTrue(self._check('>=3.11.*'))
+        self.assertEqual(__file__, ctx.filename)
+
     def test_patch_target(self):
         self.assertFalse(self._check('>=3.12.1', py_ver=(3, 12, 0)))
         self.assertTrue(self._check('>=3.12.1', py_ver=(3, 12, 1)))
@@ -358,6 +365,122 @@ class TestSeriesEvaluator(TestCase):
             self.assertTrue(self._check('>=3.11', py_ver=None))
             self.assertFalse(self._check('>=3.12', py_ver=None))
 
+    def _message(self, requires_python, py_ver=(3, 12)):
+        evaluator = SeriesEvaluator(
+            package_name='foo', target_python=TargetPython(py_ver=py_ver)
+        )
+        with self.assertRaises(LinkMismatchError) as ctx:
+            evaluator.check_requires_python(
+                Link(
+                    'https://example.com/foo.tar.gz',
+                    requires_python=requires_python,
+                )
+            )
+        return str(ctx.exception)
+
+    def test_repeated_requires_python(self):
+        # The result for a series and Requires-Python is memoised, a repeat
+        # gives the same message and a different series its own result
+        for _ in range(2):
+            self.assertEqual(
+                'No release of the target python version (3.12) matches the '
+                'requires-python specifier >=3.13',
+                self._message('>=3.13'),
+            )
+            self.assertEqual(
+                'Invalid requires-python: >=y', self._message('>=y')
+            )
+            self.assertEqual(
+                'Invalid requires-python: >=y',
+                self._message('>=y', py_ver=(3, 13)),
+            )
+            self.assertTrue(self._check('>=3.13', py_ver=(3, 13)))
+            self.assertEqual(
+                'No release of the target python version (3.11) matches the '
+                'requires-python specifier >=3.13',
+                self._message('>=3.13', py_ver=(3, 11)),
+            )
+
+
+class TestSeriesEvaluatorWheelTags(TestCase):
+    # A wheel for every combination of these, most of them incompatible
+    PYTHONS = ('py3', 'py2.py3', 'py2', 'cp311', 'cp315', 'cp39', 'pp310')
+    ABIS = ('none', 'abi3', 'cp311', 'cp315', 'cp315t', 'cp39')
+    PLATFORMS = (
+        'any',
+        'manylinux_2_17_x86_64.manylinux2014_x86_64',
+        'manylinux2014_x86_64',
+        'musllinux_1_2_x86_64',
+        'macosx_11_0_arm64',
+        'win_amd64',
+    )
+
+    def _filenames(self):
+        return [
+            f'foo-1.0-{python}-{abi}-{platform}.whl'
+            for python in self.PYTHONS
+            for abi in self.ABIS
+            for platform in self.PLATFORMS
+        ]
+
+    def _compatible(self, evaluator, filename):
+        try:
+            evaluator.check_wheel_tags(filename)
+        except LinkMismatchError as e:
+            self.assertEqual(
+                f'The wheel tags in {filename} are not compatible', str(e)
+            )
+            return False
+        return True
+
+    def test_same_as_unearth(self):
+        for py_ver in ((3, 11), (3, 15)):
+            target_python = TargetPython(py_ver=py_ver)
+            finder = SeriesPackageFinder(
+                session=None, index_urls=[], target_python=target_python
+            )
+            evaluators = (
+                finder.build_evaluator('foo'),
+                # Without the finder's tags the evaluator builds its own
+                SeriesEvaluator(
+                    package_name='foo', target_python=target_python
+                ),
+            )
+            base = Evaluator(package_name='foo', target_python=target_python)
+            results = []
+            for filename in self._filenames():
+                expected = self._compatible(base, filename)
+                results.append(expected)
+                for evaluator in evaluators:
+                    self.assertEqual(
+                        expected,
+                        self._compatible(evaluator, filename),
+                        (py_ver, filename),
+                    )
+            # Both outcomes are covered
+            self.assertIn(True, results)
+            self.assertIn(False, results)
+
+    def test_compatible_and_incompatible(self):
+        evaluator = SeriesEvaluator(
+            package_name='foo', target_python=TargetPython(py_ver=(3, 12))
+        )
+        self.assertTrue(self._compatible(evaluator, 'foo-1.0-py3-none-any.whl'))
+        self.assertFalse(
+            self._compatible(evaluator, 'foo-1.0-cp27-cp27m-win32.whl')
+        )
+
+    def test_ignore_compatibility(self):
+        evaluator = SeriesEvaluator(
+            package_name='foo',
+            target_python=TargetPython(py_ver=(3, 12)),
+            ignore_compatibility=True,
+            supported_tags=frozenset(),
+        )
+        self.assertTrue(
+            self._compatible(evaluator, 'foo-1.0-cp27-cp27m-win32.whl')
+        )
+
 
 class TestSeriesPackageFinder(TestCase):
     def _finder(self, py_ver):
@@ -375,6 +498,10 @@ class TestSeriesPackageFinder(TestCase):
         self.assertEqual('Foo', evaluator.package_name)
         self.assertEqual((3, 12), evaluator.target_python.py_ver)
         self.assertTrue(evaluator.allow_yanked)
+        self.assertEqual(
+            frozenset(evaluator.target_python.supported_tags()),
+            evaluator.supported_tags,
+        )
 
     def test_evaluate_link(self):
         evaluator = self._finder((3, 12)).build_evaluator('foo')
