@@ -10,7 +10,13 @@ import httpx2
 from build import BuildBackendException
 from packaging.requirements import Requirement
 from packaging.version import Version
-from resolvelib import ResolutionImpossible, ResolutionTooDeep
+from resolvelib import (
+    AbstractProvider,
+    BaseReporter,
+    ResolutionImpossible,
+    ResolutionTooDeep,
+)
+from resolvelib import Resolver as ResolveLibResolver
 from resolvelib.structs import RequirementInformation
 
 from proviso.main import (
@@ -332,6 +338,168 @@ class TestFindRequirements(TestCase):
             'foo satisfies foo>=2 (from bar[x]==1.0); releases inside the '
             '--cooldown-days window are excluded',
             mock_log.error.call_args[0][0],
+        )
+
+    def _causes(self, *pairs):
+        return ResolutionImpossible(
+            [
+                RequirementInformation(
+                    Requirement(requirement),
+                    None if parent is None else Candidate('a', Version(parent)),
+                )
+                for requirement, parent in pairs
+            ]
+        )
+
+    def _resolve_failure_cooldown(self, error):
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = error
+            with patch('proviso.main.exit', side_effect=SystemExit(1)):
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(
+                            [Requirement('a')],
+                            ['3.9'],
+                            exclude_newer_than=datetime(
+                                2026, 1, 1, tzinfo=timezone.utc
+                            ),
+                        )
+        return mock_log.error.call_args[0][0]
+
+    def test_find_requirements_same_requirement_many_parents(self):
+        """One requirement from several parent releases is not a conflict."""
+        error = self._causes(('missing', '2.0'), ('missing', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==2.0, a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_same_requirement_many_parents_cooldown(self):
+        """The cooldown hint follows the merged parent list."""
+        error = self._causes(('missing', '2.0'), ('missing', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==2.0, a==1.0); releases '
+            'inside the --cooldown-days window are excluded',
+            self._resolve_failure_cooldown(error),
+        )
+
+    def test_find_requirements_same_requirement_parent_cap(self):
+        """Only the first three parents are shown, then a count."""
+        error = self._causes(
+            *[('missing', f'{v}.0') for v in (10, 9, 8, 7, 6, 5, 4, 3, 2, 1)]
+        )
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==10.0, a==9.0, a==8.0 and 7 '
+            'more)',
+            self._resolve_failure(error),
+        )
+        error = self._causes(*[('missing', f'{v}.0') for v in (4, 3, 2, 1)])
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==4.0, a==3.0, a==2.0 and 1 '
+            'more)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_same_requirement_three_parents(self):
+        """Exactly three parents are all shown with no suffix."""
+        error = self._causes(*[('missing', f'{v}.0') for v in (3, 2, 1)])
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==3.0, a==2.0, a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_same_requirement_project_and_parent(self):
+        """The project counts as a parent like any other."""
+        error = self._causes(('missing', None), ('missing', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from the project, a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_same_requirement_duplicate_parents(self):
+        """A parent that repeats is listed once."""
+        error = self._causes(('missing', '1.0'), ('missing', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_different_requirements_same_package(self):
+        """Different requirements on one package still conflict."""
+        error = self._causes(('foo>=2', '2.0'), ('foo<2', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9, these '
+            'requirements conflict:\n'
+            '  foo>=2 (from a==2.0)\n'
+            '  foo<2 (from a==1.0)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_conflict_duplicate_lines(self):
+        """Exact duplicate conflict lines are collapsed, keeping order."""
+        error = self._causes(
+            ('foo>=2', '1.0'),
+            ('foo<2', None),
+            ('foo>=2', '1.0'),
+            ('foo<2', None),
+        )
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9, these '
+            'requirements conflict:\n'
+            '  foo>=2 (from a==1.0)\n'
+            '  foo<2 (from the project)',
+            self._resolve_failure(error),
+        )
+
+    def test_find_requirements_real_resolvelib_causes(self):
+        """resolvelib records one cause per rejected parent release."""
+        index = {'a': {'2.0': ['missing'], '1.0': ['missing']}, 'missing': {}}
+
+        class Provider(AbstractProvider):
+            def identify(self, requirement_or_candidate):
+                return requirement_or_candidate.name
+
+            def get_preference(self, identifier, *args, **kwargs):
+                return identifier
+
+            def find_matches(self, identifier, requirements, incompatibilities):
+                bad = {c.version for c in incompatibilities[identifier]}
+                return [
+                    Candidate(identifier, Version(v))
+                    for v in sorted(
+                        index[identifier], key=Version, reverse=True
+                    )
+                    if Version(v) not in bad
+                    and all(
+                        r.specifier.contains(v)
+                        for r in requirements[identifier]
+                    )
+                ]
+
+            def is_satisfied_by(self, requirement, candidate):
+                return requirement.specifier.contains(candidate.version)
+
+            def get_dependencies(self, candidate):
+                return [
+                    Requirement(r)
+                    for r in index[candidate.name][str(candidate.version)]
+                ]
+
+        with self.assertRaises(ResolutionImpossible) as caught:
+            ResolveLibResolver(Provider(), BaseReporter()).resolve(
+                [Requirement('a')]
+            )
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'missing satisfies missing (from a==2.0, a==1.0)',
+            self._resolve_failure(caught.exception),
         )
 
     def test_find_requirements_conflict_extras_parent(self):

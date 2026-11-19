@@ -83,18 +83,26 @@ def _resolution_error_message(error, python_version, cooldown=False):
     """Return the one error message that describes a resolution failure."""
     prefix = f'Unable to resolve dependencies for Python {python_version}'
     if isinstance(error, ResolutionImpossible):
-        conflicts = [
+        # resolvelib records one cause per rejected release of the parent, so
+        # the number of causes says nothing about whether anything conflicts
+        causes = [
             (
-                f'{cause.requirement} (from '
-                f'{make_identifier(cause.parent.name, cause.parent.extras)}'
-                f'=={cause.parent.version})'
-                if cause.parent is not None
-                else f'{cause.requirement} (from the project)'
+                str(cause.requirement),
+                (
+                    f'{make_identifier(cause.parent.name, cause.parent.extras)}'
+                    f'=={cause.parent.version}'
+                    if cause.parent is not None
+                    else 'the project'
+                ),
             )
             for cause in error.causes
         ]
-        if len(conflicts) == 1:
-            # a lone cause is a requirement nothing satisfies, not a conflict
+        if len({requirement for requirement, _ in causes}) == 1:
+            # one requirement nothing satisfies, not a conflict
+            parents = list(dict.fromkeys(parent for _, parent in causes))
+            shown = ', '.join(parents[:3])
+            if len(parents) > 3:
+                shown = f'{shown} and {len(parents) - 3} more'
             hint = (
                 '; releases inside the --cooldown-days window are excluded'
                 if cooldown
@@ -102,9 +110,12 @@ def _resolution_error_message(error, python_version, cooldown=False):
             )
             return (
                 f'{prefix}: no version of {error.causes[0].requirement.name} '
-                f'satisfies {conflicts[0]}{hint}'
+                f'satisfies {causes[0][0]} (from {shown}){hint}'
             )
-        conflicts = '\n'.join(f'  {c}' for c in conflicts)
+        conflicts = '\n'.join(
+            f'  {requirement} (from {parent})'
+            for requirement, parent in dict.fromkeys(causes)
+        )
         return f'{prefix}, these requirements conflict:\n{conflicts}'
     if isinstance(error, ResolutionTooDeep):
         return (
