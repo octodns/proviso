@@ -1,6 +1,6 @@
 from argparse import ArgumentTypeError
 from datetime import datetime, timezone
-from os.path import expanduser, join
+from os.path import join
 from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -1469,7 +1469,11 @@ class TestWriteRequirementsToFile(TestCase):
 
 class TestCacheDbSetting(TestCase):
     def setting(self, cache_db=None, no_cache=False, environ=None):
-        environ = {'XDG_CACHE_HOME': '/xdg', **(environ or {})}
+        environ = {
+            'HOME': '/home/u',
+            'XDG_CACHE_HOME': '/xdg',
+            **(environ or {}),
+        }
         with patch.dict('os.environ', environ, clear=True):
             return cache_db_setting(cache_db, no_cache)
 
@@ -1483,12 +1487,12 @@ class TestCacheDbSetting(TestCase):
             ('/tmp/c.db', True),
             self.setting('/tmp/c.db', environ={'PROVISO_CACHE_DB': '/e.db'}),
         )
-        self.assertEqual((expanduser('~/c.db'), True), self.setting('~/c.db'))
+        self.assertEqual(('/home/u/c.db', True), self.setting('~/c.db'))
 
     def test_environment(self):
         """PROVISO_CACHE_DB is used over the default, and is required."""
         self.assertEqual(
-            (expanduser('~/e.db'), True),
+            ('/home/u/e.db', True),
             self.setting(environ={'PROVISO_CACHE_DB': '~/e.db'}),
         )
 
