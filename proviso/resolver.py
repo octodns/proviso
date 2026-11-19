@@ -10,8 +10,9 @@ from packaging.metadata import InvalidMetadata, Metadata
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
-from resolvelib import AbstractProvider, BaseReporter
+from resolvelib import AbstractProvider, BaseReporter, ResolutionImpossible
 from resolvelib import Resolver as ResolveLibResolver
+from resolvelib.structs import RequirementInformation
 from unearth import TargetPython
 from unearth.auth import MultiDomainBasicAuth
 
@@ -204,6 +205,13 @@ class PyPIProvider(AbstractProvider):
             {} if file_requires_dist_cache is None else file_requires_dist_cache
         )
         self._matches_cache = {}
+        # The candidate each dependency came from, keyed by the dependency's
+        # id, see base_conflict_causes
+        self._parents = {}
+        # For an extras identifier left without candidates only because of
+        # its base package's requirements: (its own requirements, the base
+        # requirements that excluded them), see base_conflict_causes
+        self._base_conflicts = {}
         # (reason, name, version) or (reason, index) already logged about.
         # The Resolver shares this across providers so each is logged once
         # per run.
@@ -349,10 +357,11 @@ class PyPIProvider(AbstractProvider):
 
         name, extras = split_identifier(identifier)
         incompat_candidates = list(incompatibilities.get(identifier, []))
+        base_reqs = []
         if extras:
             # An extras candidate pins its base package to the same version,
             # so honor the base package's constraints here too (as pip does).
-            reqs.extend(requirements.get(name, []))
+            base_reqs = list(requirements.get(name, []))
             incompat_candidates.extend(incompatibilities.get(name, []))
 
         # Fetch (and cache) all platform-compatible packages for this name.
@@ -386,7 +395,7 @@ class PyPIProvider(AbstractProvider):
         # references a pre-release (e.g. ">=1.0a1"), as pip does.
         # SpecifierSet.prereleases returns True in that case.
         allow_prereleases = self.allow_prereleases or any(
-            r.specifier.prereleases for r in reqs
+            r.specifier.prereleases for r in reqs + base_reqs
         )
 
         # Collect incompatible versions for fast O(1) membership tests.
@@ -394,6 +403,8 @@ class PyPIProvider(AbstractProvider):
 
         # Build the filtered, sorted candidate list.
         candidates = []
+        # Versions only the base package's requirements exclude
+        base_excluded = []
         for package in result:
             version = Version(package.version)
 
@@ -420,11 +431,33 @@ class PyPIProvider(AbstractProvider):
                 if not self.pinned_exactly(name, version, requirements):
                     continue
 
+            if not all(
+                r.specifier.contains(version, prereleases=True)
+                for r in base_reqs
+            ):
+                base_excluded.append(version)
+                continue
+
             # Carry the unearth package object so get_dependencies can use it
             # directly without a redundant find_best_match lookup.
             candidates.append(
                 Candidate(name, version, extras=extras, package=package)
             )
+
+        if not candidates and base_excluded:
+            self._base_conflicts[identifier] = (
+                reqs,
+                [
+                    r
+                    for r in base_reqs
+                    if not all(
+                        r.specifier.contains(v, prereleases=True)
+                        for v in base_excluded
+                    )
+                ],
+            )
+        else:
+            self._base_conflicts.pop(identifier, None)
 
         # Return candidates sorted by version (newest first)
         log.debug(f'Found {len(candidates)} candidates for {identifier}')
@@ -712,8 +745,39 @@ class PyPIProvider(AbstractProvider):
         log.debug(
             f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
+        for req in dependencies:
+            self._parents[id(req)] = (req, candidate)
         self._dependencies_cache[cache_key] = dependencies
         return dependencies
+
+    def base_conflict_causes(self, causes):
+        """Return the causes of a failure with any base requirements added.
+
+        find_matches excludes an extras candidate when its base package's
+        requirements exclude its version, which leaves resolvelib with only
+        the extras requirement as the cause when none is left.  This adds the
+        base requirements that excluded them, with the candidates they came
+        from, None for the project's own.
+        """
+        result = list(causes)
+        for cause in causes:
+            conflict = self._base_conflicts.get(
+                self.identify(cause.requirement)
+            )
+            if conflict is None or not any(
+                cause.requirement is r for r in conflict[0]
+            ):
+                continue
+            for req in conflict[1]:
+                if any(req is c.requirement for c in result):
+                    continue
+                parent = self._parents.get(id(req), (None, None))
+                result.append(
+                    RequirementInformation(
+                        req, parent[1] if parent[0] is req else None
+                    )
+                )
+        return result
 
 
 class Resolver:
@@ -820,7 +884,13 @@ class Resolver:
         ordered = sorted(requirements, key=lambda r: bool(r.extras))
 
         # Resolve
-        result = resolver.resolve(ordered, max_rounds=MAX_ROUNDS)
+        try:
+            result = resolver.resolve(ordered, max_rounds=MAX_ROUNDS)
+        except ResolutionImpossible as e:
+            causes = provider.base_conflict_causes(e.causes)
+            if len(causes) == len(e.causes):
+                raise
+            raise ResolutionImpossible(causes) from e
 
         # Convert result to our format, folding extras candidates into their
         # base package.  An extras candidate pins its base package to the same

@@ -23,6 +23,7 @@ from unearth import Link, PackageFinder
 from unearth.errors import UnpackError
 from unearth.fetchers import DEFAULT_SECURE_ORIGINS
 
+from proviso.main import _resolution_error_message
 from proviso.resolver import (
     _CONFLICT_PRIORITY_THRESHOLD,
     MAX_ROUNDS,
@@ -2873,6 +2874,109 @@ class TestYanked(TestCase):
         self.assertEqual(
             [False, True, True], [p.link.is_yanked for p in with_yanked]
         )
+
+
+class TestExtrasBaseConflict(TestCase):
+    """A base package constraint that rules out an extras requirement."""
+
+    FILES = {
+        'foo': [index_file('foo', '1.0'), index_file('foo', '2.0')],
+        'bar': [index_file('bar', '1.0')],
+        'baz': [index_file('baz', '1.0')],
+    }
+    REQUIRES = {('bar', '1.0'): ['foo<2'], ('baz', '1.0'): ['foo[x]>=2']}
+
+    def _error(self, *requirements):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        with self.assertRaises(ResolutionImpossible) as caught:
+            resolver.resolve(
+                [Requirement(r) for r in requirements], python_version='3.12'
+            )
+        return caught.exception
+
+    def _message(self, *requirements):
+        return _resolution_error_message(
+            self._error(*requirements), '3.12', cooldown=True
+        )
+
+    def test_project_requirements(self):
+        for requirements in (('foo[x]>=2', 'foo<2'), ('foo<2', 'foo[x]>=2')):
+            with self.subTest(requirements=requirements):
+                self.assertEqual(
+                    'Unable to resolve dependencies for Python 3.12, these '
+                    'requirements conflict:\n'
+                    '  foo[x]>=2 (from the project)\n'
+                    '  foo<2 (from the project)',
+                    self._message(*requirements),
+                )
+
+    def test_from_dependency(self):
+        """The extras candidate's base pin conflicts with the dependency."""
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.12, these '
+            'requirements conflict:\n'
+            '  foo<2 (from bar==1.0)\n'
+            '  foo==2.0 (from foo[x]==2.0)',
+            self._message('bar', 'foo[x]>=2'),
+        )
+
+    def test_from_dependency_merged_first(self):
+        """The base constraint is merged before the extras requirement."""
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.12, these '
+            'requirements conflict:\n'
+            '  foo[x]>=2 (from baz==1.0)\n'
+            '  foo<2 (from bar==1.0)',
+            self._message('bar==1.0', 'baz==1.0'),
+        )
+
+    def test_only_excluding_requirements(self):
+        """A base requirement that excludes nothing isn't listed."""
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.12, these '
+            'requirements conflict:\n'
+            '  foo[x] (from the project)\n'
+            '  foo[x]>=2 (from the project)\n'
+            '  foo<2 (from the project)',
+            self._message('foo', 'foo<2', 'foo[x]', 'foo[x]>=2'),
+        )
+
+    def test_no_matching_version(self):
+        """Without a base constraint nothing else is blamed."""
+        error = self._error('foo[x]>=3')
+        self.assertEqual(
+            ['foo[x]>=3'], [str(c.requirement) for c in error.causes]
+        )
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.12: no version of '
+            'foo satisfies foo[x]>=3 (from the project); releases inside the '
+            '--cooldown-days window are excluded',
+            _resolution_error_message(error, '3.12', cooldown=True),
+        )
+
+    def test_stale_conflict(self):
+        """A recorded conflict only applies to the requirements it saw."""
+        provider = PyPIProvider(
+            FakeIndex(self.FILES, self.REQUIRES),
+            ['https://pypi.org/simple/'],
+            python_version='3.12',
+        )
+        requirements = {
+            'foo[x]': [Requirement('foo[x]>=2')],
+            'foo': [Requirement('foo<2')],
+        }
+        self.assertEqual([], provider.find_matches('foo[x]', requirements, {}))
+        recorded = _RequirementInfo(requirements['foo[x]'][0], None)
+        self.assertEqual(
+            [recorded, _RequirementInfo(requirements['foo'][0], None)],
+            provider.base_conflict_causes([recorded]),
+        )
+        other = _RequirementInfo(Requirement('foo[x]>=2'), None)
+        self.assertEqual([other], provider.base_conflict_causes([other]))
+        # Candidates found later clear it
+        requirements['foo'] = []
+        provider.find_matches('foo[x]', requirements, {})
+        self.assertEqual([recorded], provider.base_conflict_causes([recorded]))
 
 
 class TestIsExactPin(TestCase):
