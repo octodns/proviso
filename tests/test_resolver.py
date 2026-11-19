@@ -1,7 +1,7 @@
 import math
 import tarfile
 from collections import namedtuple
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from io import BytesIO
 from os.path import join
@@ -12,15 +12,18 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 from zipfile import ZipFile
 
+import httpx2
 from build import BuildBackendException
 from packaging.metadata import InvalidMetadata, Metadata
 from packaging.requirements import Requirement
 from packaging.version import Version
 from unearth import Link, PackageFinder
 from unearth.errors import UnpackError
+from unearth.fetchers import DEFAULT_SECURE_ORIGINS
 
 from proviso.resolver import (
     _CONFLICT_PRIORITY_THRESHOLD,
+    BasePin,
     Candidate,
     MetadataUnavailableError,
     PyPIProvider,
@@ -35,6 +38,66 @@ from proviso.series import SeriesPackageFinder
 # resolvelib defines RequirementInformation(requirement, parent); we use the
 # same field names so tests read naturally.
 _RequirementInfo = namedtuple('_RequirementInfo', ['requirement', 'parent'])
+
+NOW = datetime.now(timezone.utc)
+
+
+def index_file(name, version, days=100, sdist=False, tag='py3', **kwargs):
+    """Return a PEP 691 file entry uploaded days ago, with extra keys."""
+    if sdist:
+        filename = f'{name}-{version}.tar.gz'
+    else:
+        filename = f'{name}-{version}-{tag}-none-any.whl'
+    entry = {
+        'filename': filename,
+        'url': f'https://files.example.com/{filename}',
+        'hashes': {},
+        'core-metadata': True,
+        'upload-time': (NOW - timedelta(days=days)).isoformat(),
+    }
+    entry.update(kwargs)
+    return entry
+
+
+class FakeIndex(httpx2.Client):
+    """A PEP 691 JSON index serving files and their metadata.
+
+    files maps a package name to its file entries, see index_file.
+    requires maps (name, version) to that release's Requires-Dist.
+    """
+
+    def __init__(self, files, requires=None):
+        requires = requires or {}
+
+        def handler(request):
+            path = request.url.path
+            if path.endswith('.metadata'):
+                name, version = path.split('/')[-1].split('-')[:2]
+                lines = [
+                    'Metadata-Version: 2.1',
+                    f'Name: {name}',
+                    f'Version: {version}',
+                ]
+                lines.extend(
+                    f'Requires-Dist: {r}'
+                    for r in requires.get((name, version), ())
+                )
+                return httpx2.Response(200, text='\n'.join(lines) + '\n')
+            name = path.rstrip('/').split('/')[-1]
+            return httpx2.Response(
+                200,
+                headers={'Content-Type': 'application/vnd.pypi.simple.v1+json'},
+                json={
+                    'meta': {'api-version': '1.1'},
+                    'name': name,
+                    'files': files.get(name, []),
+                },
+            )
+
+        super().__init__(transport=httpx2.MockTransport(handler))
+
+    def iter_secure_origins(self):
+        yield from DEFAULT_SECURE_ORIGINS
 
 
 class TestCandidate(TestCase):
@@ -434,10 +497,13 @@ class TestPyPIProvider(TestCase):
             # Mock package results
             mock_package1 = MagicMock()
             mock_package1.version = '2.28.0'
+            mock_package1.link.is_yanked = False
             mock_package2 = MagicMock()
             mock_package2.version = '2.27.0'
+            mock_package2.link.is_yanked = False
             mock_package3 = MagicMock()
             mock_package3.version = '2.26.0'
+            mock_package3.link.is_yanked = False
 
             mock_finder.find_matches.return_value = [
                 mock_package1,
@@ -470,8 +536,10 @@ class TestPyPIProvider(TestCase):
 
             mock_package1 = MagicMock()
             mock_package1.version = '2.28.0'
+            mock_package1.link.is_yanked = False
             mock_package2 = MagicMock()
             mock_package2.version = '2.27.0'
+            mock_package2.link.is_yanked = False
 
             mock_finder.find_matches.return_value = [
                 mock_package1,
@@ -506,8 +574,10 @@ class TestPyPIProvider(TestCase):
 
             mock_package1 = MagicMock()
             mock_package1.version = '2.28.0'
+            mock_package1.link.is_yanked = False
             mock_package2 = MagicMock()
             mock_package2.version = '2.27.0'
+            mock_package2.link.is_yanked = False
 
             mock_finder.find_matches.return_value = [
                 mock_package1,
@@ -550,7 +620,7 @@ class TestPyPIProvider(TestCase):
 
             # Should be called with the bare identifier, not a specifier string
             mock_finder.find_matches.assert_called_once_with(
-                'requests', allow_prereleases=True
+                'requests', allow_yanked=True, allow_prereleases=True
             )
 
     def test_find_matches_incompatibility_filtering_applied_per_call(self):
@@ -567,8 +637,10 @@ class TestPyPIProvider(TestCase):
 
             mock_package1 = MagicMock()
             mock_package1.version = '2.28.0'
+            mock_package1.link.is_yanked = False
             mock_package2 = MagicMock()
             mock_package2.version = '2.27.0'
+            mock_package2.link.is_yanked = False
 
             mock_finder.find_matches.return_value = [
                 mock_package1,
@@ -1347,6 +1419,7 @@ class TestFindMatchesPrerelease(TestCase):
             for v in versions:
                 pkg = MagicMock()
                 pkg.version = v
+                pkg.link.is_yanked = False
                 packages.append(pkg)
 
             mock_finder.find_matches.return_value = packages
@@ -1776,6 +1849,7 @@ class TestExtras(TestCase):
     def _make_package(self, name, version):
         package = MagicMock()
         package.version = version
+        package.link.is_yanked = False
         package.link.dist_info_link.url = f'https://pypi/{name}/{version}'
         return package
 
@@ -1880,7 +1954,7 @@ class TestExtras(TestCase):
             {},
         )
         provider.finder.find_matches.assert_called_once_with(
-            'hishel', allow_prereleases=True
+            'hishel', allow_yanked=True, allow_prereleases=True
         )
 
     def test_get_dependencies_extras_candidate(self):
@@ -2488,3 +2562,149 @@ class TestTargetPythonSeries(TestCase):
             'https://example.com/foo-1.0.tar.gz', requires_python='>=3.13'
         )
         self.assertIsNone(evaluator.evaluate_link(link))
+
+
+class TestYanked(TestCase):
+    """Yanked releases are candidates only for an exact pin (PEP 592)."""
+
+    FILES = {
+        'foo': [
+            index_file('foo', '1.0'),
+            index_file('foo', '1.1', yanked='broken build'),
+            index_file('foo', '1.2', yanked=True),
+        ],
+        'app': [index_file('app', '1.0')],
+    }
+    REQUIRES = {('app', '1.0'): ['foo==1.1']}
+
+    def _provider(self):
+        return PyPIProvider(
+            FakeIndex(self.FILES, self.REQUIRES),
+            ['https://pypi.org/simple/'],
+            python_version='3.12',
+        )
+
+    def _versions(self, identifier, requirements, provider=None):
+        provider = provider or self._provider()
+        requirements = {
+            k: [r if isinstance(r, Requirement) else Requirement(r) for r in v]
+            for k, v in requirements.items()
+        }
+        result = provider.find_matches(identifier, requirements, {})
+        return [str(c.version) for c in result]
+
+    def _resolve(self, *requirements):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        return {
+            name: info['version']
+            for name, info in resolver.resolve(
+                [Requirement(r) for r in requirements], python_version='3.12'
+            ).items()
+        }
+
+    def test_not_offered_without_exact_pin(self):
+        expected = {
+            'foo': ['1.0'],
+            'foo>=1.0': ['1.0'],
+            'foo==1.*': ['1.0'],
+            'foo>=1.1': [],
+            'foo~=1.1': [],
+            'foo!=1.0': [],
+        }
+        for spec, versions in expected.items():
+            with self.subTest(spec=spec):
+                with self.assertNoLogs('proviso.resolver', level='WARNING'):
+                    self.assertEqual(
+                        versions, self._versions('foo', {'foo': [spec]})
+                    )
+
+    def test_offered_for_exact_pin(self):
+        for spec in ('foo==1.1', 'foo==1.1.0', 'foo===1.1', 'foo>=1.0,==1.1'):
+            with self.subTest(spec=spec):
+                self.assertEqual(
+                    ['1.1'], self._versions('foo', {'foo': [spec]})
+                )
+
+    def test_exact_pin_on_another_version(self):
+        self.assertEqual(['1.0'], self._versions('foo', {'foo': ['foo==1.0']}))
+
+    def test_exact_pin_on_another_package(self):
+        self.assertEqual(
+            [],
+            self._versions('foo', {'foo': ['foo>=1.1'], 'bar': ['bar==1.1']}),
+        )
+
+    def test_not_offered_for_extras_base_pin(self):
+        """The pin an extras candidate adds isn't a real exact pin."""
+        self.assertEqual(
+            [], self._versions('foo', {'foo': [BasePin('foo==1.1')]})
+        )
+
+    def test_offered_for_exact_pin_with_extras(self):
+        """A real pin on the package with extras counts for the base too."""
+        requirements = {'foo[x]': ['foo[x]==1.1'], 'foo': [BasePin('foo==1.1')]}
+        self.assertEqual(['1.1'], self._versions('foo', requirements))
+        self.assertEqual(['1.1'], self._versions('foo[x]', requirements))
+
+    def test_get_dependencies_extras_pin(self):
+        provider = self._provider()
+        candidate = Candidate('foo', Version('1.1'), extras={'x'})
+        candidate.package = MagicMock()
+        candidate.package.link.dist_info_link = None
+        with patch.object(provider, '_get_requires_dist', return_value=[]):
+            (pin,) = provider.get_dependencies(candidate)
+        self.assertIsInstance(pin, BasePin)
+        self.assertEqual('foo==1.1', str(pin))
+
+    def test_resolve_project_pin(self):
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            self.assertEqual({'foo': '1.1'}, self._resolve('foo==1.1'))
+        self.assertEqual(
+            [
+                'WARNING:proviso.resolver:foo==1.1 is yanked (broken build); '
+                'using it because it is pinned exactly'
+            ],
+            logs.output,
+        )
+
+    def test_resolve_project_pin_with_extras(self):
+        self.assertEqual({'foo': '1.1'}, self._resolve('foo[x]==1.1'))
+
+    def test_resolve_transitive_pin(self):
+        self.assertEqual({'app': '1.0', 'foo': '1.1'}, self._resolve('app'))
+
+    def test_resolve_without_pin(self):
+        self.assertEqual({'foo': '1.0'}, self._resolve('foo'))
+
+    def test_warning_without_reason(self):
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            self.assertEqual({'foo': '1.2'}, self._resolve('foo==1.2'))
+        self.assertIn('foo==1.2 is yanked (no reason given)', logs.output[0])
+
+    def test_warning_logged_once_per_run(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            for python_version in ('3.12', '3.13'):
+                resolver.resolve(
+                    [Requirement('foo==1.1')], python_version=python_version
+                )
+            provider = self._provider()
+            for _ in range(2):
+                self._versions('foo', {'foo': ['foo==1.1']}, provider)
+        yanked = [line for line in logs.output if 'is yanked' in line]
+        # Once for the resolver's run and once for the separate provider
+        self.assertEqual(2, len(yanked))
+
+    def test_yanked_files_sorted_last(self):
+        """Asking unearth for yanked files doesn't reorder the others."""
+        finder = self._provider().finder
+        with_yanked = list(
+            finder.find_matches(
+                'foo', allow_yanked=True, allow_prereleases=True
+            )
+        )
+        without = list(finder.find_matches('foo', allow_prereleases=True))
+        self.assertEqual(without, with_yanked[: len(without)])
+        self.assertEqual(
+            [False, True, True], [p.link.is_yanked for p in with_yanked]
+        )
