@@ -162,8 +162,8 @@ ignored and the extras it names are selected.
 #### HTTP cache
 
 proviso caches its HTTP requests, such as those to PyPI, in a SQLite database,
-so later runs only download what's changed. By default the database is `http-cache.db` in the
-per-user cache directory:
+so later runs only download what's changed. By default the database is
+`http-cache.db` in the per-user cache directory:
 
 - `$XDG_CACHE_HOME/proviso/` when `XDG_CACHE_HOME` is set to an absolute path
 - `~/Library/Caches/proviso/` on macOS
