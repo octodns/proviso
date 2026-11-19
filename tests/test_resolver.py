@@ -31,9 +31,11 @@ from proviso.resolver import (
     MetadataUnavailableError,
     PyPIProvider,
     Resolver,
+    UnsupportedRequirementError,
     filter_requirements,
     is_exact_pin,
     make_identifier,
+    redact_requirement,
     split_identifier,
 )
 from proviso.series import SeriesPackageFinder
@@ -2612,6 +2614,459 @@ class TestTargetPythonSeries(TestCase):
             'https://example.com/foo-1.0.tar.gz', requires_python='>=3.13'
         )
         self.assertIsNone(evaluator.evaluate_link(link))
+
+
+class TestDirectReferences(TestCase):
+    """Direct references (name @ url) aren't supported."""
+
+    def _provider(self, requires_dist):
+        session = MagicMock()
+        response = MagicMock()
+        response.text = (
+            'Metadata-Version: 2.1\nName: pkg\nVersion: 1.0\n'
+            + ''.join(f'Requires-Dist: {r}\n' for r in requires_dist)
+        )
+        session.get.return_value = response
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            return PyPIProvider(session, ['https://pypi.org/simple/'], '3.12')
+
+    def _candidate(self, extras=()):
+        package = MagicMock()
+        package.link.dist_info_link.url = 'https://pypi/pkg/1.0'
+        return Candidate('pkg', Version('1.0'), extras=extras, package=package)
+
+    def test_redact_requirement(self):
+        for written, expected in (
+            (
+                'foo @ https://user:token@example.com/foo-1.0.whl',
+                'foo @ https://example.com/foo-1.0.whl',
+            ),
+            (
+                'foo @ https://token@example.com:8443/foo-1.0.whl',
+                'foo @ https://example.com:8443/foo-1.0.whl',
+            ),
+            (
+                'foo[a,b] @ git+https://u:p@example.com/foo.git@v1.0 ; '
+                'python_version < "3.11"',
+                'foo[a,b] @ git+https://example.com/foo.git@v1.0 ; '
+                'python_version < "3.11"',
+            ),
+            (
+                'foo @ https://example.com/foo-1.0.whl',
+                'foo @ https://example.com/foo-1.0.whl',
+            ),
+            ('foo @ file:///tmp/foo-1.0.whl', 'foo @ file:///tmp/foo-1.0.whl'),
+            (
+                'foo @ https://example.com/foo.whl?token=SECRET#sha256=SECRET',
+                'foo @ https://example.com/foo.whl',
+            ),
+            (
+                'foo @ git+https://example.com/foo.git@v1.0#subdirectory=x',
+                'foo @ git+https://example.com/foo.git@v1.0',
+            ),
+        ):
+            requirement = Requirement(written)
+            self.assertEqual(expected, redact_requirement(requirement))
+            # The requirement itself is unchanged
+            self.assertEqual(written, str(requirement))
+
+    # URLs packaging accepts, but urlsplit can't parse
+    UNPARSEABLE = (
+        'https://u:SECRET@[::1/x.whl',
+        'https://u:SECRET@[notip]/x.whl',
+        'https://u:SECRET@host]/x.whl',
+        'https://u:SECRET@[::1]x/x.whl',
+    )
+    # URLs with credentials outside of the userinfo
+    SECRET_URLS = (
+        'https://example.com/x.whl?token=SECRET',
+        'https://example.com/x.whl?X-Amz-Credential=SECRET&X-Amz-Signature=SECRET',
+        'https://example.com/x.whl#token=SECRET',
+        'https://example.com/x.whl#sha256=SECRET',
+        'https://u:SECRET@example.com/x.whl?a=SECRET#b=SECRET',
+    )
+
+    def test_redact_requirement_unparseable(self):
+        for url in self.UNPARSEABLE:
+            requirement = Requirement(
+                f'foo[a,b] @ {url} ; python_version < "3.11"'
+            )
+            self.assertEqual(
+                'foo[a,b] @ <unparseable URL> ; python_version < "3.11"',
+                redact_requirement(requirement),
+            )
+            error = UnsupportedRequirementError(
+                requirement, 'pkg', Version('1.0')
+            )
+            self.assertEqual(
+                'pkg==1.0 requires a direct reference, which proviso does not '
+                'support: foo[a,b] @ <unparseable URL> ; '
+                'python_version < "3.11"',
+                str(error),
+            )
+
+    def test_redact_requirement_query_and_fragment(self):
+        for url in self.SECRET_URLS:
+            requirement = Requirement(f'foo @ {url}')
+            self.assertEqual(
+                'foo @ https://example.com/x.whl',
+                redact_requirement(requirement),
+            )
+            error = UnsupportedRequirementError(
+                requirement, 'pkg', Version('1.0')
+            )
+            self.assertNotIn('SECRET', str(error))
+            self.assertNotIn('Amz', str(error))
+
+    def test_dependency_with_url_raises(self):
+        provider = self._provider(
+            ['ok>=1', 'bar @ https://user:token@example.com/bar-1.0.whl']
+        )
+        with self.assertRaises(UnsupportedRequirementError) as ctx:
+            provider.get_dependencies(self._candidate())
+        error = ctx.exception
+        self.assertEqual('bar', error.requirement.name)
+        self.assertEqual('pkg', error.name)
+        self.assertEqual(Version('1.0'), error.version)
+        self.assertEqual(
+            'pkg==1.0 requires a direct reference, which proviso does not '
+            'support: bar @ https://example.com/bar-1.0.whl',
+            str(error),
+        )
+        self.assertNotIn('token', str(error))
+        self.assertNotIn('user', str(error))
+
+    def test_dependency_with_url_not_applying_is_ignored(self):
+        provider = self._provider(
+            [
+                'ok>=1',
+                'bar @ https://example.com/bar.whl ; python_version < "3.11"',
+                'baz @ https://example.com/baz.whl ; extra == "fast"',
+            ]
+        )
+        self.assertEqual(
+            ['ok>=1'],
+            [str(r) for r in provider.get_dependencies(self._candidate())],
+        )
+
+    def test_extra_dependency_with_url_raises(self):
+        provider = self._provider(
+            ['ok>=1', 'baz @ https://example.com/baz.whl ; extra == "fast"']
+        )
+        with self.assertRaises(UnsupportedRequirementError) as ctx:
+            provider.get_dependencies(self._candidate(extras={'fast'}))
+        self.assertEqual('baz', ctx.exception.requirement.name)
+
+    def test_resolve_dependency_on_project_with_url_raises(self):
+        """Only the project's requirements on itself are exempt."""
+        provider = self._provider(['mypkg @ https://example.com/mypkg.whl'])
+        package = MagicMock()
+        package.version = '1.0'
+        package.link.dist_info_link.url = 'https://pypi/pkg/1.0'
+        package.link.is_yanked = False
+        provider.finder.find_matches.return_value = [package]
+        with patch('proviso.resolver.PyPIProvider', return_value=provider):
+            resolver = Resolver(session=MagicMock())
+            with self.assertRaises(UnsupportedRequirementError) as ctx:
+                resolver.resolve(
+                    [Requirement('pkg')],
+                    python_version='3.12',
+                    project_name='mypkg',
+                )
+        self.assertEqual('mypkg', ctx.exception.requirement.name)
+        self.assertEqual('pkg', ctx.exception.name)
+
+    def test_extras_candidate_base_pin_is_not_a_direct_reference(self):
+        # The pin an extras candidate adds on its base package isn't a
+        # direct reference
+        provider = self._provider(
+            [
+                'ok>=1',
+                'fast-dep>=2 ; extra == "fast"',
+                'baz @ https://example.com/baz.whl ; extra == "other"',
+            ]
+        )
+        dependencies = provider.get_dependencies(
+            self._candidate(extras={'fast'})
+        )
+        self.assertIsInstance(dependencies[0], BasePin)
+        self.assertEqual(
+            ['pkg==1.0', 'fast-dep>=2; extra == "fast"'],
+            [str(r) for r in dependencies],
+        )
+
+    def test_resolve_dependency_with_url_raises(self):
+        provider = self._provider(['bar @ https://example.com/bar-1.0.whl'])
+        package = MagicMock()
+        package.version = '1.0'
+        package.link.dist_info_link.url = 'https://pypi/pkg/1.0'
+        package.link.is_yanked = False
+        provider.finder.find_matches.return_value = [package]
+        with patch('proviso.resolver.PyPIProvider', return_value=provider):
+            resolver = Resolver(session=MagicMock())
+            with self.assertRaises(UnsupportedRequirementError):
+                resolver.resolve([Requirement('pkg')], python_version='3.12')
+        # The direct reference was never looked up by name
+        provider.finder.find_matches.assert_called_once_with(
+            'pkg', allow_yanked=True, allow_prereleases=True
+        )
+
+
+class TestSelfReferentialExtras(TestCase):
+    """A project requirement on the project itself selects its extras."""
+
+    METADATA = (
+        'Metadata-Version: 2.4\n'
+        'Name: mypkg\n'
+        'Version: 1.0\n'
+        'Provides-Extra: test\n'
+        'Provides-Extra: lint\n'
+        'Provides-Extra: dev\n'
+        'Requires-Dist: a\n'
+        'Requires-Dist: pytest; extra == "test"\n'
+        'Requires-Dist: black; extra == "lint"\n'
+        'Requires-Dist: mypkg[test,lint]; extra == "dev"\n'
+        'Requires-Dist: ipython; extra == "dev"\n'
+    )
+
+    def _names(self, requirements, **kwargs):
+        with patch('proviso.resolver.default_environment') as de:
+            de.return_value = {'sys_platform': 'linux'}
+            return [
+                str(r)
+                for r in filter_requirements(
+                    [Requirement(r) for r in requirements], **kwargs
+                )
+            ]
+
+    def test_pyproject_example(self):
+        metadata = Metadata.from_email(self.METADATA)
+        with patch('proviso.resolver.default_environment') as de:
+            de.return_value = {'sys_platform': 'linux'}
+            filtered = filter_requirements(
+                metadata.requires_dist,
+                python_version='3.12',
+                extras=['dev'],
+                project_name=metadata.name,
+            )
+        self.assertEqual(
+            ['a', 'pytest', 'black', 'ipython'], [r.name for r in filtered]
+        )
+
+    def test_extra_not_selected(self):
+        metadata = Metadata.from_email(self.METADATA)
+        for extras, expected in (
+            ((), ['a']),
+            (['test'], ['a', 'pytest']),
+            (['lint', 'test'], ['a', 'pytest', 'black']),
+        ):
+            with patch('proviso.resolver.default_environment') as de:
+                de.return_value = {'sys_platform': 'linux'}
+                filtered = filter_requirements(
+                    metadata.requires_dist,
+                    python_version='3.12',
+                    extras=extras,
+                    project_name='mypkg',
+                )
+            self.assertEqual(expected, [r.name for r in filtered])
+
+    def test_nested(self):
+        requirements = [
+            'mypkg[test]; extra == "dev"',
+            'mypkg[lint]; extra == "test"',
+            'pytest; extra == "test"',
+            'black; extra == "lint"',
+            'ipython; extra == "dev"',
+            'other; extra == "other"',
+        ]
+        self.assertEqual(
+            [
+                'pytest; extra == "test"',
+                'black; extra == "lint"',
+                'ipython; extra == "dev"',
+            ],
+            self._names(
+                requirements,
+                python_version='3.12',
+                extras=['dev'],
+                project_name='mypkg',
+            ),
+        )
+
+    def test_cycle(self):
+        requirements = [
+            'mypkg[b]; extra == "a"',
+            'mypkg[a]; extra == "b"',
+            'x; extra == "a"',
+            'y; extra == "b"',
+        ]
+        for selected in ('a', 'b'):
+            self.assertEqual(
+                ['x; extra == "a"', 'y; extra == "b"'],
+                self._names(
+                    requirements,
+                    python_version='3.12',
+                    extras=[selected],
+                    project_name='mypkg',
+                ),
+            )
+
+    def test_python_marker(self):
+        requirements = [
+            'mypkg[test]; extra == "dev" and python_version < "3.11"',
+            'pytest; extra == "test"',
+            'ipython; extra == "dev"',
+        ]
+        kwargs = {'extras': ['dev'], 'project_name': 'mypkg'}
+        self.assertEqual(
+            ['pytest; extra == "test"', 'ipython; extra == "dev"'],
+            self._names(requirements, python_version='3.10', **kwargs),
+        )
+        self.assertEqual(
+            ['ipython; extra == "dev"'],
+            self._names(requirements, python_version='3.12', **kwargs),
+        )
+
+    def test_spelling(self):
+        requirements = [
+            'My.Pkg[Test_Extra]; extra == "Dev"',
+            'pytest; extra == "test-extra"',
+            'ipython; extra == "dev"',
+        ]
+        for project_name, extras in (
+            ('my_pkg', ['dev']),
+            ('MY-PKG', ['DEV']),
+            ('my--pkg', ['Dev']),
+        ):
+            self.assertEqual(
+                ['pytest; extra == "test-extra"', 'ipython; extra == "dev"'],
+                self._names(
+                    requirements,
+                    python_version='3.12',
+                    extras=extras,
+                    project_name=project_name,
+                ),
+            )
+
+    def test_without_extras_or_unknown_extra(self):
+        requirements = [
+            'a',
+            'mypkg>=99',
+            'mypkg[nope]; extra == "dev"',
+            'pytest; extra == "test"',
+        ]
+        self.assertEqual(
+            ['a'],
+            self._names(
+                requirements,
+                python_version='3.12',
+                extras=['dev'],
+                project_name='mypkg',
+            ),
+        )
+
+    def test_project_name_none_unchanged(self):
+        requirements = [
+            'a',
+            'mypkg[test]; extra == "dev"',
+            'pytest; extra == "test"',
+        ]
+        self.assertEqual(
+            ['a', 'mypkg[test]; extra == "dev"'],
+            self._names(requirements, python_version='3.12', extras=['dev']),
+        )
+
+    def test_other_package_name_unaffected(self):
+        requirements = [
+            'mypkg-extra[test]; extra == "dev"',
+            'pytest; extra == "test"',
+        ]
+        self.assertEqual(
+            ['mypkg-extra[test]; extra == "dev"'],
+            self._names(
+                requirements,
+                python_version='3.12',
+                extras=['dev'],
+                project_name='mypkg',
+            ),
+        )
+
+    def test_self_reference_direct_reference(self):
+        """A self-reference with a URL is left out and its extras expanded."""
+        requirements = [
+            'a',
+            'pytest; extra == "test"',
+            'black; extra == "lint"',
+            'mypkg[test] @ file:///src/mypkg ; extra == "dev"',
+        ]
+        self.assertEqual(
+            ['a', 'pytest; extra == "test"'],
+            self._names(
+                requirements,
+                python_version='3.12',
+                extras=['dev'],
+                project_name='mypkg',
+            ),
+        )
+
+    def test_resolve_passes_project_name(self):
+        metadata = Metadata.from_email(self.METADATA)
+        with patch('proviso.resolver.CachingClient'):
+            with patch('proviso.resolver.MultiDomainBasicAuth'):
+                resolver = Resolver()
+        for kwargs, expected in (
+            # A requirement with extras is passed after the ones without
+            ({}, ['a', 'ipython', 'mypkg']),
+            ({'project_name': 'mypkg'}, ['a', 'pytest', 'black', 'ipython']),
+        ):
+            mock_result = MagicMock()
+            mock_result.mapping = {}
+            with patch('proviso.resolver.ResolveLibResolver') as rl:
+                rl.return_value.resolve.return_value = mock_result
+                with patch('proviso.resolver.PyPIProvider') as provider:
+                    resolver.resolve(
+                        metadata.requires_dist,
+                        python_version='3.12',
+                        extras=['dev'],
+                        **kwargs,
+                    )
+            passed = rl.return_value.resolve.call_args.args[0]
+            self.assertEqual(expected, [r.name for r in passed])
+            user_requested = provider.call_args.kwargs['user_requested']
+            self.assertEqual(
+                'mypkg' in expected, 'mypkg[lint,test]' in user_requested
+            )
+            # The cooldown's exemption only sees the filtered requirements
+            project_requirements = provider.call_args.kwargs[
+                'project_requirements'
+            ]
+            self.assertEqual(
+                sorted(expected), sorted(r.name for r in project_requirements)
+            )
+
+    def test_dependency_on_its_own_extras_unchanged(self):
+        """A dependency that requires its own extras goes to the resolver."""
+        session = MagicMock()
+        response = MagicMock()
+        response.text = (
+            'Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n'
+            'Requires-Dist: foo[baz]; extra == "bar"\n'
+            'Requires-Dist: qux; extra == "baz"\n'
+        )
+        session.get.return_value = response
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            provider = PyPIProvider(
+                session, ['https://pypi.org/simple/'], '3.12'
+            )
+        package = MagicMock()
+        package.link.dist_info_link.url = 'https://pypi/foo/1.0'
+        candidate = Candidate(
+            'foo', Version('1.0'), extras={'bar'}, package=package
+        )
+        self.assertEqual(
+            ['foo==1.0', 'foo[baz]; extra == "bar"'],
+            [str(r) for r in provider.get_dependencies(candidate)],
+        )
 
 
 class TestYanked(TestCase):

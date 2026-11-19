@@ -16,8 +16,11 @@ from proviso.python import Python
 from proviso.resolver import (
     MetadataUnavailableError,
     Resolver,
+    UnsupportedRequirementError,
     is_exact_pin,
+    is_self_reference,
     make_identifier,
+    redact_requirement,
 )
 from proviso.series import PythonSeries
 from proviso.utils import CachingClient
@@ -147,12 +150,33 @@ def find_requirements(
     allow_prereleases=False,
     extras=(),
     build_sdists=False,
+    project_name=None,
 ):
 
     if not requirements:
         return {}
 
-    log.info(f'Requirements: {", ".join([str(r) for r in requirements])}')
+    # Direct references aren't supported. Check every requirement, whatever
+    # its marker, so the result doesn't depend on the target Pythons. One on
+    # the project itself is a self-reference, it's never resolved and its URL
+    # is ignored, see filter_requirements
+    direct = [
+        redact_requirement(r)
+        for r in requirements
+        if r.url is not None and not is_self_reference(r, project_name)
+    ]
+    if direct:
+        log.error(
+            'The project requires direct references, which proviso does not '
+            f'support: {", ".join(direct)}'
+        )
+        exit(1)
+
+    # A self-reference can still have a URL, which is redacted
+    shown = [
+        str(r) if r.url is None else redact_requirement(r) for r in requirements
+    ]
+    log.info(f'Requirements: {", ".join(shown)}')
 
     # Create one resolver instance (shared session across all Python versions)
     resolver = Resolver(session=session)
@@ -172,11 +196,13 @@ def find_requirements(
                 allow_prereleases=allow_prereleases,
                 extras=extras,
                 build_sdists=build_sdists,
+                project_name=project_name,
             )
         except (
             MetadataUnavailableError,
             ResolutionImpossible,
             ResolutionTooDeep,
+            UnsupportedRequirementError,
             httpx2.HTTPError,
         ) as e:
             log.error(
@@ -448,6 +474,7 @@ def main():  # pragma: no cover
             allow_prereleases=args.pre,
             extras=parsed['extras'],
             build_sdists=args.build_sdists,
+            project_name=metadata.name,
         )
 
         write_requirements_to_file(
