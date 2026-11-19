@@ -288,6 +288,9 @@ class PyPIProvider(AbstractProvider):
         # its base package's requirements: (its own requirements, the base
         # requirements that excluded them), see base_conflict_causes
         self._base_conflicts = {}
+        # A copy of _base_conflicts taken when resolvelib last reported a
+        # conflict, None until it does, see conflict_reported
+        self._reported_base_conflicts = None
         # (reason, name, version) or (reason, index) already logged about.
         # The Resolver shares this across providers so each is logged once
         # per run.
@@ -809,13 +812,13 @@ class PyPIProvider(AbstractProvider):
             ):
                 # Applies without any extra, so it belongs to the base package
                 if not candidate.extras:
-                    dependencies.append(req)
+                    dependencies.append(copy(req))
                 continue
 
             # Not a base dependency, check against requested extras
             for extra in candidate.extras:
                 if marker_applies(req.marker, environment, self.series, extra):
-                    dependencies.append(req)
+                    dependencies.append(copy(req))
                     break
 
         # Direct references aren't supported, fail rather than resolve one by
@@ -829,10 +832,24 @@ class PyPIProvider(AbstractProvider):
         log.debug(
             f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
+        # Each dependency is a copy of the cached Requires-Dist entry, so it
+        # belongs to this candidate alone and is kept alive by the cache
         for req in dependencies:
             self._parents[id(req)] = (req, candidate)
         self._dependencies_cache[cache_key] = dependencies
         return dependencies
+
+    def conflict_reported(self):
+        """Keep the base conflicts recorded when resolvelib found a conflict.
+
+        resolvelib computes a conflict's causes, reports them and then
+        backtracks, which calls find_matches again and replaces the records.
+        If backtracking fails, the ResolutionImpossible it raises carries the
+        causes reported, so base_conflict_causes uses this copy rather than
+        the later records.  Each record is a new tuple that's never changed,
+        so copying the dict is enough.
+        """
+        self._reported_base_conflicts = dict(self._base_conflicts)
 
     def base_conflict_causes(self, causes):
         """Return the causes of a failure with any base requirements added.
@@ -842,12 +859,18 @@ class PyPIProvider(AbstractProvider):
         the extras requirement as the cause when none is left.  This adds the
         base requirements that excluded them, with the candidates they came
         from, None for the project's own.
+
+        The records come from when the conflict was reported, see
+        conflict_reported.  Without a reported conflict the failure happened
+        while merging the initial requirements, right after the find_matches
+        call that made the current records.
         """
+        conflicts = self._reported_base_conflicts
+        if conflicts is None:
+            conflicts = self._base_conflicts
         result = list(causes)
         for cause in causes:
-            conflict = self._base_conflicts.get(
-                self.identify(cause.requirement)
-            )
+            conflict = conflicts.get(self.identify(cause.requirement))
             if conflict is None or not any(
                 cause.requirement is r for r in conflict[0]
             ):
@@ -862,6 +885,16 @@ class PyPIProvider(AbstractProvider):
                     )
                 )
         return result
+
+
+class ConflictReporter(BaseReporter):
+    """Tells the provider when resolvelib reports a conflict's causes."""
+
+    def __init__(self, provider):
+        self.provider = provider
+
+    def resolving_conflicts(self, causes):
+        self.provider.conflict_reported()
 
 
 class Resolver:
@@ -967,7 +1000,7 @@ class Resolver:
             logged=self._logged,
             project_requirements=requirements,
         )
-        reporter = BaseReporter()
+        reporter = ConflictReporter(provider)
         resolver = ResolveLibResolver(provider, reporter)
 
         # resolvelib finds a package's candidates when a requirement for it is

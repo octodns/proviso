@@ -29,6 +29,7 @@ from proviso.resolver import (
     MAX_ROUNDS,
     BasePin,
     Candidate,
+    ConflictReporter,
     MetadataUnavailableError,
     PyPIProvider,
     Resolver,
@@ -3341,18 +3342,29 @@ class TestExtrasBaseConflict(TestCase):
     }
     REQUIRES = {('bar', '1.0'): ['foo<2'], ('baz', '1.0'): ['foo[x]>=2']}
 
-    def _error(self, *requirements):
-        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+    def _error(self, *requirements, files=None, requires=None):
+        resolver = Resolver(
+            session=FakeIndex(files or self.FILES, requires or self.REQUIRES)
+        )
         with self.assertRaises(ResolutionImpossible) as caught:
             resolver.resolve(
                 [Requirement(r) for r in requirements], python_version='3.12'
             )
         return caught.exception
 
-    def _message(self, *requirements):
+    def _message(self, *requirements, files=None, requires=None):
         return _resolution_error_message(
-            self._error(*requirements), '3.12', cooldown=True
+            self._error(*requirements, files=files, requires=requires),
+            '3.12',
+            cooldown=True,
         )
+
+    @staticmethod
+    def _files(**versions):
+        return {
+            name: [index_file(name, v) for v in vs]
+            for name, vs in versions.items()
+        }
 
     def test_project_requirements(self):
         for requirements in (('foo[x]>=2', 'foo<2'), ('foo<2', 'foo[x]>=2')):
@@ -3432,6 +3444,137 @@ class TestExtrasBaseConflict(TestCase):
         requirements['foo'] = []
         provider.find_matches('foo[x]', requirements, {})
         self.assertEqual([recorded], provider.base_conflict_causes([recorded]))
+
+    def test_conflict_found_while_backtracking(self):
+        """Only the records from when the conflict was found are used.
+
+        resolvelib calls find_matches again while it backtracks from the
+        conflict, after it has worked out its causes. Here those calls record
+        foo<3 for foo[x], although foo[x]<3 and foo[x]>=2 leave only 2.0,
+        which foo<3 allows.
+        """
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.12, these '
+            'requirements conflict:\n'
+            '  foo[x] (from the project)\n'
+            '  foo[x]<3 (from c==2.0)\n'
+            '  foo[x]>=2 (from c==2.0)',
+            self._message(
+                'foo[y]',
+                'foo<3',
+                'foo[x]',
+                'b<2',
+                files=self._files(
+                    foo=('1.0', '2.0', '3.0'),
+                    a=('1.0', '2.0'),
+                    b=('1.0', '2.0'),
+                    c=('1.0', '2.0'),
+                ),
+                requires={
+                    ('a', '1.0'): ['foo[x]>=2'],
+                    ('b', '1.0'): ['foo<2'],
+                    ('b', '2.0'): ['c<2', 'foo>=2'],
+                    ('c', '2.0'): ['foo[x]<3', 'foo[x]>=2'],
+                    ('foo', '1.0'): ['c>=2; extra == "x"'],
+                    ('foo', '3.0'): ['b>=2; extra == "x"'],
+                },
+            ),
+        )
+
+    def test_shared_requires_dist_parent(self):
+        """A dependency names the extras candidate it came from.
+
+        foo[x]==1.0 and foo[x,y]==1.0 both get bar<2 from the same
+        Requires-Dist entry. q==2.0, which requires foo[x,y], is backtracked
+        away, so the bar<2 in the conflict comes from foo[x]==1.0.
+        """
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.12, these '
+            'requirements conflict:\n'
+            '  bar[z]>=2 (from zz==1.0)\n'
+            '  bar<2; extra == "x" (from foo[x]==1.0)',
+            self._message(
+                'foo[x]',
+                'q',
+                'r',
+                files=self._files(
+                    foo=('1.0',),
+                    bar=('1.0', '2.0'),
+                    q=('1.0', '2.0'),
+                    w=('1.0',),
+                    v=('1.0',),
+                    r=('1.0',),
+                    zz=('1.0',),
+                ),
+                requires={
+                    ('foo', '1.0'): ['bar<2; extra == "x"'],
+                    ('q', '2.0'): ['foo[x,y]', 'w'],
+                    ('w', '1.0'): ['v>=5'],
+                    ('r', '1.0'): ['zz'],
+                    ('zz', '1.0'): ['bar[z]>=2'],
+                },
+            ),
+        )
+
+    def test_dependencies_not_shared(self):
+        """Each candidate gets its own copies of its Requires-Dist entries."""
+        provider = PyPIProvider(
+            FakeIndex(self.FILES, {('foo', '1.0'): ['bar; extra == "x"']}),
+            ['https://pypi.org/simple/'],
+            python_version='3.12',
+        )
+        x = Candidate('foo', Version('1.0'), extras=['x'])
+        xy = Candidate('foo', Version('1.0'), extras=['x', 'y'])
+        x_deps = provider.get_dependencies(x)
+        xy_deps = provider.get_dependencies(xy)
+        self.assertEqual(x_deps, xy_deps)
+        self.assertIsInstance(x_deps[0], BasePin)
+        self.assertIsNot(x_deps[1], xy_deps[1])
+        self.assertIsNot(
+            provider._requires_dist_cache[('foo', Version('1.0'))][0], x_deps[1]
+        )
+        # A cache hit returns the same list, so the parent stays recorded
+        self.assertIs(x_deps, provider.get_dependencies(x))
+        for deps, candidate in ((x_deps, x), (xy_deps, xy)):
+            for req in deps:
+                self.assertEqual((req, candidate), provider._parents[id(req)])
+
+    def test_reported_conflict(self):
+        """A conflict's records are kept from when resolvelib reports it."""
+        provider = PyPIProvider(
+            FakeIndex(self.FILES, self.REQUIRES),
+            ['https://pypi.org/simple/'],
+            python_version='3.12',
+        )
+        reporter = ConflictReporter(provider)
+        extras = Requirement('foo[x]>=2')
+        below_two = Requirement('foo<2')
+        one = Requirement('foo==1.0')
+        cause = _RequirementInfo(extras, None)
+        requirements = {'foo[x]': [extras], 'foo': [below_two]}
+        self.assertEqual([], provider.find_matches('foo[x]', requirements, {}))
+        expected = [cause, _RequirementInfo(below_two, None)]
+        # Without a reported conflict the current records are used
+        self.assertEqual(expected, provider.base_conflict_causes([cause]))
+        reporter.resolving_conflicts([cause])
+        # Backtracking finds candidates, or excludes them with something
+        # else, after the conflict was reported
+        requirements['foo'] = []
+        self.assertTrue(provider.find_matches('foo[x]', requirements, {}))
+        self.assertEqual(expected, provider.base_conflict_causes([cause]))
+        requirements['foo'] = [one]
+        self.assertEqual([], provider.find_matches('foo[x]', requirements, {}))
+        self.assertEqual(expected, provider.base_conflict_causes([cause]))
+        # A later conflict replaces it
+        reporter.resolving_conflicts([cause])
+        self.assertEqual(
+            [cause, _RequirementInfo(one, None)],
+            provider.base_conflict_causes([cause]),
+        )
+        requirements['foo'] = []
+        provider.find_matches('foo[x]', requirements, {})
+        reporter.resolving_conflicts([cause])
+        self.assertEqual([cause], provider.base_conflict_causes([cause]))
 
 
 class TestIsExactPin(TestCase):
