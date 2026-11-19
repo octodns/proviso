@@ -24,7 +24,7 @@ from .builder import (
     sdist_pkg_info_metadata,
     wheel_metadata,
 )
-from .series import PythonSeries, SeriesPackageFinder
+from .series import IndexCache, PythonSeries, SeriesPackageFinder
 from .utils import CachingClient
 
 log = getLogger('proviso.resolver')
@@ -263,6 +263,8 @@ class PyPIProvider(AbstractProvider):
         build_sdists=False,
         logged=None,
         project_requirements=(),
+        index_cache=None,
+        index_requires_dist_cache=None,
     ):
         self.session = session
         # When True, an sdist's build backend may be run to learn its
@@ -279,6 +281,14 @@ class PyPIProvider(AbstractProvider):
         # file is downloaded, and an sdist built, at most once per run.
         self._file_requires_dist_cache = (
             {} if file_requires_dist_cache is None else file_requires_dist_cache
+        )
+        # Requires-Dist from the index's metadata files, keyed by metadata
+        # URL.  Shared like _file_requires_dist_cache: the metadata of a file
+        # is the same whichever target Python picked it.
+        self._index_requires_dist_cache = (
+            {}
+            if index_requires_dist_cache is None
+            else index_requires_dist_cache
         )
         self._matches_cache = {}
         # The candidate each dependency came from, keyed by the dependency's
@@ -321,9 +331,14 @@ class PyPIProvider(AbstractProvider):
         if self.series:
             target_python = TargetPython(py_ver=self.series.release)
 
-        # Create PackageFinder with the target Python version
+        # Create PackageFinder with the target Python version.  The Resolver
+        # shares index_cache across providers so each index page is fetched
+        # and parsed once per run.
         self.finder = SeriesPackageFinder(
-            session=session, index_urls=index_urls, target_python=target_python
+            session=session,
+            index_urls=index_urls,
+            target_python=target_python,
+            index_cache=index_cache,
         )
 
     def identify(self, requirement_or_candidate):
@@ -456,19 +471,14 @@ class PyPIProvider(AbstractProvider):
         else:
             log.debug(f'Finding matches for {name}: {reqs[0]}')
             # Query by name only so one cache entry covers all specifiers and
-            # extras seen during resolution.  Always ask for pre-releases and
-            # apply the pre-release policy below: with prereleases=None unearth
-            # defers to packaging's default, which differs between packaging
-            # 25 and 26.  Yanked files are included too and filtered below, as
-            # whether one is allowed depends on the requirements.  unearth
-            # sorts them after every other file, so the order of the rest
-            # doesn't change.  unearth returns a lazy LazySequence so we
-            # materialise it immediately before caching.
-            result = self._one_per_version(
-                self.finder.find_matches(
-                    name, allow_yanked=True, allow_prereleases=True
-                )
-            )
+            # extras seen during resolution.  find_all includes pre-releases,
+            # the pre-release policy is applied below: leaving it to unearth
+            # would defer to packaging's default, which differs between
+            # packaging 25 and 26.  Yanked files are included too and
+            # filtered below, as whether one is allowed depends on the
+            # requirements.  unearth sorts them after every other file, so the
+            # order of the rest doesn't change.
+            result = self._one_per_version(self.finder.find_all(name))
             if self.exclude_newer_than is not None:
                 result = self._apply_cooldown(name, result)
             self._matches_cache[name] = result
@@ -692,10 +702,29 @@ class PyPIProvider(AbstractProvider):
 
         # Fetch metadata from dist_info_link if available
         if package.link.dist_info_link:
-            url = package.link.dist_info_link.url
+            requires_dist = self._get_index_requires_dist(
+                candidate, package.link.dist_info_link
+            )
+        else:
+            # No metadata from the index, e.g. for sdists, so get it from the
+            # file itself as pip does
+            requires_dist = self._get_file_requires_dist(
+                candidate, package.link
+            )
 
+        self._requires_dist_cache[cache_key] = requires_dist
+        return requires_dist
+
+    def _get_index_requires_dist(self, candidate, dist_info_link):
+        """Return the Requires-Dist entries from a file's index metadata.
+
+        Only a successful parse is cached, so an error is raised again for
+        the next target Python.
+        """
+        key = dist_info_link.url_without_fragment
+        if key not in self._index_requires_dist_cache:
             # Fetch using cached session
-            response = self.session.get(url)
+            response = self.session.get(dist_info_link.url)
             response.raise_for_status()
 
             # Disable validation to handle metadata version mismatches
@@ -708,15 +737,8 @@ class PyPIProvider(AbstractProvider):
                     candidate.version,
                     f'invalid Requires-Dist in the index metadata: {e}',
                 ) from e
-        else:
-            # No metadata from the index, e.g. for sdists, so get it from the
-            # file itself as pip does
-            requires_dist = self._get_file_requires_dist(
-                candidate, package.link
-            )
-
-        self._requires_dist_cache[cache_key] = requires_dist
-        return requires_dist
+            self._index_requires_dist_cache[key] = requires_dist
+        return self._index_requires_dist_cache[key]
 
     def _get_file_requires_dist(self, candidate, link):
         """Return the Requires-Dist entries read from a candidate's file."""
@@ -940,6 +962,8 @@ class Resolver:
         self._session.auth = MultiDomainBasicAuth(index_urls=index_urls)
         # Shared by every provider this resolver creates, see PyPIProvider
         self._file_requires_dist_cache = {}
+        self._index_requires_dist_cache = {}
+        self._index_cache = IndexCache()
         self._logged = set()
 
     def resolve(
@@ -1020,6 +1044,8 @@ class Resolver:
             build_sdists=build_sdists,
             logged=self._logged,
             project_requirements=requirements,
+            index_cache=self._index_cache,
+            index_requires_dist_cache=self._index_requires_dist_cache,
         )
         reporter = ConflictReporter(provider)
         resolver = ResolveLibResolver(provider, reporter)
