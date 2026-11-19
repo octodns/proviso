@@ -104,18 +104,19 @@ proviso --pre
 
 #### Platform-specific output
 
-proviso resolves for each target Python version, but for the platform it runs
-on. The operating system, CPU architecture, and Python implementation come
-from the machine running proviso, so the same project can produce a different
-file on Linux, macOS, and Windows:
+proviso resolves for each target Python version, but only for the platform it
+runs on. The operating system, CPU architecture, and Python implementation come
+from the machine running proviso, as does the glibc or macOS version, so the
+same project can produce a different file on Linux, macOS, and Windows, or on
+two Linux machines with different glibc versions:
 
 - A dependency behind a marker for another platform, such as
   `colorama; sys_platform == "win32"`, isn't pinned.
 - A dependency that only the generating platform needs is pinned without a
-  marker.
+  platform marker.
 - A release counts as available when it has a wheel for the generating
-  platform or an sdist, so a package can resolve to a different version, or
-  need `--build-sdists`, on another platform.
+  platform or an sdist, so on another platform a package can resolve to a
+  different version, need `--build-sdists`, or fail to resolve.
 
 Generate the file on the platform you install on. See
 [#39](https://github.com/octodns/proviso/issues/39).
