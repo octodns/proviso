@@ -65,9 +65,10 @@ class FakeIndex(httpx2.Client):
 
     files maps a package name to its file entries, see index_file.
     requires maps (name, version) to that release's Requires-Dist.
+    Index pages on html_hosts use the HTML API, which has no upload times.
     """
 
-    def __init__(self, files, requires=None):
+    def __init__(self, files, requires=None, html_hosts=()):
         requires = requires or {}
 
         def handler(request):
@@ -85,6 +86,16 @@ class FakeIndex(httpx2.Client):
                 )
                 return httpx2.Response(200, text='\n'.join(lines) + '\n')
             name = path.rstrip('/').split('/')[-1]
+            if request.url.host in html_hosts:
+                anchors = ''.join(
+                    f'<a href="{f["url"]}">{f["filename"]}</a>'
+                    for f in files.get(name, [])
+                )
+                return httpx2.Response(
+                    200,
+                    headers={'Content-Type': 'text/html'},
+                    text=f'<html><body>{anchors}</body></html>',
+                )
             return httpx2.Response(
                 200,
                 headers={'Content-Type': 'application/vnd.pypi.simple.v1+json'},
@@ -2852,3 +2863,136 @@ class TestCooldown(TestCase):
             'qux[x]': [Requirement('qux[x]')],
         }
         self.assertEqual([], provider.find_matches('qux', requirements, {}))
+
+
+class TestCooldownWithoutUploadTimes(TestCase):
+    """An index that gives no upload times is reported once per run."""
+
+    CUTOFF = NOW - timedelta(days=7)
+    JSON_INDEX = 'https://pypi.org/simple/'
+    HTML_INDEX = 'https://html.example.com/simple/'
+
+    FILES = {
+        'foo': [index_file('foo', '1.0'), index_file('foo', '2.0')],
+        'bar': [index_file('bar', '1.0')],
+        # Only 1.0 lacks an upload time
+        'baz': [
+            index_file('baz', '1.0', **{'upload-time': None}),
+            index_file('baz', '0.9'),
+        ],
+    }
+
+    def _session(self):
+        return FakeIndex(self.FILES, html_hosts=('html.example.com',))
+
+    def _provider(self, index_urls=None, **kwargs):
+        kwargs.setdefault('exclude_newer_than', self.CUTOFF)
+        return PyPIProvider(
+            self._session(),
+            index_urls or [self.HTML_INDEX],
+            python_version='3.12',
+            **kwargs,
+        )
+
+    def _versions(self, provider, name):
+        result = provider.find_matches(name, {name: [Requirement(name)]}, {})
+        return [str(c.version) for c in result]
+
+    def _warnings(self, logs):
+        return [line for line in logs.output if 'no upload times' in line]
+
+    def test_warning(self):
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            self.assertEqual([], self._versions(self._provider(), 'foo'))
+        self.assertEqual(
+            [
+                'WARNING:proviso.resolver:https://html.example.com/simple/ '
+                'provided no upload times for foo, which happens when an '
+                'index only serves the HTML "simple" API and not the JSON '
+                "API; its releases can't be dated, so the dependency "
+                'cooldown excludes all of them. Other packages may be '
+                'affected too; --cooldown-days 0 disables the cooldown'
+            ],
+            logs.output,
+        )
+
+    def test_credentials_redacted(self):
+        provider = self._provider(
+            ['https://user:secret@html.example.com/simple/']
+        )
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            self._versions(provider, 'foo')
+        self.assertIn('***@html.example.com/simple/ provided', logs.output[0])
+        self.assertNotIn('secret', logs.output[0])
+
+    def test_once_per_run(self):
+        resolver = Resolver(
+            index_urls=[self.HTML_INDEX], session=self._session()
+        )
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            for python_version in ('3.12', '3.13'):
+                for name in ('foo', 'bar'):
+                    with self.assertRaises(ResolutionImpossible):
+                        resolver.resolve(
+                            [Requirement(name)],
+                            python_version=python_version,
+                            exclude_newer_than=self.CUTOFF,
+                        )
+        warnings = self._warnings(logs)
+        self.assertEqual(1, len(warnings))
+        self.assertIn('no upload times for foo', warnings[0])
+
+    def test_once_per_index(self):
+        """Only the HTML index is reported when it's mixed with a JSON one.
+
+        Both serve the same files.  foo's releases are dated by the JSON
+        index, baz 1.0 has no upload time on either.
+        """
+        resolver = Resolver(
+            index_urls=[self.JSON_INDEX, self.HTML_INDEX],
+            session=self._session(),
+        )
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            for name in ('foo', 'baz'):
+                resolver.resolve(
+                    [Requirement(name)],
+                    python_version='3.12',
+                    exclude_newer_than=self.CUTOFF,
+                )
+        warnings = self._warnings(logs)
+        self.assertEqual(1, len(warnings))
+        self.assertIn(
+            f'{self.HTML_INDEX} provided no upload times for baz', warnings[0]
+        )
+
+    def test_project_pin(self):
+        """A pin is still exempt, other releases are excluded and reported."""
+        provider = self._provider(
+            project_requirements=[Requirement('foo==1.0')]
+        )
+        with self.assertLogs('proviso.resolver', level='INFO') as logs:
+            self.assertEqual(['1.0'], self._versions(provider, 'foo'))
+        self.assertEqual(1, len(self._warnings(logs)))
+
+    def test_project_pin_only_release(self):
+        """Nothing is excluded when the pin is the only release."""
+        provider = self._provider(
+            project_requirements=[Requirement('bar==1.0')]
+        )
+        with self.assertLogs('proviso.resolver', level='INFO') as logs:
+            self.assertEqual(['1.0'], self._versions(provider, 'bar'))
+        self.assertEqual([], self._warnings(logs))
+
+    def test_some_upload_times(self):
+        provider = self._provider([self.JSON_INDEX])
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            self.assertEqual(['0.9'], self._versions(provider, 'baz'))
+
+    def test_no_files(self):
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            self.assertEqual([], self._versions(self._provider(), 'missing'))
+
+    def test_without_cooldown(self):
+        provider = self._provider(exclude_newer_than=None)
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            self.assertEqual(['2.0', '1.0'], self._versions(provider, 'foo'))

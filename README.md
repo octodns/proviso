@@ -81,7 +81,9 @@ brand-new release doesn't get pinned the moment it lands. A release is dated
 by its first upload, so a file added to an older release later, such as a
 wheel for a new Python, is still used. A version that your project pins
 exactly with `==` or `===` is used even if it's newer; pins in dependencies
-aren't exempt. Adjust the window:
+aren't exempt. An index that only serves the HTML "simple" API, not the JSON
+API, gives no upload times, so its releases can't be dated and are all
+excluded; proviso warns when this happens. Adjust the window:
 
 ```bash
 proviso --cooldown-days 14

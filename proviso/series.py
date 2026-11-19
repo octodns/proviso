@@ -10,6 +10,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 from unearth import PackageFinder
 from unearth.evaluator import Evaluator, LinkMismatchError
+from unearth.link import Link
 from unearth.utils import fix_legacy_specifier
 
 # Matches the contents of a single or double quoted string
@@ -156,6 +157,14 @@ class PythonSeries:
         return f"python_full_version!='{self.version}'"
 
 
+def _index_url(page_url):
+    """Return the index URL, redacted, of a package's index page URL.
+
+    A package's page is the index URL followed by the package's name.
+    """
+    return Link(page_url.rstrip('/').rpartition('/')[0] + '/').redacted
+
+
 class SeriesEvaluator(Evaluator):
     """unearth Evaluator that checks Requires-Python against a whole series.
 
@@ -196,6 +205,9 @@ class SeriesPackageFinder(PackageFinder):
         super().__init__(*args, **kwargs)
         # (canonical name, Version) -> earliest upload time of its files
         self._first_uploads = {}
+        # canonical name -> indexes that gave files for it, none with an
+        # upload time
+        self._undated_indexes = {}
 
     def build_evaluator(self, package_name, allow_yanked=False):
         evaluator = super().build_evaluator(package_name, allow_yanked)
@@ -203,9 +215,19 @@ class SeriesPackageFinder(PackageFinder):
             **{f.name: getattr(evaluator, f.name) for f in fields(evaluator)}
         )
 
+    # This overrides a private unearth method, written against unearth
+    # 0.19.0.  It relies on unearth calling it once per index page with every
+    # link on the page, before compatibility, yanked and upload time
+    # filtering, and with an evaluator whose package_name is the queried
+    # package.  If unearth renames it, changes its signature or stops routing
+    # links through it, first upload times aren't recorded, so with a
+    # cooldown every release looks undated and is excluded.
+    # TestUnearthPrivateHook in tests/test_series.py fails when that happens.
+    # Then switch to the public API: a second query per package, with
+    # ignore_compatibility=True and allow_yanked=True, to list every file and
+    # take the earliest upload_time of each version, at the cost of
+    # evaluating each page twice.
     def _evaluate_links(self, links, evaluator):
-        # unearth passes every link on an index page here before filtering
-        # them, so it's where all of a release's files can be seen
         links = list(links)
         self._record_first_uploads(links, evaluator.package_name)
         return super()._evaluate_links(links, evaluator)
@@ -217,16 +239,27 @@ class SeriesPackageFinder(PackageFinder):
             package_name, ignore_compatibility=True, allow_yanked=True
         )
         name = canonicalize_name(package_name)
+        # The index pages the files came from, and those with an upload time
+        pages = set()
+        dated_pages = set()
         for link in links:
-            if link.upload_time is None:
-                continue
             package = evaluator.evaluate_link(link)
             if package is None:
                 continue
+            pages.add(link.comes_from)
+            if link.upload_time is None:
+                continue
+            dated_pages.add(link.comes_from)
             key = (name, Version(package.version))
             first = self._first_uploads.get(key)
             if first is None or link.upload_time < first:
                 self._first_uploads[key] = link.upload_time
+        # A file found locally rather than on an index page has no page
+        undated = {
+            _index_url(page) for page in pages - dated_pages if page is not None
+        }
+        if undated:
+            self._undated_indexes.setdefault(name, set()).update(undated)
 
     def first_upload(self, name, version):
         """Return when a release was first uploaded, or None if unknown.
@@ -237,3 +270,12 @@ class SeriesPackageFinder(PackageFinder):
         serves the HTML API.
         """
         return self._first_uploads.get((canonicalize_name(name), version))
+
+    def undated_indexes(self, name):
+        """Return the indexes that gave files for a package, none dated.
+
+        These are the indexes found so far whose files for the package all
+        lack an upload time, e.g. ones that only serve the HTML API, sorted.
+        Credentials in their URLs are redacted.
+        """
+        return sorted(self._undated_indexes.get(canonicalize_name(name), ()))

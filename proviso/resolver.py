@@ -194,8 +194,9 @@ class PyPIProvider(AbstractProvider):
             {} if file_requires_dist_cache is None else file_requires_dist_cache
         )
         self._matches_cache = {}
-        # (reason, name, version) already logged about.  The Resolver shares
-        # this across providers so each is logged once per run.
+        # (reason, name, version) or (reason, index) already logged about.
+        # The Resolver shares this across providers so each is logged once
+        # per run.
         self._logged = set() if logged is None else logged
         # Conflict-promotion state (mirrors pip's PipProvider)
         self._conflict_counts = defaultdict(int)
@@ -429,6 +430,7 @@ class PyPIProvider(AbstractProvider):
         exempt.
         """
         result = []
+        excluded_undated = False
         for package in packages:
             version = Version(package.version)
             first = self.finder.first_upload(name, version)
@@ -437,6 +439,11 @@ class PyPIProvider(AbstractProvider):
             elif self._project_pins(name, version):
                 self._log_cooldown_exempt(name, version)
                 result.append(package)
+            elif first is None:
+                excluded_undated = True
+        if excluded_undated:
+            for index in self.finder.undated_indexes(name):
+                self._warn_no_upload_times(name, index)
         return result
 
     def _project_pins(self, name, version):
@@ -456,6 +463,20 @@ class PyPIProvider(AbstractProvider):
         log.info(
             f'{name}=={version} is within the dependency cooldown; using it '
             'because the project pins it exactly'
+        )
+
+    def _warn_no_upload_times(self, name, index):
+        """Log, once per run and index, that it gave no upload times."""
+        key = ('no-upload-times', index)
+        if key in self._logged:
+            return
+        self._logged.add(key)
+        log.warning(
+            f'{index} provided no upload times for {name}, which happens when '
+            'an index only serves the HTML "simple" API and not the JSON API; '
+            "its releases can't be dated, so the dependency cooldown excludes "
+            'all of them. Other packages may be affected too; '
+            '--cooldown-days 0 disables the cooldown'
         )
 
     def pinned_exactly(self, name, version, requirements):
