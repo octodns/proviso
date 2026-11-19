@@ -102,6 +102,25 @@ Pre-releases are skipped unless a requirement's specifier names one, such as
 proviso --pre
 ```
 
+#### Platform-specific output
+
+proviso resolves for each target Python version, but only for the platform it
+runs on. The operating system, CPU architecture, and Python implementation come
+from the machine running proviso, as does the glibc or macOS version, so the
+same project can produce a different file on Linux, macOS, and Windows, or on
+two Linux machines with different glibc versions:
+
+- A dependency behind a marker for another platform, such as
+  `colorama; sys_platform == "win32"`, isn't pinned.
+- A dependency that only the generating platform needs is pinned without a
+  platform marker.
+- A release counts as available when it has a wheel for the generating
+  platform or an sdist, so on another platform a package can resolve to a
+  different version, need `--build-sdists`, or fail to resolve.
+
+Generate the file on the platform you install on. See
+[#39](https://github.com/octodns/proviso/issues/39).
+
 #### Packages without index metadata
 
 When the index serves no metadata for a package's file, proviso downloads it and
@@ -125,6 +144,20 @@ Caveats:
   the result is reused for every target Python version. A package whose
   dependencies vary by Python version may be resolved incorrectly (see
   [#53](https://github.com/octodns/proviso/issues/53)).
+
+#### Direct references
+
+proviso resolves every requirement from the package index and doesn't support
+direct references such as `foo @ https://example.com/foo-1.0-py3-none-any.whl`.
+If the project requires one, whatever its environment marker, proviso fails
+with an error that lists each of them. If a dependency requires one for a
+target Python, proviso fails with an error that names the requirement and the
+package that requires it. Neither writes a requirements file. The error leaves
+out the user and password, the query string, and the fragment of a URL, and
+shows a URL that can't be parsed as `<unparseable URL>`. A direct reference
+to the project itself, such as hatch's `mypkg[test] @ {root:uri}`, is allowed
+and handled like any other requirement on the project's own extras: its URL is
+ignored and the extras it names are selected.
 
 #### Full command-line reference
 
