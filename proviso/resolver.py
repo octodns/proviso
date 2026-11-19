@@ -1,9 +1,11 @@
 import math
 from collections import defaultdict
+from copy import copy
 from logging import getLogger
 from operator import attrgetter
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit, urlunsplit
 
 from packaging.markers import default_environment
 from packaging.metadata import InvalidMetadata, Metadata
@@ -79,26 +81,60 @@ def marker_applies(marker, environment, series=None, extra=''):
     return series.marker_applies(marker, environment, extra)
 
 
-def filter_requirements(requirements, python_version=None, extras=()):
+def is_self_reference(requirement, project_name):
+    """Return whether requirement is on the project itself.
+
+    Names are compared in their canonical form. With no project_name nothing
+    is a self-reference.
+    """
+    return project_name is not None and canonicalize_name(
+        requirement.name
+    ) == canonicalize_name(project_name)
+
+
+def filter_requirements(
+    requirements, python_version=None, extras=(), project_name=None
+):
     """Return the requirements that apply to a target Python and extras.
 
     A requirement applies when it has no marker, its marker is true with no
     extra selected, or its marker is true with any one of the extras selected.
     Order is preserved and each requirement appears at most once.
+
+    With a project_name, requirements on the project itself, such as
+    ``mypkg[test]``, are left out. When one applies, the extras it names are
+    selected too, repeatedly until no more are added, before the rest are
+    filtered.
     """
     environment = default_environment()
     series = PythonSeries(python_version) if python_version else None
-    extras = ('', *extras)
 
-    return [
-        r
-        for r in requirements
-        if r.marker is None
-        or any(
-            marker_applies(r.marker, environment, series, extra)
-            for extra in extras
+    def applies(requirement, extras):
+        return requirement.marker is None or any(
+            marker_applies(requirement.marker, environment, series, extra)
+            for extra in ('', *extras)
         )
-    ]
+
+    if project_name is not None:
+        own = [r for r in requirements if is_self_reference(r, project_name)]
+        requirements = [
+            r for r in requirements if not is_self_reference(r, project_name)
+        ]
+        # Extra names are compared in their canonical form, as packaging does
+        # when it evaluates an extra marker
+        extras = {canonicalize_name(e) for e in extras}
+        while True:
+            implied = {
+                canonicalize_name(e)
+                for r in own
+                if applies(r, extras)
+                for e in r.extras
+            }
+            if implied <= extras:
+                break
+            extras |= implied
+
+    return [r for r in requirements if applies(r, extras)]
 
 
 class Candidate:
@@ -168,6 +204,46 @@ class MetadataUnavailableError(Exception):
         self.reason = reason
         super().__init__(
             f'Unable to get the metadata for {name}=={version}: {reason}'
+        )
+
+
+def redact_requirement(requirement):
+    """Return a direct reference requirement as a string without credentials.
+
+    A URL can carry credentials in the userinfo (https://user:token@host/...),
+    the query string (?token=...) or the fragment (#token=...). All three are
+    removed before the requirement is logged or reported, leaving the scheme,
+    host, port and path. A URL that can't be parsed can't be safely redacted,
+    so it's replaced by a placeholder.
+    """
+    redacted = copy(requirement)
+    try:
+        parts = urlsplit(requirement.url)
+    except ValueError:
+        redacted.url = '<unparseable URL>'
+    else:
+        redacted.url = urlunsplit(
+            parts._replace(
+                netloc=parts.netloc.rpartition('@')[2], query='', fragment=''
+            )
+        )
+    return str(redacted)
+
+
+class UnsupportedRequirementError(Exception):
+    """A package requires a direct reference (name @ url).
+
+    Direct references aren't supported, every requirement is resolved from
+    the package index.
+    """
+
+    def __init__(self, requirement, name, version):
+        self.requirement = requirement
+        self.name = name
+        self.version = version
+        super().__init__(
+            f'{name}=={version} requires a direct reference, which proviso '
+            f'does not support: {redact_requirement(requirement)}'
         )
 
 
@@ -709,6 +785,14 @@ class PyPIProvider(AbstractProvider):
                     dependencies.append(req)
                     break
 
+        # Direct references aren't supported, fail rather than resolve one by
+        # name from the index
+        for req in dependencies:
+            if req.url is not None:
+                raise UnsupportedRequirementError(
+                    req, candidate.name, candidate.version
+                )
+
         log.debug(
             f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
@@ -748,6 +832,7 @@ class Resolver:
         allow_prereleases=False,
         extras=(),
         build_sdists=False,
+        project_name=None,
     ):
         """Resolve dependencies for the given requirements.
 
@@ -775,6 +860,10 @@ class Resolver:
                           PKG-INFO provides them. This executes the package's
                           build code. By default MetadataUnavailableError is
                           raised for such a package instead.
+            project_name: The project's name. Requirements on the project
+                          itself aren't resolved; the extras they name are
+                          selected when they apply. Defaults to None, which
+                          treats them like any other requirement.
 
         Returns:
             Dict mapping package names to metadata dicts with 'version' and 'extras'
@@ -782,9 +871,14 @@ class Resolver:
         Raises:
             resolvelib.ResolutionImpossible: If resolution fails
             MetadataUnavailableError: If a package's metadata can't be obtained
+            UnsupportedRequirementError: If a package requires a direct
+                          reference (name @ url)
         """
         requirements = filter_requirements(
-            requirements, python_version=python_version, extras=extras
+            requirements,
+            python_version=python_version,
+            extras=extras,
+            project_name=project_name,
         )
         if not requirements:
             return {}
