@@ -409,7 +409,6 @@ class PyPIProvider(AbstractProvider):
             if package.link.is_yanked:
                 if not self.pinned_exactly(name, version, requirements):
                     continue
-                self._warn_yanked(name, version, package.link.yank_reason)
 
             # Carry the unearth package object so get_dependencies can use it
             # directly without a redundant find_best_match lookup.
@@ -496,8 +495,8 @@ class PyPIProvider(AbstractProvider):
                     return True
         return False
 
-    def _warn_yanked(self, name, version, reason):
-        """Log, once per run, that a yanked release is a candidate."""
+    def warn_yanked(self, name, version, reason):
+        """Log, once per run, that a yanked release was selected."""
         key = ('yanked', name, version)
         if key in self._logged:
             return
@@ -796,14 +795,31 @@ class Resolver:
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)
 
+        # resolvelib finds a package's candidates when a requirement for it is
+        # first merged, so a requirement with extras has to follow the ones
+        # without, or an exact pin that comes later wouldn't reach it, see
+        # PyPIProvider.pinned_exactly. pip sorts its requirements the same
+        # way. The sort is stable, so the order is otherwise kept.
+        ordered = sorted(requirements, key=lambda r: bool(r.extras))
+
         # Resolve
-        result = resolver.resolve(requirements, max_rounds=1000)
+        result = resolver.resolve(ordered, max_rounds=1000)
 
         # Convert result to our format, folding extras candidates into their
         # base package.  An extras candidate pins its base package to the same
         # version, so the versions always agree.
         resolved = {}
         for candidate in result.mapping.values():
+            # Warn for the selected files only, not for every one offered
+            if (
+                candidate.package is not None
+                and candidate.package.link.is_yanked
+            ):
+                provider.warn_yanked(
+                    candidate.name,
+                    candidate.version,
+                    candidate.package.link.yank_reason,
+                )
             info = resolved.setdefault(
                 candidate.name,
                 {'version': str(candidate.version), 'extras': set()},
