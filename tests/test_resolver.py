@@ -17,6 +17,7 @@ from build import BuildBackendException
 from packaging.metadata import InvalidMetadata, Metadata
 from packaging.requirements import Requirement
 from packaging.version import Version
+from resolvelib import ResolutionImpossible
 from unearth import Link, PackageFinder
 from unearth.errors import UnpackError
 from unearth.fetchers import DEFAULT_SECURE_ORIGINS
@@ -233,10 +234,7 @@ class TestPyPIProvider(TestCase):
 
             # Verify PackageFinder was created correctly
             mock_finder.assert_called_once_with(
-                session=session,
-                index_urls=index_urls,
-                target_python=None,
-                exclude_newer_than=None,
+                session=session, index_urls=index_urls, target_python=None
             )
 
             # No target series when no python_version specified
@@ -1155,29 +1153,25 @@ class TestPyPIProviderExcludeNewerThan(TestCase):
         exclude_newer_than = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
         with patch('proviso.resolver.SeriesPackageFinder') as mock_finder:
-            PyPIProvider(
+            provider = PyPIProvider(
                 session, index_urls, exclude_newer_than=exclude_newer_than
             )
 
-            # Verify PackageFinder was created with exclude_newer_than
+            # The provider applies the cooldown to each release, so the
+            # finder, which would apply it to each file, doesn't get it
             mock_finder.assert_called_once()
-            call_kwargs = mock_finder.call_args[1]
-            self.assertEqual(
-                exclude_newer_than, call_kwargs['exclude_newer_than']
-            )
+            self.assertNotIn('exclude_newer_than', mock_finder.call_args[1])
+            self.assertEqual(exclude_newer_than, provider.exclude_newer_than)
 
     def test_init_without_exclude_newer_than(self):
         """Test PyPIProvider initialization without exclude_newer_than."""
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder:
-            PyPIProvider(session, index_urls)
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            provider = PyPIProvider(session, index_urls)
 
-            # Verify PackageFinder was created with exclude_newer_than=None
-            mock_finder.assert_called_once()
-            call_kwargs = mock_finder.call_args[1]
-            self.assertIsNone(call_kwargs['exclude_newer_than'])
+            self.assertIsNone(provider.exclude_newer_than)
 
 
 class TestPyPIProviderExtrasBug(TestCase):
@@ -2708,3 +2702,153 @@ class TestYanked(TestCase):
         self.assertEqual(
             [False, True, True], [p.link.is_yanked for p in with_yanked]
         )
+
+
+class TestCooldown(TestCase):
+    """The cooldown dates a release by its first upload (#42)."""
+
+    CUTOFF = NOW - timedelta(days=7)
+
+    FILES = {
+        # 1.0 is old, a wheel was added to it inside the window
+        'foo': [
+            index_file('foo', '1.0', days=100, sdist=True),
+            index_file('foo', '1.0', days=2),
+            index_file('foo', '2.0', days=2, sdist=True),
+            index_file('foo', '2.0', days=2),
+            # Another project's file is ignored
+            index_file('other', '3.0', days=100),
+        ],
+        # 1.0 has only wheels; its first is incompatible with the target
+        'bar': [
+            index_file('bar', '1.0', days=100, tag='py2'),
+            index_file('bar', '1.0', days=2),
+        ],
+        # 1.0 has no upload times
+        'baz': [
+            index_file('baz', '1.0', **{'upload-time': None}),
+            index_file('baz', '0.9'),
+        ],
+        # 1.1 is new and preferred, but inside the window
+        'qux': [index_file('qux', '1.0'), index_file('qux', '1.1', days=1)],
+        'app': [index_file('app', '1.0')],
+    }
+    REQUIRES = {('app', '1.0'): ['qux==1.1']}
+
+    def _provider(self, **kwargs):
+        return PyPIProvider(
+            FakeIndex(self.FILES, self.REQUIRES),
+            ['https://pypi.org/simple/'],
+            python_version='3.12',
+            exclude_newer_than=self.CUTOFF,
+            **kwargs,
+        )
+
+    def _files(self, name, provider=None):
+        provider = provider or self._provider()
+        result = provider.find_matches(name, {name: [Requirement(name)]}, {})
+        return [c.package.link.filename for c in result]
+
+    def _resolve(self, *requirements):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        return {
+            name: info['version']
+            for name, info in resolver.resolve(
+                [Requirement(r) for r in requirements],
+                python_version='3.12',
+                exclude_newer_than=self.CUTOFF,
+            ).items()
+        }
+
+    def test_late_file_on_old_release(self):
+        self.assertEqual(
+            ['foo-1.0-py3-none-any.whl', 'foo-1.0.tar.gz'], self._files('foo')
+        )
+
+    def test_first_upload_of_incompatible_file(self):
+        """A file that isn't compatible with the target still dates it."""
+        self.assertEqual(['bar-1.0-py3-none-any.whl'], self._files('bar'))
+
+    def test_release_without_upload_time(self):
+        self.assertEqual(['baz-0.9-py3-none-any.whl'], self._files('baz'))
+
+    def test_new_release_excluded(self):
+        self.assertEqual(['qux-1.0-py3-none-any.whl'], self._files('qux'))
+        self.assertEqual({'qux': '1.0'}, self._resolve('qux'))
+
+    def test_without_cooldown(self):
+        provider = self._provider()
+        provider.exclude_newer_than = None
+        self.assertEqual(
+            ['qux-1.1-py3-none-any.whl', 'qux-1.0-py3-none-any.whl'],
+            self._files('qux', provider),
+        )
+
+    def test_first_upload(self):
+        provider = self._provider()
+        self._files('foo', provider)
+        self.assertEqual(
+            NOW - timedelta(days=100),
+            provider.finder.first_upload('Foo', Version('1.0')),
+        )
+        self.assertEqual(
+            NOW - timedelta(days=2),
+            provider.finder.first_upload('foo', Version('2.0')),
+        )
+        self.assertIsNone(provider.finder.first_upload('foo', Version('3.0')))
+        self.assertIsNone(provider.finder.first_upload('other', Version('3.0')))
+
+    def test_project_pin_inside_window(self):
+        for spec in ('qux==1.1', 'qux===1.1', 'qux[x]==1.1', 'qux==1.1.0'):
+            with self.subTest(spec=spec):
+                with self.assertLogs('proviso.resolver', level='INFO') as logs:
+                    self.assertEqual({'qux': '1.1'}, self._resolve(spec))
+                self.assertIn(
+                    'INFO:proviso.resolver:qux==1.1 is within the dependency '
+                    'cooldown; using it because the project pins it exactly',
+                    logs.output,
+                )
+
+    def test_project_pin_without_upload_time(self):
+        self.assertEqual({'baz': '1.0'}, self._resolve('baz==1.0'))
+
+    def test_project_pin_logged_once_per_run(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        with self.assertLogs('proviso.resolver', level='INFO') as logs:
+            for python_version in ('3.12', '3.13'):
+                resolver.resolve(
+                    [Requirement('qux==1.1')],
+                    python_version=python_version,
+                    exclude_newer_than=self.CUTOFF,
+                )
+        self.assertEqual(
+            1, len([line for line in logs.output if 'cooldown' in line])
+        )
+
+    def test_project_pin_not_exact(self):
+        for spec in ('qux>=1.1', 'qux~=1.1', 'qux==1.1.*'):
+            with self.subTest(spec=spec):
+                with self.assertRaises(ResolutionImpossible):
+                    self._resolve(spec)
+        self.assertEqual({'qux': '1.0'}, self._resolve('qux==1.*'))
+
+    def test_project_pin_on_another_package(self):
+        provider = self._provider(
+            project_requirements=[Requirement('foo==1.1')]
+        )
+        self.assertEqual(
+            ['qux-1.0-py3-none-any.whl'], self._files('qux', provider)
+        )
+
+    def test_transitive_pin_inside_window(self):
+        with self.assertRaises(ResolutionImpossible):
+            self._resolve('app')
+
+    def test_extras_base_pin_inside_window(self):
+        """The pin an extras candidate adds on its base isn't exempt."""
+        provider = self._provider()
+        requirements = {
+            'qux': [BasePin('qux==1.1')],
+            'qux[x]': [Requirement('qux[x]')],
+        }
+        self.assertEqual([], provider.find_matches('qux', requirements, {}))

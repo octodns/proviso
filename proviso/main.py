@@ -266,7 +266,7 @@ def main():  # pragma: no cover
         '--cooldown-days',
         type=int,
         default=7,
-        help='Exclude packages uploaded within this many days (dependency cooldown). Default: 7. Use 0 to disable.',
+        help='Exclude releases first uploaded within this many days (dependency cooldown). Files added later to an older release are still used, and a version the project pins exactly with == or === is exempt. Default: 7. Use 0 to disable.',
     )
     parser.add_argument(
         '--pre',

@@ -6,6 +6,7 @@ import re
 from dataclasses import fields
 
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 from unearth import PackageFinder
 from unearth.evaluator import Evaluator, LinkMismatchError
@@ -186,10 +187,53 @@ class SeriesEvaluator(Evaluator):
 
 
 class SeriesPackageFinder(PackageFinder):
-    """unearth PackageFinder that evaluates links with SeriesEvaluator."""
+    """unearth PackageFinder that evaluates links with SeriesEvaluator.
+
+    It also records when each release was first uploaded, see first_upload.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # (canonical name, Version) -> earliest upload time of its files
+        self._first_uploads = {}
 
     def build_evaluator(self, package_name, allow_yanked=False):
         evaluator = super().build_evaluator(package_name, allow_yanked)
         return SeriesEvaluator(
             **{f.name: getattr(evaluator, f.name) for f in fields(evaluator)}
         )
+
+    def _evaluate_links(self, links, evaluator):
+        # unearth passes every link on an index page here before filtering
+        # them, so it's where all of a release's files can be seen
+        links = list(links)
+        self._record_first_uploads(links, evaluator.package_name)
+        return super()._evaluate_links(links, evaluator)
+
+    def _record_first_uploads(self, links, package_name):
+        # Every file of a release counts, including ones that are yanked or
+        # aren't compatible with the target Python
+        evaluator = Evaluator(
+            package_name, ignore_compatibility=True, allow_yanked=True
+        )
+        name = canonicalize_name(package_name)
+        for link in links:
+            if link.upload_time is None:
+                continue
+            package = evaluator.evaluate_link(link)
+            if package is None:
+                continue
+            key = (name, Version(package.version))
+            first = self._first_uploads.get(key)
+            if first is None or link.upload_time < first:
+                self._first_uploads[key] = link.upload_time
+
+    def first_upload(self, name, version):
+        """Return when a release was first uploaded, or None if unknown.
+
+        That's the earliest upload time of any of its files found so far,
+        whether or not they're compatible with the target Python. It's None
+        when none of them has an upload time, e.g. on an index that only
+        serves the HTML API.
+        """
+        return self._first_uploads.get((canonicalize_name(name), version))

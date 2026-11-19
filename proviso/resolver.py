@@ -175,6 +175,7 @@ class PyPIProvider(AbstractProvider):
         file_requires_dist_cache=None,
         build_sdists=False,
         logged=None,
+        project_requirements=(),
     ):
         self.session = session
         # When True, an sdist's build backend may be run to learn its
@@ -201,6 +202,12 @@ class PyPIProvider(AbstractProvider):
         self._conflict_promoted = set()
         # Ordering of user-specified top-level requirements (name → index)
         self._user_requested = user_requested or {}
+        # The project's own requirements, a version they pin exactly is
+        # exempt from the cooldown
+        self._project_requirements = project_requirements
+        # Releases first uploaded after this are excluded (the cooldown).  The
+        # finder doesn't get it as unearth would apply it to each file.
+        self.exclude_newer_than = exclude_newer_than
 
         # The target Python series, None means the running interpreter
         self.series = PythonSeries(python_version) if python_version else None
@@ -212,12 +219,9 @@ class PyPIProvider(AbstractProvider):
         if self.series:
             target_python = TargetPython(py_ver=self.series.release)
 
-        # Create PackageFinder with the target Python version and optional date filter
+        # Create PackageFinder with the target Python version
         self.finder = SeriesPackageFinder(
-            session=session,
-            index_urls=index_urls,
-            target_python=target_python,
-            exclude_newer_than=exclude_newer_than,
+            session=session, index_urls=index_urls, target_python=target_python
         )
 
     def identify(self, requirement_or_candidate):
@@ -362,6 +366,8 @@ class PyPIProvider(AbstractProvider):
                     name, allow_yanked=True, allow_prereleases=True
                 )
             )
+            if self.exclude_newer_than is not None:
+                result = self._apply_cooldown(name, result)
             self._matches_cache[name] = result
 
         # Determine whether pre-releases are allowed: always with --pre,
@@ -413,6 +419,44 @@ class PyPIProvider(AbstractProvider):
         # Return candidates sorted by version (newest first)
         log.debug(f'Found {len(candidates)} candidates for {identifier}')
         return sorted(candidates, key=attrgetter('version'), reverse=True)
+
+    def _apply_cooldown(self, name, packages):
+        """Return the packages of releases first uploaded before the cooldown.
+
+        A release is dated by its first upload, so a file added to it later
+        is still a candidate.  A release without any upload time is excluded,
+        as unearth does for a file.  A version the project pins exactly is
+        exempt.
+        """
+        result = []
+        for package in packages:
+            version = Version(package.version)
+            first = self.finder.first_upload(name, version)
+            if first is not None and first <= self.exclude_newer_than:
+                result.append(package)
+            elif self._project_pins(name, version):
+                self._log_cooldown_exempt(name, version)
+                result.append(package)
+        return result
+
+    def _project_pins(self, name, version):
+        """Return whether a project requirement pins a version exactly."""
+        return any(
+            canonicalize_name(r.name) == name
+            and any(pins_exactly(s, version) for s in r.specifier)
+            for r in self._project_requirements
+        )
+
+    def _log_cooldown_exempt(self, name, version):
+        """Log, once per run, that a pin is used despite the cooldown."""
+        key = ('cooldown', name, version)
+        if key in self._logged:
+            return
+        self._logged.add(key)
+        log.info(
+            f'{name}=={version} is within the dependency cooldown; using it '
+            'because the project pins it exactly'
+        )
 
     def pinned_exactly(self, name, version, requirements):
         """Return whether a requirement pins a package version exactly.
@@ -677,8 +721,11 @@ class Resolver:
                           "3.12.5" for exactly that release. A dependency is
                           included when any release in the series needs it.
                           Defaults to the running Python.
-            exclude_newer_than: Optional datetime to exclude packages uploaded after
-                          this date (for dependency cooldowns).
+            exclude_newer_than: Optional datetime to exclude releases first
+                          uploaded after this date (for dependency cooldowns).
+                          A file added to an older release later is still
+                          used. A version that one of the requirements pins
+                          exactly with == or === is exempt.
             allow_prereleases: Consider pre-release versions for every package.
                           By default pre-releases are only considered for a
                           package whose specifier names one (e.g. ">=2.0b1").
@@ -723,6 +770,7 @@ class Resolver:
             file_requires_dist_cache=self._file_requires_dist_cache,
             build_sdists=build_sdists,
             logged=self._logged,
+            project_requirements=requirements,
         )
         reporter = BaseReporter()
         resolver = ResolveLibResolver(provider, reporter)

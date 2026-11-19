@@ -77,7 +77,11 @@ proviso --header "# Generated requirements - do not edit"
 ```
 
 By default proviso ignores anything published in the last 7 days, so a
-brand-new release doesn't get pinned the moment it lands. Adjust the window:
+brand-new release doesn't get pinned the moment it lands. A release is dated
+by its first upload, so a file added to an older release later, such as a
+wheel for a new Python, is still used. A version that your project pins
+exactly with `==` or `===` is used even if it's newer; pins in dependencies
+aren't exempt. Adjust the window:
 
 ```bash
 proviso --cooldown-days 14
@@ -147,8 +151,9 @@ options:
   --cache-db CACHE_DB   Path to SQLite database for persistent HTTP caching. If not specified, checks PROVISO_CACHE_DB
                         environment variable. If neither is set, uses in-memory caching.
   --cooldown-days COOLDOWN_DAYS
-                        Exclude packages uploaded within this many days (dependency cooldown). Default: 7. Use 0 to
-                        disable.
+                        Exclude releases first uploaded within this many days (dependency cooldown). Files added later to
+                        an older release are still used, and a version the project pins exactly with == or === is exempt.
+                        Default: 7. Use 0 to disable.
   --pre                 Include pre-release versions for all packages. By default, pre-releases are only used for a
                         package whose specifier names one (e.g. "foo>=2.0b1").
   --build-sdists        Allow proviso to run a package's build backend to learn its dependencies when neither the index nor
