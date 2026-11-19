@@ -643,6 +643,23 @@ class TestFindRequirements(TestCase):
         mock_log.error.assert_not_called()
         self.assertEqual({'2.28.0': ['3.9']}, result['requests'])
 
+    def test_find_requirements_passes_project_name(self):
+        """project_name defaults to None and is passed to the resolver."""
+        requirements = [Requirement('requests>=2.0.0')]
+        for kwargs, expected in (
+            ({}, None),
+            ({'project_name': 'mypkg'}, 'mypkg'),
+        ):
+            with patch('proviso.main.Resolver') as mock_resolver_class:
+                mock_resolver = mock_resolver_class.return_value
+                mock_resolver.resolve.return_value = {}
+                with patch('proviso.main.log'):
+                    find_requirements(requirements, ['3.9'], **kwargs)
+                self.assertEqual(
+                    expected,
+                    mock_resolver.resolve.call_args.kwargs['project_name'],
+                )
+
     def test_find_requirements_passes_extras(self):
         """extras defaults to empty and is passed to the resolver."""
         requirements = [Requirement('requests>=2.0.0')]

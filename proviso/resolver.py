@@ -81,26 +81,52 @@ def marker_applies(marker, environment, series=None, extra=''):
     return series.marker_applies(marker, environment, extra)
 
 
-def filter_requirements(requirements, python_version=None, extras=()):
+def filter_requirements(
+    requirements, python_version=None, extras=(), project_name=None
+):
     """Return the requirements that apply to a target Python and extras.
 
     A requirement applies when it has no marker, its marker is true with no
     extra selected, or its marker is true with any one of the extras selected.
     Order is preserved and each requirement appears at most once.
+
+    With a project_name, requirements on the project itself, such as
+    ``mypkg[test]``, are left out. When one applies, the extras it names are
+    selected too, repeatedly until no more are added, before the rest are
+    filtered.
     """
     environment = default_environment()
     series = PythonSeries(python_version) if python_version else None
-    extras = ('', *extras)
 
-    return [
-        r
-        for r in requirements
-        if r.marker is None
-        or any(
-            marker_applies(r.marker, environment, series, extra)
-            for extra in extras
+    def applies(requirement, extras):
+        return requirement.marker is None or any(
+            marker_applies(requirement.marker, environment, series, extra)
+            for extra in ('', *extras)
         )
-    ]
+
+    if project_name is not None:
+        project_name = canonicalize_name(project_name)
+        own = [
+            r for r in requirements if canonicalize_name(r.name) == project_name
+        ]
+        requirements = [
+            r for r in requirements if canonicalize_name(r.name) != project_name
+        ]
+        # Extra names are compared in their canonical form, as packaging does
+        # when it evaluates an extra marker
+        extras = {canonicalize_name(e) for e in extras}
+        while True:
+            implied = {
+                canonicalize_name(e)
+                for r in own
+                if applies(r, extras)
+                for e in r.extras
+            }
+            if implied <= extras:
+                break
+            extras |= implied
+
+    return [r for r in requirements if applies(r, extras)]
 
 
 class Candidate:
@@ -658,6 +684,7 @@ class Resolver:
         allow_prereleases=False,
         extras=(),
         build_sdists=False,
+        project_name=None,
     ):
         """Resolve dependencies for the given requirements.
 
@@ -682,6 +709,10 @@ class Resolver:
                           PKG-INFO provides them. This executes the package's
                           build code. By default MetadataUnavailableError is
                           raised for such a package instead.
+            project_name: The project's name. Requirements on the project
+                          itself aren't resolved; the extras they name are
+                          selected when they apply. Defaults to None, which
+                          treats them like any other requirement.
 
         Returns:
             Dict mapping package names to metadata dicts with 'version' and 'extras'
@@ -693,7 +724,10 @@ class Resolver:
                           reference (name @ url)
         """
         requirements = filter_requirements(
-            requirements, python_version=python_version, extras=extras
+            requirements,
+            python_version=python_version,
+            extras=extras,
+            project_name=project_name,
         )
         if not requirements:
             return {}

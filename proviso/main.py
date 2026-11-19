@@ -141,6 +141,7 @@ def find_requirements(
     allow_prereleases=False,
     extras=(),
     build_sdists=False,
+    project_name=None,
 ):
 
     if not requirements:
@@ -176,6 +177,7 @@ def find_requirements(
                 allow_prereleases=allow_prereleases,
                 extras=extras,
                 build_sdists=build_sdists,
+                project_name=project_name,
             )
         except (
             MetadataUnavailableError,
@@ -453,6 +455,7 @@ def main():  # pragma: no cover
             allow_prereleases=args.pre,
             extras=parsed['extras'],
             build_sdists=args.build_sdists,
+            project_name=metadata.name,
         )
 
         write_requirements_to_file(

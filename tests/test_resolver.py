@@ -2690,3 +2690,234 @@ class TestDirectReferences(TestCase):
         provider.finder.find_matches.assert_called_once_with(
             'pkg', allow_prereleases=True
         )
+
+
+class TestSelfReferentialExtras(TestCase):
+    """A project requirement on the project itself selects its extras."""
+
+    METADATA = (
+        'Metadata-Version: 2.4\n'
+        'Name: mypkg\n'
+        'Version: 1.0\n'
+        'Provides-Extra: test\n'
+        'Provides-Extra: lint\n'
+        'Provides-Extra: dev\n'
+        'Requires-Dist: a\n'
+        'Requires-Dist: pytest; extra == "test"\n'
+        'Requires-Dist: black; extra == "lint"\n'
+        'Requires-Dist: mypkg[test,lint]; extra == "dev"\n'
+        'Requires-Dist: ipython; extra == "dev"\n'
+    )
+
+    def _names(self, requirements, **kwargs):
+        with patch('proviso.resolver.default_environment') as de:
+            de.return_value = {'sys_platform': 'linux'}
+            return [
+                str(r)
+                for r in filter_requirements(
+                    [Requirement(r) for r in requirements], **kwargs
+                )
+            ]
+
+    def test_pyproject_example(self):
+        metadata = Metadata.from_email(self.METADATA)
+        with patch('proviso.resolver.default_environment') as de:
+            de.return_value = {'sys_platform': 'linux'}
+            filtered = filter_requirements(
+                metadata.requires_dist,
+                python_version='3.12',
+                extras=['dev'],
+                project_name=metadata.name,
+            )
+        self.assertEqual(
+            ['a', 'pytest', 'black', 'ipython'], [r.name for r in filtered]
+        )
+
+    def test_extra_not_selected(self):
+        metadata = Metadata.from_email(self.METADATA)
+        for extras, expected in (
+            ((), ['a']),
+            (['test'], ['a', 'pytest']),
+            (['lint', 'test'], ['a', 'pytest', 'black']),
+        ):
+            with patch('proviso.resolver.default_environment') as de:
+                de.return_value = {'sys_platform': 'linux'}
+                filtered = filter_requirements(
+                    metadata.requires_dist,
+                    python_version='3.12',
+                    extras=extras,
+                    project_name='mypkg',
+                )
+            self.assertEqual(expected, [r.name for r in filtered])
+
+    def test_nested(self):
+        requirements = [
+            'mypkg[test]; extra == "dev"',
+            'mypkg[lint]; extra == "test"',
+            'pytest; extra == "test"',
+            'black; extra == "lint"',
+            'ipython; extra == "dev"',
+            'other; extra == "other"',
+        ]
+        self.assertEqual(
+            [
+                'pytest; extra == "test"',
+                'black; extra == "lint"',
+                'ipython; extra == "dev"',
+            ],
+            self._names(
+                requirements,
+                python_version='3.12',
+                extras=['dev'],
+                project_name='mypkg',
+            ),
+        )
+
+    def test_cycle(self):
+        requirements = [
+            'mypkg[b]; extra == "a"',
+            'mypkg[a]; extra == "b"',
+            'x; extra == "a"',
+            'y; extra == "b"',
+        ]
+        for selected in ('a', 'b'):
+            self.assertEqual(
+                ['x; extra == "a"', 'y; extra == "b"'],
+                self._names(
+                    requirements,
+                    python_version='3.12',
+                    extras=[selected],
+                    project_name='mypkg',
+                ),
+            )
+
+    def test_python_marker(self):
+        requirements = [
+            'mypkg[test]; extra == "dev" and python_version < "3.11"',
+            'pytest; extra == "test"',
+            'ipython; extra == "dev"',
+        ]
+        kwargs = {'extras': ['dev'], 'project_name': 'mypkg'}
+        self.assertEqual(
+            ['pytest; extra == "test"', 'ipython; extra == "dev"'],
+            self._names(requirements, python_version='3.10', **kwargs),
+        )
+        self.assertEqual(
+            ['ipython; extra == "dev"'],
+            self._names(requirements, python_version='3.12', **kwargs),
+        )
+
+    def test_spelling(self):
+        requirements = [
+            'My.Pkg[Test_Extra]; extra == "Dev"',
+            'pytest; extra == "test-extra"',
+            'ipython; extra == "dev"',
+        ]
+        for project_name, extras in (
+            ('my_pkg', ['dev']),
+            ('MY-PKG', ['DEV']),
+            ('my--pkg', ['Dev']),
+        ):
+            self.assertEqual(
+                ['pytest; extra == "test-extra"', 'ipython; extra == "dev"'],
+                self._names(
+                    requirements,
+                    python_version='3.12',
+                    extras=extras,
+                    project_name=project_name,
+                ),
+            )
+
+    def test_without_extras_or_unknown_extra(self):
+        requirements = [
+            'a',
+            'mypkg>=99',
+            'mypkg[nope]; extra == "dev"',
+            'pytest; extra == "test"',
+        ]
+        self.assertEqual(
+            ['a'],
+            self._names(
+                requirements,
+                python_version='3.12',
+                extras=['dev'],
+                project_name='mypkg',
+            ),
+        )
+
+    def test_project_name_none_unchanged(self):
+        requirements = [
+            'a',
+            'mypkg[test]; extra == "dev"',
+            'pytest; extra == "test"',
+        ]
+        self.assertEqual(
+            ['a', 'mypkg[test]; extra == "dev"'],
+            self._names(requirements, python_version='3.12', extras=['dev']),
+        )
+
+    def test_other_package_name_unaffected(self):
+        requirements = [
+            'mypkg-extra[test]; extra == "dev"',
+            'pytest; extra == "test"',
+        ]
+        self.assertEqual(
+            ['mypkg-extra[test]; extra == "dev"'],
+            self._names(
+                requirements,
+                python_version='3.12',
+                extras=['dev'],
+                project_name='mypkg',
+            ),
+        )
+
+    def test_resolve_passes_project_name(self):
+        metadata = Metadata.from_email(self.METADATA)
+        with patch('proviso.resolver.CachingClient'):
+            with patch('proviso.resolver.MultiDomainBasicAuth'):
+                resolver = Resolver()
+        for kwargs, expected in (
+            ({}, ['a', 'mypkg', 'ipython']),
+            ({'project_name': 'mypkg'}, ['a', 'pytest', 'black', 'ipython']),
+        ):
+            mock_result = MagicMock()
+            mock_result.mapping = {}
+            with patch('proviso.resolver.ResolveLibResolver') as rl:
+                rl.return_value.resolve.return_value = mock_result
+                with patch('proviso.resolver.PyPIProvider') as provider:
+                    resolver.resolve(
+                        metadata.requires_dist,
+                        python_version='3.12',
+                        extras=['dev'],
+                        **kwargs,
+                    )
+            passed = rl.return_value.resolve.call_args.args[0]
+            self.assertEqual(expected, [r.name for r in passed])
+            user_requested = provider.call_args.kwargs['user_requested']
+            self.assertEqual(
+                'mypkg' in expected, 'mypkg[lint,test]' in user_requested
+            )
+
+    def test_dependency_on_its_own_extras_unchanged(self):
+        """A dependency that requires its own extras goes to the resolver."""
+        session = MagicMock()
+        response = MagicMock()
+        response.text = (
+            'Metadata-Version: 2.1\nName: foo\nVersion: 1.0\n'
+            'Requires-Dist: foo[baz]; extra == "bar"\n'
+            'Requires-Dist: qux; extra == "baz"\n'
+        )
+        session.get.return_value = response
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            provider = PyPIProvider(
+                session, ['https://pypi.org/simple/'], '3.12'
+            )
+        package = MagicMock()
+        package.link.dist_info_link.url = 'https://pypi/foo/1.0'
+        candidate = Candidate(
+            'foo', Version('1.0'), extras={'bar'}, package=package
+        )
+        self.assertEqual(
+            ['foo==1.0', 'foo[baz]; extra == "bar"'],
+            [str(r) for r in provider.get_dependencies(candidate)],
+        )
