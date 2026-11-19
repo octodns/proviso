@@ -1,10 +1,16 @@
+from dataclasses import fields
+from datetime import datetime, timezone
+from inspect import signature
 from unittest import TestCase
 from unittest.mock import patch
 
+import httpx2
 from packaging.markers import Marker, default_environment
 from packaging.specifiers import SpecifierSet
-from unearth import TargetPython
-from unearth.evaluator import LinkMismatchError
+from packaging.version import Version
+from unearth import PackageFinder, TargetPython
+from unearth.evaluator import Evaluator, LinkMismatchError
+from unearth.fetchers import DEFAULT_SECURE_ORIGINS
 from unearth.link import Link
 
 from proviso.series import PythonSeries, SeriesEvaluator, SeriesPackageFinder
@@ -382,3 +388,84 @@ class TestSeriesPackageFinder(TestCase):
             'https://example.com/foo-1.0.tar.gz', requires_python='>=3.13'
         )
         self.assertIsNone(evaluator.evaluate_link(link))
+
+
+class TestUnearthPrivateHook(TestCase):
+    """Fail if unearth changes the private method SeriesPackageFinder uses.
+
+    SeriesPackageFinder overrides unearth's private
+    PackageFinder._evaluate_links to see every file on an index page and
+    record when each release was first uploaded.  These tests use the real
+    unearth machinery so an unearth upgrade that renames the method, changes
+    its signature or stops routing links through it is caught here rather
+    than as every release being excluded by the cooldown.
+    """
+
+    MESSAGE = (
+        "unearth's private _evaluate_links hook has changed, see the comment "
+        'on SeriesPackageFinder._evaluate_links in proviso/series.py'
+    )
+
+    SDIST_UPLOAD = datetime(2024, 6, 1, tzinfo=timezone.utc)
+    WHEEL_UPLOAD = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    def _session(self):
+        files = [
+            {
+                'filename': 'foo-1.0.tar.gz',
+                'url': 'https://files.example.com/foo-1.0.tar.gz',
+                'hashes': {},
+                'upload-time': self.SDIST_UPLOAD.isoformat(),
+            },
+            # Uploaded first, but not for the target Python or platform
+            {
+                'filename': 'foo-1.0-cp27-cp27m-win32.whl',
+                'url': 'https://files.example.com/foo-1.0-cp27-cp27m-win32.whl',
+                'hashes': {},
+                'upload-time': self.WHEEL_UPLOAD.isoformat(),
+            },
+        ]
+
+        def handler(request):
+            return httpx2.Response(
+                200,
+                headers={'Content-Type': 'application/vnd.pypi.simple.v1+json'},
+                json={'meta': {'api-version': '1.1'}, 'files': files},
+            )
+
+        session = httpx2.Client(transport=httpx2.MockTransport(handler))
+        session.iter_secure_origins = lambda: iter(DEFAULT_SECURE_ORIGINS)
+        return session
+
+    def test_signature(self):
+        method = getattr(PackageFinder, '_evaluate_links', None)
+        self.assertIsNotNone(method, self.MESSAGE)
+        self.assertEqual(
+            ['self', 'links', 'evaluator'],
+            list(signature(method).parameters),
+            self.MESSAGE,
+        )
+        self.assertIn(
+            'upload_time', [f.name for f in fields(Link)], self.MESSAGE
+        )
+        self.assertIn(
+            'package_name', [f.name for f in fields(Evaluator)], self.MESSAGE
+        )
+
+    def test_every_link_routed_through_hook(self):
+        finder = SeriesPackageFinder(
+            session=self._session(),
+            index_urls=['https://pypi.example.com/simple/'],
+            target_python=TargetPython(py_ver=(3, 12)),
+        )
+        matches = list(finder.find_matches('Foo'))
+        self.assertEqual(
+            ['foo-1.0.tar.gz'], [p.link.filename for p in matches], self.MESSAGE
+        )
+        # The earliest file was filtered out of the matches, but still dates
+        # the release
+        self.assertEqual(
+            self.WHEEL_UPLOAD,
+            finder.first_upload('foo', Version('1.0')),
+            self.MESSAGE,
+        )
