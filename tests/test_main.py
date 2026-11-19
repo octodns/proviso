@@ -288,6 +288,54 @@ class TestParseAndValidateArgs(TestCase):
                 self.assertIn('invalid', error_msg)
                 mock_exit.assert_called_once_with(1)
 
+    def _parse_versions(self, python_versions):
+        mock_metadata = MagicMock()
+        mock_metadata.provides_extra = []
+
+        mock_args = MagicMock()
+        mock_args.directory = '/path/to/project'
+        mock_args.extras = None
+        mock_args.python_versions = python_versions
+        mock_args.filename = 'requirements.txt'
+        mock_args.header = None
+        mock_args.cache_db = None
+
+        with patch('proviso.main.exit') as mock_exit:
+            with patch('proviso.main.log') as mock_log:
+                with patch('proviso.main.argv', ['proviso']):
+                    result = parse_and_validate_args(mock_metadata, mock_args)
+        return result, mock_log, mock_exit
+
+    def test_overlapping_python_versions_exit(self):
+        """Test that overlapping targets are rejected."""
+        for versions, a, b in (
+            ('3.12,3.12.5', '3.12', '3.12.5'),
+            ('3.12.5,3.12', '3.12.5', '3.12'),
+            ('3,3.12', '3', '3.12'),
+            ('3,3.12.5', '3', '3.12.5'),
+            ('3.11,3.12,3.12', '3.12', '3.12'),
+            ('3.12,3.12.0', '3.12', '3.12.0'),
+        ):
+            _, mock_log, mock_exit = self._parse_versions(versions)
+            mock_log.error.assert_called_once_with(
+                f'Python versions {a} and {b} overlap; each release may be '
+                'covered by only one target'
+            )
+            mock_exit.assert_called_once_with(1)
+
+    def test_non_overlapping_python_versions(self):
+        """Test that targets that don't overlap are accepted."""
+        for versions in ('3.11,3.12.5', '2,3.12', '3.12,3.13', '3.12.4,3.12.5'):
+            result, mock_log, mock_exit = self._parse_versions(versions)
+            mock_log.error.assert_not_called()
+            mock_exit.assert_not_called()
+            self.assertEqual(versions.split(','), result['python_versions'])
+
+    def test_invalid_python_version_still_raises(self):
+        """Test that an invalid target still raises ValueError."""
+        with self.assertRaises(ValueError):
+            self._parse_versions('3.12,3.13rc1')
+
     def test_default_python_versions(self):
         """Test that Python versions default to active versions."""
         mock_metadata = MagicMock()
