@@ -285,15 +285,72 @@ class TestFindRequirements(TestCase):
         )
 
     def test_find_requirements_http_status_error(self):
-        """An error status names the URL and the status."""
-        request = httpx2.Request('GET', 'https://pypi.org/metadata')
-        response = httpx2.Response(503, request=request)
-        error = httpx2.HTTPStatusError(
-            'Server error 503', request=request, response=response
+        """An error status is one line with the URL, status and reason."""
+        request = httpx2.Request('GET', 'https://pypi.org/x/metadata')
+        with self.assertRaises(httpx2.HTTPStatusError) as caught:
+            httpx2.Response(503, request=request).raise_for_status()
+        message = self._resolve_failure(caught.exception)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: request failed: '
+            'https://pypi.org/x/metadata: HTTP 503 Service Unavailable',
+            message,
+        )
+
+    def test_find_requirements_no_matching_version(self):
+        """A lone cause says no version matched rather than a conflict."""
+        error = ResolutionImpossible(
+            [RequirementInformation(Requirement('nosuchpkg'), None)]
         )
         message = self._resolve_failure(error)
-        self.assertIn('https://pypi.org/metadata', message)
-        self.assertIn('Server error 503', message)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'nosuchpkg satisfies nosuchpkg (from the project)',
+            message,
+        )
+
+    def test_find_requirements_no_matching_version_cooldown(self):
+        """The cooldown hint is added only when a cooldown is active."""
+        bar = Candidate('bar', Version('1.0'), extras=['x'])
+        error = ResolutionImpossible(
+            [RequirementInformation(Requirement('foo>=2'), bar)]
+        )
+        requirements = [Requirement('requests>=2.0.0')]
+        with patch('proviso.main.Resolver') as mock_resolver_class:
+            mock_resolver_class.return_value.resolve.side_effect = error
+            with patch('proviso.main.exit', side_effect=SystemExit(1)):
+                with patch('proviso.main.log') as mock_log:
+                    with self.assertRaises(SystemExit):
+                        find_requirements(
+                            requirements,
+                            ['3.9'],
+                            exclude_newer_than=datetime(
+                                2026, 1, 1, tzinfo=timezone.utc
+                            ),
+                        )
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'foo satisfies foo>=2 (from bar[x]==1.0); releases inside the '
+            '--cooldown-days window are excluded',
+            mock_log.error.call_args[0][0],
+        )
+
+    def test_find_requirements_conflict_extras_parent(self):
+        """A parent with extras is named with them."""
+        b = Candidate('b', Version('1.0'), extras=['x'])
+        error = ResolutionImpossible(
+            [
+                RequirementInformation(Requirement('b==1.0'), b),
+                RequirementInformation(Requirement('b<1'), None),
+            ]
+        )
+        message = self._resolve_failure(error)
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9, these '
+            'requirements conflict:\n'
+            '  b==1.0 (from b[x]==1.0)\n'
+            '  b<1 (from the project)',
+            message,
+        )
 
     def test_find_requirements_http_error_without_request(self):
         """An error with no request attached still reports the error."""
@@ -526,8 +583,22 @@ class TestParseAndValidateArgs(TestCase):
         )
         self.assertEqual(
             'Unable to look up the active Python versions from '
-            'https://endoflife.date/api/python.json: '
             'https://endoflife.date/api/python.json: name resolution failed',
+            message,
+        )
+
+    def test_default_python_versions_http_status_error(self):
+        """An error status from endoflife.date names the URL once."""
+        request = httpx2.Request(
+            'GET', 'https://endoflife.date/api/python.json'
+        )
+        with self.assertRaises(httpx2.HTTPStatusError) as caught:
+            httpx2.Response(503, request=request).raise_for_status()
+        message = self._default_versions_failure(caught.exception)
+        self.assertEqual(
+            'Unable to look up the active Python versions from '
+            'https://endoflife.date/api/python.json: '
+            'HTTP 503 Service Unavailable',
             message,
         )
 

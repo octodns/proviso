@@ -13,7 +13,7 @@ from resolvelib import ResolutionImpossible, ResolutionTooDeep
 
 from proviso.builder import Builder
 from proviso.python import Python
-from proviso.resolver import MetadataUnavailableError, Resolver
+from proviso.resolver import MetadataUnavailableError, Resolver, make_identifier
 from proviso.series import PythonSeries
 from proviso.utils import CachingClient
 
@@ -61,9 +61,17 @@ def non_negative_int(value):
     return number
 
 
+def _http_error_detail(error):
+    """Describe an httpx2 transport or status error without the URL."""
+    if isinstance(error, httpx2.HTTPStatusError):
+        response = error.response
+        return f'HTTP {response.status_code} {response.reason_phrase}'
+    return str(error) or type(error).__name__
+
+
 def _http_error_message(error):
     """Describe an httpx2 transport or status error, naming the URL if known."""
-    detail = str(error) or type(error).__name__
+    detail = _http_error_detail(error)
     try:
         return f'{error.request.url}: {detail}'
     except RuntimeError:
@@ -71,19 +79,32 @@ def _http_error_message(error):
         return detail
 
 
-def _resolution_error_message(error, python_version):
+def _resolution_error_message(error, python_version, cooldown=False):
     """Return the one error message that describes a resolution failure."""
     prefix = f'Unable to resolve dependencies for Python {python_version}'
     if isinstance(error, ResolutionImpossible):
-        conflicts = '\n'.join(
+        conflicts = [
             (
-                f'  {cause.requirement} (from '
-                f'{cause.parent.name}=={cause.parent.version})'
+                f'{cause.requirement} (from '
+                f'{make_identifier(cause.parent.name, cause.parent.extras)}'
+                f'=={cause.parent.version})'
                 if cause.parent is not None
-                else f'  {cause.requirement} (from the project)'
+                else f'{cause.requirement} (from the project)'
             )
             for cause in error.causes
-        )
+        ]
+        if len(conflicts) == 1:
+            # a lone cause is a requirement nothing satisfies, not a conflict
+            hint = (
+                '; releases inside the --cooldown-days window are excluded'
+                if cooldown
+                else ''
+            )
+            return (
+                f'{prefix}: no version of {error.causes[0].requirement.name} '
+                f'satisfies {conflicts[0]}{hint}'
+            )
+        conflicts = '\n'.join(f'  {c}' for c in conflicts)
         return f'{prefix}, these requirements conflict:\n{conflicts}'
     if isinstance(error, ResolutionTooDeep):
         return (
@@ -135,7 +156,11 @@ def find_requirements(
             ResolutionTooDeep,
             httpx2.HTTPError,
         ) as e:
-            log.error(_resolution_error_message(e, python_version))
+            log.error(
+                _resolution_error_message(
+                    e, python_version, cooldown=exclude_newer_than is not None
+                )
+            )
             exit(1)
 
         log.info(
@@ -221,7 +246,7 @@ def parse_and_validate_args(metadata, args, session=None):
         except httpx2.HTTPError as e:
             log.error(
                 'Unable to look up the active Python versions from '
-                f'{Python.API_URL}: {_http_error_message(e)}'
+                f'{Python.API_URL}: {_http_error_detail(e)}'
             )
             exit(1)
             python_versions = []
