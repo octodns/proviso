@@ -2688,12 +2688,127 @@ class TestYanked(TestCase):
                 resolver.resolve(
                     [Requirement('foo==1.1')], python_version=python_version
                 )
-            provider = self._provider()
-            for _ in range(2):
-                self._versions('foo', {'foo': ['foo==1.1']}, provider)
+            # A separate resolver is a separate run
+            Resolver(session=FakeIndex(self.FILES, self.REQUIRES)).resolve(
+                [Requirement('foo==1.1')], python_version='3.12'
+            )
         yanked = [line for line in logs.output if 'is yanked' in line]
-        # Once for the resolver's run and once for the separate provider
         self.assertEqual(2, len(yanked))
+
+    def test_warning_once_for_extras_and_base(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            result = resolver.resolve(
+                [Requirement('foo[x]'), Requirement('foo==1.1')],
+                python_version='3.12',
+            )
+        self.assertEqual({'foo': {'version': '1.1', 'extras': ['x']}}, result)
+        self.assertEqual(1, len(logs.output))
+        self.assertIn('foo==1.1 is yanked', logs.output[0])
+
+    def test_no_warning_when_backtracked_away(self):
+        files = {
+            'foo': self.FILES['foo'],
+            'app': [index_file('app', '1.0'), index_file('app', '2.0')],
+        }
+        requires = {
+            ('app', '1.0'): ['foo>=1.0'],
+            ('app', '2.0'): ['foo==1.1', 'missing'],
+        }
+        resolver = Resolver(session=FakeIndex(files, requires))
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            result = resolver.resolve(
+                [Requirement('app')], python_version='3.12'
+            )
+        self.assertEqual(
+            {
+                'app': {'version': '1.0', 'extras': []},
+                'foo': {'version': '1.0', 'extras': []},
+            },
+            result,
+        )
+
+    def test_no_warning_when_unyanked_file_selected(self):
+        """Only some of a release's files are yanked."""
+        files = {
+            'foo': [
+                index_file('foo', '1.0'),
+                index_file('foo', '1.1', yanked='broken wheel'),
+                index_file('foo', '1.1', sdist=True),
+            ]
+        }
+        resolver = Resolver(session=FakeIndex(files))
+        with self.assertNoLogs('proviso.resolver', level='WARNING'):
+            result = resolver.resolve(
+                [Requirement('foo==1.1')], python_version='3.12'
+            )
+        self.assertEqual({'foo': {'version': '1.1', 'extras': []}}, result)
+
+    def test_warning_when_yanked_file_selected(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        with self.assertLogs('proviso.resolver', level='WARNING') as logs:
+            resolver.resolve([Requirement('app')], python_version='3.12')
+        self.assertEqual(
+            [
+                'WARNING:proviso.resolver:foo==1.1 is yanked (broken build); '
+                'using it because it is pinned exactly'
+            ],
+            logs.output,
+        )
+
+    def test_candidate_without_package(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        result = MagicMock()
+        result.mapping = {'foo': Candidate('foo', Version('1.0'))}
+        with patch('proviso.resolver.ResolveLibResolver') as rl:
+            rl.return_value.resolve.return_value = result
+            with self.assertNoLogs('proviso.resolver', level='WARNING'):
+                self.assertEqual(
+                    {'foo': {'version': '1.0', 'extras': []}},
+                    resolver.resolve(
+                        [Requirement('foo')], python_version='3.12'
+                    ),
+                )
+
+    def test_resolve_extras_first_with_later_pin(self):
+        for order in (['foo[x]', 'foo==1.1'], ['foo==1.1', 'foo[x]']):
+            with self.subTest(order=order):
+                resolver = Resolver(
+                    session=FakeIndex(self.FILES, self.REQUIRES)
+                )
+                result = resolver.resolve(
+                    [Requirement(r) for r in order], python_version='3.12'
+                )
+                self.assertEqual(
+                    {'foo': {'version': '1.1', 'extras': ['x']}}, result
+                )
+
+    def test_extras_requirements_ordered_last(self):
+        resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
+        result = MagicMock()
+        result.mapping = {}
+        with patch('proviso.resolver.ResolveLibResolver') as rl:
+            rl.return_value.resolve.return_value = result
+            with patch('proviso.resolver.PyPIProvider') as provider:
+                resolver.resolve(
+                    [
+                        Requirement('foo[x]'),
+                        Requirement('bar'),
+                        Requirement('baz[y]'),
+                        Requirement('foo==1.1'),
+                    ],
+                    python_version='3.12',
+                )
+        passed = rl.return_value.resolve.call_args.args[0]
+        self.assertEqual(['bar', 'foo', 'foo', 'baz'], [r.name for r in passed])
+        self.assertEqual(
+            ['foo[x]', 'baz[y]'], [str(r) for r in passed if r.extras]
+        )
+        # The user's order is what's preferred, not the order passed on
+        self.assertEqual(
+            {'foo[x]': 0, 'foo': 0, 'bar': 1, 'baz[y]': 2, 'baz': 2},
+            provider.call_args.kwargs['user_requested'],
+        )
 
     def test_yanked_files_sorted_last(self):
         """Asking unearth for yanked files doesn't reorder the others."""
