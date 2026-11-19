@@ -3481,6 +3481,45 @@ class TestExtrasBaseConflict(TestCase):
             ),
         )
 
+    def test_record_replaced_while_backtracking(self):
+        """A record from when the conflict was found isn't replaced later.
+
+        The conflict leaves a correct record for foo[y]: foo<3 and the pin
+        foo==2.0 exclude 3.0, the only version foo[y]>=3 allows. While
+        backtracking, find_matches replaces it with one that names foo>=2,
+        which allows 3.0.
+        """
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.12, these '
+            'requirements conflict:\n'
+            '  foo[y] (from the project)\n'
+            '  foo[y] (from b==1.0)\n'
+            '  foo[y]>=3 (from c==2.0)\n'
+            '  foo<3 (from the project)\n'
+            '  foo==2.0 (from foo[y]==2.0)',
+            self._message(
+                'b<2',
+                'foo[y]',
+                'foo<3',
+                files=self._files(
+                    foo=('1.0', '2.0', '3.0'),
+                    a=('1.0', '2.0'),
+                    b=('1.0', '2.0'),
+                    c=('1.0', '2.0'),
+                ),
+                requires={
+                    ('a', '1.0'): ['foo[x,y]', 'foo>=2'],
+                    ('a', '2.0'): ['c<2', 'foo[x,y]'],
+                    ('b', '1.0'): ['a<2', 'foo[y]'],
+                    ('b', '2.0'): ['c<2'],
+                    ('c', '1.0'): ['foo[x]<3', 'foo[y]'],
+                    ('c', '2.0'): ['foo[x,y]', 'foo[y]>=3'],
+                    ('foo', '1.0'): ['a<2; extra == "y"'],
+                    ('foo', '2.0'): ['c>=2; extra == "y"'],
+                },
+            ),
+        )
+
     def test_shared_requires_dist_parent(self):
         """A dependency names the extras candidate it came from.
 
