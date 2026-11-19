@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 from packaging.requirements import Requirement
 from packaging.version import Version
-from unearth import PackageFinder
+from unearth.link import Link
 
 from proviso.resolver import (
     _CONFLICT_PRIORITY_THRESHOLD,
@@ -20,6 +20,7 @@ from proviso.resolver import (
     make_identifier,
     split_identifier,
 )
+from proviso.series import SeriesPackageFinder
 
 # Lightweight stand-in for resolvelib's RequirementInformation namedtuple.
 # resolvelib defines RequirementInformation(requirement, parent); we use the
@@ -155,7 +156,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder:
             provider = PyPIProvider(session, index_urls)
 
             # Verify PackageFinder was created correctly
@@ -166,8 +167,8 @@ class TestPyPIProvider(TestCase):
                 exclude_newer_than=None,
             )
 
-            # Environment should be None when no python_version specified
-            self.assertIsNone(provider.environment)
+            # No target series when no python_version specified
+            self.assertIsNone(provider.series)
 
     def test_init_with_python_version(self):
         """Test PyPIProvider initialization with python_version."""
@@ -175,33 +176,25 @@ class TestPyPIProvider(TestCase):
         index_urls = ['https://pypi.org/simple/']
         python_version = '3.10'
 
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             with patch('proviso.resolver.TargetPython') as mock_target_python:
-                with patch('proviso.resolver.default_environment') as mock_env:
-                    mock_env.return_value = {'some': 'env'}
+                provider = PyPIProvider(session, index_urls, python_version)
 
-                    provider = PyPIProvider(session, index_urls, python_version)
+                # Verify TargetPython was created with correct version
+                mock_target_python.assert_called_once()
+                call_kwargs = mock_target_python.call_args[1]
+                self.assertEqual((3, 10), call_kwargs['py_ver'])
 
-                    # Verify TargetPython was created with correct version
-                    mock_target_python.assert_called_once()
-                    call_kwargs = mock_target_python.call_args[1]
-                    self.assertEqual((3, 10), call_kwargs['py_ver'])
-
-                    # Environment should be updated with Python version info
-                    self.assertIsNotNone(provider.environment)
-                    self.assertEqual(
-                        '3.10', provider.environment['python_version']
-                    )
-                    self.assertEqual(
-                        '3.10.0', provider.environment['python_full_version']
-                    )
+                # Markers are evaluated for the 3.10 series
+                self.assertEqual('3.10', provider.series.version)
+                self.assertEqual((3, 10), provider.series.release)
 
     def test_identify_with_requirement(self):
         """Test identify method with a Requirement."""
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder:
             provider = PyPIProvider(session, index_urls)
             # Ensure finder was created
             self.assertIsNotNone(mock_finder)
@@ -217,7 +210,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(session, index_urls)
 
             candidate = Candidate('my-package', Version('1.0.0'))
@@ -230,7 +223,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(session, index_urls)
 
             req = Requirement('requests>=2.0.0,<3.0.0')
@@ -243,7 +236,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(session, index_urls)
 
             req = Requirement('requests>=2.0.0,<3.0.0')
@@ -256,7 +249,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(session, index_urls)
 
             req = Requirement('requests>=2.0.0')
@@ -266,7 +259,7 @@ class TestPyPIProvider(TestCase):
 
     def test_get_preference_free_requirement(self):
         """A free (no specifier) requirement returns the highest-value tuple."""
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
 
             info = _RequirementInfo(
@@ -284,7 +277,7 @@ class TestPyPIProvider(TestCase):
 
     def test_get_preference_pinned_before_free(self):
         """A pinned (==x.y.z) requirement sorts before a free one."""
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
 
             info_pinned = _RequirementInfo(
@@ -305,7 +298,7 @@ class TestPyPIProvider(TestCase):
 
     def test_get_preference_upper_bounded_before_free(self):
         """An upper-bounded requirement sorts before a free one."""
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
 
             info_bounded = _RequirementInfo(
@@ -326,7 +319,7 @@ class TestPyPIProvider(TestCase):
 
     def test_get_preference_user_requested_order(self):
         """Earlier user-specified requirements sort before later ones."""
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             user_requested = {'requests': 0, 'urllib3': 1}
             provider = PyPIProvider(
                 MagicMock(),
@@ -353,7 +346,7 @@ class TestPyPIProvider(TestCase):
 
     def test_get_preference_conflict_promoted_sorts_first(self):
         """A conflict-promoted package sorts before all others."""
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
             provider._conflict_promoted.add('requests')
 
@@ -377,7 +370,7 @@ class TestPyPIProvider(TestCase):
 
     def test_get_preference_direct_url_before_pinned(self):
         """A direct-URL requirement sorts before a pinned specifier."""
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
 
             info_direct = _RequirementInfo(
@@ -405,7 +398,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(session, index_urls)
 
             # Empty requirements dict
@@ -423,7 +416,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -460,7 +453,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -496,7 +489,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -535,7 +528,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -557,7 +550,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -598,7 +591,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             provider = PyPIProvider(session, index_urls)
 
             candidate = Candidate('requests', Version('2.28.0'))
@@ -618,7 +611,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -645,7 +638,7 @@ class TestPyPIProvider(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -687,7 +680,7 @@ Requires-Dist: requests>=2.0.0
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -726,7 +719,7 @@ Requires-Dist: pytest>=7.0.0; extra == "test"
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -752,7 +745,7 @@ Requires-Dist: pytest>=7.0.0; extra == "test"
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -792,7 +785,7 @@ Requires-Dist: urllib3>=1.26.0; python_version >= "3.8"
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             with patch('proviso.resolver.TargetPython'):
                 with patch('proviso.resolver.default_environment') as mock_env:
                     mock_env.return_value = {}
@@ -838,7 +831,7 @@ Requires-Dist: urllib3>=1.26.0; python_version >= "3.9"
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             with patch('proviso.resolver.TargetPython'):
                 with patch('proviso.resolver.default_environment') as mock_env:
                     mock_env.return_value = {}
@@ -883,7 +876,7 @@ Requires-Dist: urllib3>=1.26.0; python_version >= "3.10"
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -1073,7 +1066,7 @@ class TestPyPIProviderExcludeNewerThan(TestCase):
         index_urls = ['https://pypi.org/simple/']
         exclude_newer_than = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder:
             PyPIProvider(
                 session, index_urls, exclude_newer_than=exclude_newer_than
             )
@@ -1090,7 +1083,7 @@ class TestPyPIProviderExcludeNewerThan(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder:
             PyPIProvider(session, index_urls)
 
             # Verify PackageFinder was created with exclude_newer_than=None
@@ -1105,7 +1098,7 @@ class TestPyPIProviderExtrasBug(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -1165,7 +1158,7 @@ class TestPyPIProviderCoverage(TestCase):
         session = MagicMock()
         index_urls = ['https://pypi.org/simple/']
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -1207,7 +1200,7 @@ class TestNarrowRequirementSelection(TestCase):
     """Tests for PyPIProvider.narrow_requirement_selection."""
 
     def _make_provider(self):
-        with patch('proviso.resolver.PackageFinder'):
+        with patch('proviso.resolver.SeriesPackageFinder'):
             return PyPIProvider(MagicMock(), ['https://pypi.org/simple/'])
 
     def test_no_backtrack_causes_returns_all(self):
@@ -1324,7 +1317,7 @@ class TestFindMatchesPrerelease(TestCase):
     def _make_provider_with_packages(self, versions, allow_prereleases=False):
         """Helper: creates a provider whose finder returns packages at given versions."""
         session = MagicMock()
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -1466,7 +1459,7 @@ class TestFindMatchesPrerelease(TestCase):
 
 
 class TestPrereleaseWithRealFinder(TestCase):
-    """Pre-release handling with a real unearth PackageFinder.
+    """Pre-release handling with a real SeriesPackageFinder.
 
     The finder reads a local find-links directory instead of being mocked, so
     unearth's own filtering runs.  These tests catch unearth dropping
@@ -1482,8 +1475,8 @@ class TestPrereleaseWithRealFinder(TestCase):
         for version in self.VERSIONS:
             filename = f'foo-{version}-py3-none-any.whl'
             open(join(self._tmp.name, filename), 'wb').close()
-        finder = partial(PackageFinder, find_links=[self._tmp.name])
-        patcher = patch('proviso.resolver.PackageFinder', finder)
+        finder = partial(SeriesPackageFinder, find_links=[self._tmp.name])
+        patcher = patch('proviso.resolver.SeriesPackageFinder', finder)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1528,7 +1521,7 @@ class TestGetDependenciesPackageFastPath(TestCase):
         """get_dependencies uses candidate.package directly, avoiding find_best_match."""
         session = MagicMock()
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -1564,7 +1557,7 @@ Requires-Dist: urllib3>=1.21.1
         """get_dependencies falls back to find_best_match when candidate.package is None."""
         session = MagicMock()
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder_class.return_value = mock_finder
 
@@ -1783,7 +1776,7 @@ class TestExtras(TestCase):
 
         session.get.side_effect = get
 
-        with patch('proviso.resolver.PackageFinder') as mock_finder_class:
+        with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
             mock_finder.find_matches.side_effect = lambda name, **kwargs: [
                 self._make_package(name, v) for v in self.VERSIONS[name]
@@ -1951,3 +1944,99 @@ class TestExtras(TestCase):
             {'requests': 0, 'hishel[httpx]': 1, 'hishel': 1},
             mock_provider_class.call_args.kwargs['user_requested'],
         )
+
+
+class TestTargetPythonSeries(TestCase):
+    """A target Python version stands for its whole release series."""
+
+    REQUIRES_DIST = (
+        'old; python_full_version < "3.12.4"',
+        'new; python_full_version >= "3.12.4"',
+        'next; python_version >= "3.13"',
+        'legacy; python_version < "3.11"',
+        'fast; extra == "speed" and python_full_version >= "3.12.2"',
+        'slow; extra == "speed" and python_full_version < "3.12"',
+    )
+
+    def _dependencies(self, python_version, extras=()):
+        session = MagicMock()
+        response = MagicMock()
+        response.text = (
+            'Metadata-Version: 2.1\nName: pkg\nVersion: 1.0\n'
+            + ''.join(f'Requires-Dist: {r}\n' for r in self.REQUIRES_DIST)
+        )
+        session.get.return_value = response
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            provider = PyPIProvider(
+                session, ['https://pypi.org/simple/'], python_version
+            )
+        package = MagicMock()
+        package.link.dist_info_link.url = 'https://pypi/pkg/1.0'
+        candidate = Candidate(
+            'pkg', Version('1.0'), extras=extras, package=package
+        )
+        return [r.name for r in provider.get_dependencies(candidate)]
+
+    def test_get_dependencies_series(self):
+        self.assertEqual(['old', 'new'], self._dependencies('3.12'))
+        self.assertEqual(['new'], self._dependencies('3.12.5'))
+        self.assertEqual(['old'], self._dependencies('3.12.0'))
+        self.assertEqual(
+            ['old', 'new', 'next', 'legacy'], self._dependencies('3')
+        )
+
+    def test_get_dependencies_extras(self):
+        self.assertEqual(
+            ['pkg', 'fast'], self._dependencies('3.12', extras=['speed'])
+        )
+        self.assertEqual(
+            ['pkg'], self._dependencies('3.12.1', extras=['speed'])
+        )
+        self.assertEqual(
+            ['pkg', 'fast', 'slow'], self._dependencies('3', extras=['speed'])
+        )
+
+    def test_get_dependencies_without_target_uses_host(self):
+        host = {'python_version': '3.12', 'python_full_version': '3.12.1'}
+        with patch('proviso.resolver.default_environment') as de:
+            de.side_effect = lambda: dict(host)
+            self.assertEqual(['old'], self._dependencies(None))
+
+    def _filtered(self, python_version, extras=()):
+        requirements = [Requirement(r) for r in self.REQUIRES_DIST]
+        return [
+            r.name
+            for r in filter_requirements(
+                requirements, python_version=python_version, extras=extras
+            )
+        ]
+
+    def test_filter_requirements_series(self):
+        self.assertEqual(['old', 'new'], self._filtered('3.12'))
+        self.assertEqual(['new'], self._filtered('3.12.5'))
+        self.assertEqual(
+            ['old', 'new', 'fast'], self._filtered('3.12', extras=['speed'])
+        )
+        self.assertEqual(
+            ['old', 'new', 'next', 'legacy', 'fast', 'slow'],
+            self._filtered('3', extras=['speed']),
+        )
+
+    def test_filter_requirements_without_target_uses_host(self):
+        host = {'python_version': '3.12', 'python_full_version': '3.12.5'}
+        with patch('proviso.resolver.default_environment') as de:
+            de.side_effect = lambda: dict(host)
+            self.assertEqual(['new'], self._filtered(None))
+
+    def test_requires_python_series(self):
+        """The provider's finder accepts files that need a later patch."""
+        provider = PyPIProvider(None, [], python_version='3.12')
+        evaluator = provider.finder.build_evaluator('foo')
+        link = Link(
+            'https://example.com/foo-1.0.tar.gz', requires_python='>=3.12.1'
+        )
+        self.assertEqual('1.0', evaluator.evaluate_link(link).version)
+        link = Link(
+            'https://example.com/foo-1.0.tar.gz', requires_python='>=3.13'
+        )
+        self.assertIsNone(evaluator.evaluate_link(link))
