@@ -60,6 +60,15 @@ class PythonSeries:
         """Return whether a three part release tuple is in the series."""
         return release[: len(self.release)] == self.release
 
+    def overlaps(self, other):
+        """Return whether the series have any release in common.
+
+        Series are nested, so they overlap when one release is a prefix of
+        the other, e.g. ``3.12`` and ``3.12.5``, or two identical targets.
+        """
+        n = min(len(self.release), len(other.release))
+        return self.release[:n] == other.release[:n]
+
     def releases(self, literals=()):
         """Return the releases to check for markers mentioning literals.
 

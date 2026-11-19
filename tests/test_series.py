@@ -47,6 +47,27 @@ class TestPythonSeries(TestCase):
         self.assertTrue(PythonSeries('3.12.5').contains((3, 12, 5)))
         self.assertFalse(PythonSeries('3.12.5').contains((3, 12, 6)))
 
+    def test_overlaps(self):
+        for a, b in (
+            ('3', '3.12'),
+            ('3.12', '3.12.5'),
+            ('3', '3.12.5'),
+            ('3.12', '3.12'),
+            ('3.12', '3.12.0'),
+            ('3.12.5', '3.12.5'),
+        ):
+            self.assertTrue(PythonSeries(a).overlaps(PythonSeries(b)), (a, b))
+            self.assertTrue(PythonSeries(b).overlaps(PythonSeries(a)), (b, a))
+        for a, b in (
+            ('3.12', '3.13'),
+            ('3.12.4', '3.12.5'),
+            ('2', '3'),
+            ('2', '3.12'),
+            ('3.11', '3.12.5'),
+        ):
+            self.assertFalse(PythonSeries(a).overlaps(PythonSeries(b)), (a, b))
+            self.assertFalse(PythonSeries(b).overlaps(PythonSeries(a)), (b, a))
+
     def test_releases_minor(self):
         series = PythonSeries('3.12')
         self.assertEqual([(3, 12, 0)], series.releases())

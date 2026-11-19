@@ -1,6 +1,7 @@
 from argparse import ArgumentParser
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from itertools import combinations
 from logging import DEBUG, ERROR, INFO, WARNING, basicConfig, getLogger
 from os import getcwd, getenv
 from os.path import dirname, expanduser, join
@@ -171,6 +172,16 @@ def parse_and_validate_args(metadata, args, session=None):
         python_versions = [
             v.strip() for v in args.python_versions.split(',') if v.strip()
         ]
+
+    # Each release may be covered by only one target, otherwise the output
+    # would pin a package twice for the same interpreter
+    for a, b in combinations(python_versions, 2):
+        if PythonSeries(a).overlaps(PythonSeries(b)):
+            log.error(
+                f'Python versions {a} and {b} overlap; each release may be covered by only one target'
+            )
+            exit(1)
+            break
 
     # Determine output path: if filename has a directory component, use as-is;
     # otherwise place it in the project directory
