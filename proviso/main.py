@@ -46,28 +46,13 @@ def format_and_print_metadata(metadata, extras, python_versions):
     )
 
 
-def get_requirements_with_extras(metadata, extras):
-    """Get requirements including extras."""
-    requires_dist = metadata.requires_dist or []
-
-    # base runtime direct requirements
-    requirements = [r for r in requires_dist if r.marker is None]
-    for extra in extras:
-        requirements.extend(
-            r
-            for r in requires_dist
-            if r.marker and r.marker.evaluate({'extra': extra})
-        )
-
-    return requirements
-
-
 def find_requirements(
     requirements,
     python_versions,
     session=None,
     exclude_newer_than=None,
     allow_prereleases=False,
+    extras=(),
 ):
 
     if not requirements:
@@ -90,6 +75,7 @@ def find_requirements(
             python_version=python_version,
             exclude_newer_than=exclude_newer_than,
             allow_prereleases=allow_prereleases,
+            extras=extras,
         )
 
         log.info(
@@ -306,7 +292,7 @@ def main():  # pragma: no cover
             metadata, parsed['extras'], parsed['python_versions']
         )
 
-        requirements = get_requirements_with_extras(metadata, parsed['extras'])
+        requirements = metadata.requires_dist or []
 
         # Calculate exclude_newer_than if cooldown is enabled
         exclude_newer_than = None
@@ -324,6 +310,7 @@ def main():  # pragma: no cover
             session=session,
             exclude_newer_than=exclude_newer_than,
             allow_prereleases=args.pre,
+            extras=parsed['extras'],
         )
 
         write_requirements_to_file(

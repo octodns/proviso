@@ -16,6 +16,7 @@ from proviso.resolver import (
     Candidate,
     PyPIProvider,
     Resolver,
+    filter_requirements,
     make_identifier,
     split_identifier,
 )
@@ -1632,6 +1633,106 @@ class TestResolverUserRequested(TestCase):
                         self.assertIn('urllib3', user_requested)
                         self.assertEqual(0, user_requested['requests'])
                         self.assertEqual(1, user_requested['urllib3'])
+
+
+class TestRootRequirementMarkers(TestCase):
+    """Root requirement markers are evaluated per target Python."""
+
+    REQS = [
+        Requirement('a'),
+        Requirement("tomli; python_version < '3.11'"),
+        Requirement("newpy; python_version >= '3.12'"),
+        Requirement("win; sys_platform == 'win32'"),
+        Requirement("d; extra == 'dev'"),
+        Requirement("e; extra == 'dev' and python_version < '3.11'"),
+        Requirement("f; extra == 'test'"),
+        Requirement("g; python_version < '3.11' or extra == 'dev'"),
+    ]
+
+    def _names(self, python_version, extras=()):
+        return [
+            r.name
+            for r in filter_requirements(
+                self.REQS, python_version=python_version, extras=extras
+            )
+        ]
+
+    def test_no_extras(self):
+        with patch('proviso.resolver.default_environment') as de:
+            de.return_value = {'sys_platform': 'linux'}
+            self.assertEqual(['a', 'tomli', 'g'], self._names('3.10'))
+            self.assertEqual(['a', 'newpy'], self._names('3.12'))
+
+    def test_host_python_does_not_matter(self):
+        host = {'python_version': '3.14', 'sys_platform': 'linux'}
+        with patch('proviso.resolver.default_environment') as de:
+            de.side_effect = lambda: dict(host)
+            self.assertIn('tomli', self._names('3.10'))
+            self.assertNotIn('tomli', self._names('3.14'))
+
+    def test_extras(self):
+        with patch('proviso.resolver.default_environment') as de:
+            de.return_value = {'sys_platform': 'linux'}
+            self.assertEqual(
+                ['a', 'tomli', 'd', 'e', 'g'], self._names('3.10', ['dev'])
+            )
+            self.assertEqual(
+                ['a', 'newpy', 'd', 'g'], self._names('3.12', ['dev'])
+            )
+
+    def test_included_once_with_many_extras(self):
+        with patch('proviso.resolver.default_environment') as de:
+            de.return_value = {'sys_platform': 'linux'}
+            names = self._names('3.10', ['dev', 'test', 'other'])
+            self.assertEqual(['a', 'tomli', 'd', 'e', 'f', 'g'], names)
+
+    def test_python_version_none_uses_host(self):
+        with patch('proviso.resolver.default_environment') as de:
+            de.return_value = {
+                'python_version': '3.10',
+                'sys_platform': 'win32',
+            }
+            names = [
+                r.name for r in filter_requirements(self.REQS, extras=['dev'])
+            ]
+            self.assertEqual(['a', 'tomli', 'win', 'd', 'e', 'g'], names)
+
+    def _resolve(self, **kwargs):
+        with patch('proviso.resolver.CachingClient'):
+            with patch('proviso.resolver.MultiDomainBasicAuth'):
+                resolver = Resolver()
+        mock_result = MagicMock()
+        mock_result.mapping = {}
+        with patch('proviso.resolver.ResolveLibResolver') as rl:
+            rl.return_value.resolve.return_value = mock_result
+            with patch('proviso.resolver.PyPIProvider') as provider:
+                with patch('proviso.resolver.default_environment') as de:
+                    de.return_value = {'sys_platform': 'linux'}
+                    result = resolver.resolve(self.REQS, **kwargs)
+        return result, rl, provider
+
+    def test_resolve_passes_filtered_requirements(self):
+        _, rl, provider = self._resolve(python_version='3.10', extras=['dev'])
+        passed = rl.return_value.resolve.call_args.args[0]
+        names = [r.name for r in passed]
+        self.assertEqual(['a', 'tomli', 'd', 'e', 'g'], names)
+        user_requested = provider.call_args.kwargs['user_requested']
+        self.assertEqual(
+            {'a': 0, 'tomli': 1, 'd': 2, 'e': 3, 'g': 4}, user_requested
+        )
+
+    def test_resolve_all_filtered_out(self):
+        with patch('proviso.resolver.CachingClient'):
+            with patch('proviso.resolver.MultiDomainBasicAuth'):
+                resolver = Resolver()
+        with patch('proviso.resolver.ResolveLibResolver') as rl:
+            with patch('proviso.resolver.PyPIProvider'):
+                result = resolver.resolve(
+                    [Requirement("x; python_version < '3.0'")],
+                    python_version='3.12',
+                )
+        self.assertEqual({}, result)
+        rl.return_value.resolve.assert_not_called()
 
 
 class TestExtras(TestCase):

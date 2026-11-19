@@ -52,6 +52,36 @@ def split_identifier(identifier):
     return name, frozenset(extras.rstrip(']').split(','))
 
 
+def marker_environment(python_version=None):
+    """Return the environment used to evaluate markers for a target Python.
+
+    Without a python_version this is the environment of the running
+    interpreter.
+    """
+    environment = default_environment()
+    if python_version:
+        environment.update(format_python_version_for_markers(python_version))
+    return environment
+
+
+def filter_requirements(requirements, python_version=None, extras=()):
+    """Return the requirements that apply to a target Python and extras.
+
+    A requirement applies when it has no marker, its marker is true with no
+    extra selected, or its marker is true with any one of the extras selected.
+    Order is preserved and each requirement appears at most once.
+    """
+    base_env = marker_environment(python_version)
+    envs = [dict(base_env, extra='')]
+    envs.extend(dict(base_env, extra=extra) for extra in extras)
+
+    return [
+        r
+        for r in requirements
+        if r.marker is None or any(r.marker.evaluate(env) for env in envs)
+    ]
+
+
 class Candidate:
     """Represents a concrete package version."""
 
@@ -120,18 +150,10 @@ class PyPIProvider(AbstractProvider):
             exclude_newer_than=exclude_newer_than,
         )
 
-        # Build environment for marker evaluation
-        if python_version:
-            # Start with default environment and override Python version
-            version_info_dict = format_python_version_for_markers(
-                python_version
-            )
-
-            self.environment = default_environment()
-            self.environment.update(version_info_dict)
-        else:
-            # Use current environment
-            self.environment = None
+        # Build environment for marker evaluation, None means the current one
+        self.environment = (
+            marker_environment(python_version) if python_version else None
+        )
 
     def identify(self, requirement_or_candidate):
         """Return the identifier: the package name plus any extras."""
@@ -452,6 +474,7 @@ class Resolver:
         python_version=None,
         exclude_newer_than=None,
         allow_prereleases=False,
+        extras=(),
     ):
         """Resolve dependencies for the given requirements.
 
@@ -464,6 +487,9 @@ class Resolver:
             allow_prereleases: Consider pre-release versions for every package.
                           By default pre-releases are only considered for a
                           package whose specifier names one (e.g. ">=2.0b1").
+            extras: Names of the project extras that are selected. Only the
+                          requirements that apply to python_version with these
+                          extras are resolved.
 
         Returns:
             Dict mapping package names to metadata dicts with 'version' and 'extras'
@@ -471,6 +497,12 @@ class Resolver:
         Raises:
             resolvelib.ResolutionImpossible: If resolution fails
         """
+        requirements = filter_requirements(
+            requirements, python_version=python_version, extras=extras
+        )
+        if not requirements:
+            return {}
+
         # Record the user-specified ordering so get_preference can prioritise
         # top-level requirements (mirrors pip's _user_requested).
         user_requested = {}
