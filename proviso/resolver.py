@@ -142,14 +142,19 @@ class BasePin(Requirement):
     __slots__ = ()
 
 
-def pins_exactly(specifier, version):
-    """Return whether specifier is an exact pin (``==`` or ``===``) on version.
+def is_exact_pin(specifier):
+    """Return whether specifier is an exact pin (``==`` or ``===``).
 
     ``==`` with a ``.*`` wildcard isn't an exact pin.
     """
     if specifier.operator == '==' and '*' in specifier.version:
         return False
-    return specifier.operator in ('==', '===') and specifier.contains(
+    return specifier.operator in ('==', '===')
+
+
+def pins_exactly(specifier, version):
+    """Return whether specifier is an exact pin on version."""
+    return is_exact_pin(specifier) and specifier.contains(
         version, prereleases=True
     )
 

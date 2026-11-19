@@ -385,6 +385,46 @@ class TestFindRequirements(TestCase):
             self._resolve_failure_cooldown(error),
         )
 
+    def test_find_requirements_cooldown_hint_exact_project_pin(self):
+        """No hint when the project pins the requirement exactly."""
+        for requirement in ('qux==9.9', 'qux===9.9', 'qux[x]==9.9'):
+            error = self._causes((requirement, None))
+            self.assertEqual(
+                'Unable to resolve dependencies for Python 3.9: no version '
+                f'of qux satisfies {requirement} (from the project)',
+                self._resolve_failure_cooldown(error),
+            )
+
+    def test_find_requirements_cooldown_hint_inexact_project_spec(self):
+        """The hint stays for a project specifier that isn't an exact pin."""
+        for requirement in ('qux==9.*', 'qux>=1.1'):
+            error = self._causes((requirement, None))
+            self.assertEqual(
+                'Unable to resolve dependencies for Python 3.9: no version '
+                f'of qux satisfies {requirement} (from the project); '
+                'releases inside the --cooldown-days window are excluded',
+                self._resolve_failure_cooldown(error),
+            )
+
+    def test_find_requirements_cooldown_hint_exact_dependency_pin(self):
+        """A dependency's exact pin isn't exempt, so the hint stays."""
+        error = self._causes(('qux==9.9', '1.0'))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'qux satisfies qux==9.9 (from a==1.0); releases inside the '
+            '--cooldown-days window are excluded',
+            self._resolve_failure_cooldown(error),
+        )
+
+    def test_find_requirements_cooldown_hint_project_and_dependency(self):
+        """No hint when the project also pins the requirement exactly."""
+        error = self._causes(('qux==9.9', '1.0'), ('qux==9.9', None))
+        self.assertEqual(
+            'Unable to resolve dependencies for Python 3.9: no version of '
+            'qux satisfies qux==9.9 (from a==1.0, the project)',
+            self._resolve_failure_cooldown(error),
+        )
+
     def test_find_requirements_same_requirement_parent_cap(self):
         """Only the first three parents are shown, then a count."""
         error = self._causes(

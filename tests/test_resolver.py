@@ -16,6 +16,7 @@ import httpx2
 from build import BuildBackendException
 from packaging.metadata import InvalidMetadata, Metadata
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 from resolvelib import ResolutionImpossible
 from unearth import Link, PackageFinder
@@ -31,6 +32,7 @@ from proviso.resolver import (
     PyPIProvider,
     Resolver,
     filter_requirements,
+    is_exact_pin,
     make_identifier,
     split_identifier,
 )
@@ -2871,6 +2873,19 @@ class TestYanked(TestCase):
         self.assertEqual(
             [False, True, True], [p.link.is_yanked for p in with_yanked]
         )
+
+
+class TestIsExactPin(TestCase):
+    def test_is_exact_pin(self):
+        def pin(text):
+            return is_exact_pin(next(iter(SpecifierSet(text))))
+
+        self.assertTrue(pin('==1.0'))
+        self.assertTrue(pin('===1.0'))
+        self.assertFalse(pin('==1.*'))
+        self.assertFalse(pin('>=1.0'))
+        self.assertFalse(pin('~=1.0'))
+        self.assertFalse(pin('!=1.0'))
 
 
 class TestCooldown(TestCase):
