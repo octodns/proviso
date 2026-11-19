@@ -2128,11 +2128,12 @@ Requires-Dist: pytest; extra == "test"
         self.mock_build.return_value = Metadata.from_raw(
             {'requires_dist': ['six>=1.*.3']}, validate=False
         )
+        provider = self._provider()
         with self.assertRaises(MetadataUnavailableError) as ctx:
-            self._dependencies(self._sdist())
+            self._dependencies(self._sdist(), provider)
         self.assertIn('foo==1.0', str(ctx.exception))
         self.assertIn("'six>=1.*.3' is invalid", str(ctx.exception))
-        self.assertEqual({}, self._provider()._file_requires_dist_cache)
+        self.assertEqual({}, provider._file_requires_dist_cache)
 
     def test_sdist_undecodable_requires_dist_builds(self):
         pkg_info = (
