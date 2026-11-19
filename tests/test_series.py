@@ -607,6 +607,13 @@ class TestUnearthPrivateSurface(TestCase):
             _file('bar-1.0-py3-none-any.whl'),
             _file('foo-bad.whl'),
             _file('foo-1.3.exe'),
+            # A local version, a build tag and an upload time
+            _file('foo-2.1+local.1-py3-none-any.whl'),
+            _file('foo-2.0-1-py3-none-any.whl'),
+            _file(
+                'foo-1.8-py3-none-any.whl',
+                **{'upload-time': '2024-01-01T00:00:00Z'},
+            ),
         ],
         'https://mirror.example.com/simple/foo/': [
             _file('foo-1.9.tar.gz', host='mirror.example.com'),
@@ -665,6 +672,9 @@ class TestUnearthPrivateSurface(TestCase):
                 'files.example.com/foo-2.0.tar.gz',
                 'mirror.example.com/foo-2.0-py3-none-any.whl',
                 'files.example.com/foo-1.5-py3-none-any.whl',
+                'files.example.com/foo-2.1+local.1-py3-none-any.whl',
+                'files.example.com/foo-2.0-1-py3-none-any.whl',
+                'files.example.com/foo-1.8-py3-none-any.whl',
             ):
                 self.assertIn(f'https://{filename}', urls, py_ver)
             # Each target has a file the other can't use
