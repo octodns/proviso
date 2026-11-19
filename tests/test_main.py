@@ -1,6 +1,6 @@
 from argparse import ArgumentTypeError
 from datetime import datetime, timezone
-from os.path import join
+from os.path import expanduser, join
 from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -21,6 +21,7 @@ from resolvelib.structs import RequirementInformation
 
 from proviso.main import (
     build_project_metadata,
+    cache_db_setting,
     find_requirements,
     format_and_print_metadata,
     non_negative_int,
@@ -1464,6 +1465,60 @@ class TestWriteRequirementsToFile(TestCase):
                 ['x-python-version-not-supported', 'b==1.0'],
                 self._selected(content, full_version),
             )
+
+
+class TestCacheDbSetting(TestCase):
+    def setting(self, cache_db=None, no_cache=False, environ=None):
+        environ = {'XDG_CACHE_HOME': '/xdg', **(environ or {})}
+        with patch.dict('os.environ', environ, clear=True):
+            return cache_db_setting(cache_db, no_cache)
+
+    def test_default(self):
+        """Without options the per-user cache is used, best effort."""
+        self.assertEqual(('/xdg/proviso/http-cache.db', False), self.setting())
+
+    def test_cache_db(self):
+        """--cache-db is used over PROVISO_CACHE_DB, and is required."""
+        self.assertEqual(
+            ('/tmp/c.db', True),
+            self.setting('/tmp/c.db', environ={'PROVISO_CACHE_DB': '/e.db'}),
+        )
+        self.assertEqual((expanduser('~/c.db'), True), self.setting('~/c.db'))
+
+    def test_environment(self):
+        """PROVISO_CACHE_DB is used over the default, and is required."""
+        self.assertEqual(
+            (expanduser('~/e.db'), True),
+            self.setting(environ={'PROVISO_CACHE_DB': '~/e.db'}),
+        )
+
+    def test_empty_turns_persistent_cache_off(self):
+        """An empty --cache-db or PROVISO_CACHE_DB means in-memory."""
+        self.assertEqual((None, True), self.setting(''))
+        self.assertEqual(
+            (None, True), self.setting(environ={'PROVISO_CACHE_DB': ''})
+        )
+
+    def test_no_cache(self):
+        """--no-cache means in-memory, whatever PROVISO_CACHE_DB says."""
+        self.assertEqual((None, False), self.setting(no_cache=True))
+        self.assertEqual(
+            (None, False),
+            self.setting(no_cache=True, environ={'PROVISO_CACHE_DB': '/e.db'}),
+        )
+
+    def test_no_home_directory(self):
+        """Without a home directory the cache is in-memory, with a warning."""
+        with (
+            patch(
+                'proviso.main.default_cache_db_path',
+                side_effect=RuntimeError('Could not determine home directory'),
+            ),
+            self.assertLogs('proviso', level='WARNING') as logs,
+        ):
+            self.assertEqual((None, False), self.setting())
+        self.assertIn('caching in memory instead', logs.output[0])
+        self.assertIn('Could not determine home directory', logs.output[0])
 
 
 class TestNonNegativeInt(TestCase):
