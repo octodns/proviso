@@ -23,6 +23,7 @@ from unearth.fetchers import DEFAULT_SECURE_ORIGINS
 
 from proviso.resolver import (
     _CONFLICT_PRIORITY_THRESHOLD,
+    MAX_ROUNDS,
     BasePin,
     Candidate,
     MetadataUnavailableError,
@@ -756,6 +757,31 @@ Requires-Dist: requests>=2.0.0
             self.assertTrue(any('urllib3' in str(r) for r in result))
             self.assertTrue(any('requests' in str(r) for r in result))
 
+    def test_get_dependencies_invalid_index_requires_dist(self):
+        """Invalid Requires-Dist in index metadata is MetadataUnavailableError."""
+        session = MagicMock()
+
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            provider = PyPIProvider(session, ['https://pypi.org/simple/'])
+
+            mock_package = MagicMock()
+            mock_package.link.dist_info_link.url = 'https://pypi.org/metadata'
+            session.get.return_value.text = (
+                'Metadata-Version: 2.1\nName: test-package\n'
+                'Version: 1.0.0\nRequires-Dist: not a valid ((requirement\n'
+            )
+
+            candidate = Candidate(
+                'test-package', Version('1.0.0'), package=mock_package
+            )
+            with self.assertRaises(MetadataUnavailableError) as ctx:
+                provider.get_dependencies(candidate)
+
+        self.assertIsInstance(ctx.exception.__cause__, InvalidMetadata)
+        message = str(ctx.exception)
+        self.assertIn('test-package==1.0.0', message)
+        self.assertIn('invalid Requires-Dist', message)
+
     def test_get_dependencies_with_markers(self):
         """Test get_dependencies evaluates markers correctly."""
         session = MagicMock()
@@ -1145,6 +1171,23 @@ class TestResolver(TestCase):
                             exclude_newer_than,
                             call_kwargs['exclude_newer_than'],
                         )
+
+
+class TestMaxRounds(TestCase):
+    def test_round_limit_matches_pip(self):
+        """The resolver is given pip's round limit."""
+        self.assertEqual(200000, MAX_ROUNDS)
+        with patch('proviso.resolver.CachingClient'):
+            resolver = Resolver()
+        with patch('proviso.resolver.ResolveLibResolver') as mock_class:
+            mock_class.return_value.resolve.return_value.mapping = {}
+            with patch('proviso.resolver.PyPIProvider'):
+                resolver.resolve([Requirement('foo')])
+        mock_class.return_value.resolve.assert_called_once()
+        self.assertEqual(
+            MAX_ROUNDS,
+            mock_class.return_value.resolve.call_args.kwargs['max_rounds'],
+        )
 
 
 class TestPyPIProviderExcludeNewerThan(TestCase):
