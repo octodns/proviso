@@ -12,8 +12,9 @@ from packaging.metadata import InvalidMetadata, Metadata
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
-from resolvelib import AbstractProvider, BaseReporter
+from resolvelib import AbstractProvider, BaseReporter, ResolutionImpossible
 from resolvelib import Resolver as ResolveLibResolver
+from resolvelib.structs import RequirementInformation
 from unearth import TargetPython
 from unearth.auth import MultiDomainBasicAuth
 
@@ -280,6 +281,16 @@ class PyPIProvider(AbstractProvider):
             {} if file_requires_dist_cache is None else file_requires_dist_cache
         )
         self._matches_cache = {}
+        # The candidate each dependency came from, keyed by the dependency's
+        # id, see base_conflict_causes
+        self._parents = {}
+        # For an extras identifier left without candidates only because of
+        # its base package's requirements: (its own requirements, the base
+        # requirements that excluded them), see base_conflict_causes
+        self._base_conflicts = {}
+        # A copy of _base_conflicts taken when resolvelib last reported a
+        # conflict, None until it does, see conflict_reported
+        self._reported_base_conflicts = None
         # (reason, name, version) or (reason, index) already logged about.
         # The Resolver shares this across providers so each is logged once
         # per run.
@@ -425,10 +436,11 @@ class PyPIProvider(AbstractProvider):
 
         name, extras = split_identifier(identifier)
         incompat_candidates = list(incompatibilities.get(identifier, []))
+        base_reqs = []
         if extras:
             # An extras candidate pins its base package to the same version,
             # so honor the base package's constraints here too (as pip does).
-            reqs.extend(requirements.get(name, []))
+            base_reqs = list(requirements.get(name, []))
             incompat_candidates.extend(incompatibilities.get(name, []))
 
         # Fetch (and cache) all platform-compatible packages for this name.
@@ -462,7 +474,7 @@ class PyPIProvider(AbstractProvider):
         # references a pre-release (e.g. ">=1.0a1"), as pip does.
         # SpecifierSet.prereleases returns True in that case.
         allow_prereleases = self.allow_prereleases or any(
-            r.specifier.prereleases for r in reqs
+            r.specifier.prereleases for r in reqs + base_reqs
         )
 
         # Collect incompatible versions for fast O(1) membership tests.
@@ -470,6 +482,8 @@ class PyPIProvider(AbstractProvider):
 
         # Build the filtered, sorted candidate list.
         candidates = []
+        # Versions only the base package's requirements exclude
+        base_excluded = []
         for package in result:
             version = Version(package.version)
 
@@ -496,11 +510,33 @@ class PyPIProvider(AbstractProvider):
                 if not self.pinned_exactly(name, version, requirements):
                     continue
 
+            if not all(
+                r.specifier.contains(version, prereleases=True)
+                for r in base_reqs
+            ):
+                base_excluded.append(version)
+                continue
+
             # Carry the unearth package object so get_dependencies can use it
             # directly without a redundant find_best_match lookup.
             candidates.append(
                 Candidate(name, version, extras=extras, package=package)
             )
+
+        if not candidates and base_excluded:
+            self._base_conflicts[identifier] = (
+                reqs,
+                [
+                    r
+                    for r in base_reqs
+                    if not all(
+                        r.specifier.contains(v, prereleases=True)
+                        for v in base_excluded
+                    )
+                ],
+            )
+        else:
+            self._base_conflicts.pop(identifier, None)
 
         # Return candidates sorted by version (newest first)
         log.debug(f'Found {len(candidates)} candidates for {identifier}')
@@ -776,13 +812,13 @@ class PyPIProvider(AbstractProvider):
             ):
                 # Applies without any extra, so it belongs to the base package
                 if not candidate.extras:
-                    dependencies.append(req)
+                    dependencies.append(copy(req))
                 continue
 
             # Not a base dependency, check against requested extras
             for extra in candidate.extras:
                 if marker_applies(req.marker, environment, self.series, extra):
-                    dependencies.append(req)
+                    dependencies.append(copy(req))
                     break
 
         # Direct references aren't supported, fail rather than resolve one by
@@ -796,8 +832,71 @@ class PyPIProvider(AbstractProvider):
         log.debug(
             f'Found {len(dependencies)} dependencies for {candidate.name}=={candidate.version} extras={candidate.extras}'
         )
+        # The Requires-Dist entries are copied, as their cache is shared by a
+        # package's extras candidates, so each dependency belongs to this
+        # candidate alone.  The dependencies cache keeps it alive, so its id
+        # isn't reused.
+        for req in dependencies:
+            self._parents[id(req)] = (req, candidate)
         self._dependencies_cache[cache_key] = dependencies
         return dependencies
+
+    def conflict_reported(self):
+        """Keep the base conflicts recorded when resolvelib found a conflict.
+
+        resolvelib computes a conflict's causes, reports them and then
+        backtracks, which calls find_matches again and replaces the records.
+        If backtracking fails, the ResolutionImpossible it raises carries the
+        causes reported, so base_conflict_causes uses this copy rather than
+        the later records.  Each record is a new tuple that's never changed,
+        so copying the dict is enough.
+        """
+        self._reported_base_conflicts = dict(self._base_conflicts)
+
+    def base_conflict_causes(self, causes):
+        """Return the causes of a failure with any base requirements added.
+
+        find_matches excludes an extras candidate when its base package's
+        requirements exclude its version, which leaves resolvelib with only
+        the extras requirement as the cause when none is left.  This adds the
+        base requirements that excluded them, with the candidates they came
+        from, None for the project's own.
+
+        The records come from when the conflict was reported, see
+        conflict_reported.  Without a reported conflict the failure happened
+        while merging the initial requirements, right after the find_matches
+        call that made the current records.
+        """
+        conflicts = self._reported_base_conflicts
+        if conflicts is None:
+            conflicts = self._base_conflicts
+        result = list(causes)
+        for cause in causes:
+            conflict = conflicts.get(self.identify(cause.requirement))
+            if conflict is None or not any(
+                cause.requirement is r for r in conflict[0]
+            ):
+                continue
+            for req in conflict[1]:
+                if any(req is c.requirement for c in result):
+                    continue
+                parent = self._parents.get(id(req), (None, None))
+                result.append(
+                    RequirementInformation(
+                        req, parent[1] if parent[0] is req else None
+                    )
+                )
+        return result
+
+
+class ConflictReporter(BaseReporter):
+    """Tells the provider when resolvelib reports a conflict's causes."""
+
+    def __init__(self, provider):
+        self.provider = provider
+
+    def resolving_conflicts(self, causes):
+        self.provider.conflict_reported()
 
 
 class Resolver:
@@ -903,7 +1002,7 @@ class Resolver:
             logged=self._logged,
             project_requirements=requirements,
         )
-        reporter = BaseReporter()
+        reporter = ConflictReporter(provider)
         resolver = ResolveLibResolver(provider, reporter)
 
         # resolvelib finds a package's candidates when a requirement for it is
@@ -914,7 +1013,13 @@ class Resolver:
         ordered = sorted(requirements, key=lambda r: bool(r.extras))
 
         # Resolve
-        result = resolver.resolve(ordered, max_rounds=MAX_ROUNDS)
+        try:
+            result = resolver.resolve(ordered, max_rounds=MAX_ROUNDS)
+        except ResolutionImpossible as e:
+            causes = provider.base_conflict_causes(e.causes)
+            if len(causes) == len(e.causes):
+                raise
+            raise ResolutionImpossible(causes) from e
 
         # Convert result to our format, folding extras candidates into their
         # base package.  An extras candidate pins its base package to the same
