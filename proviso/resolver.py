@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from packaging.markers import default_environment
-from packaging.metadata import Metadata
+from packaging.metadata import InvalidMetadata, Metadata
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -439,9 +439,15 @@ class PyPIProvider(AbstractProvider):
         url = link.url_without_fragment
         if url not in self._file_requires_dist_cache:
             metadata = self._download_metadata(candidate, link)
-            self._file_requires_dist_cache[url] = list(
-                metadata.requires_dist or []
-            )
+            try:
+                requires_dist = list(metadata.requires_dist or [])
+            except InvalidMetadata as e:
+                raise MetadataUnavailableError(
+                    candidate.name,
+                    candidate.version,
+                    f'invalid Requires-Dist in {link.filename}: {e}',
+                ) from e
+            self._file_requires_dist_cache[url] = requires_dist
         return self._file_requires_dist_cache[url]
 
     def _download_metadata(self, candidate, link):
@@ -467,7 +473,7 @@ class PyPIProvider(AbstractProvider):
 
             try:
                 if link.is_wheel:
-                    metadata = wheel_metadata(path)
+                    metadata = wheel_metadata(path, name)
                 else:
                     metadata = sdist_pkg_info_metadata(path)
             except Exception as e:

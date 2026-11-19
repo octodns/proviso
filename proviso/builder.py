@@ -8,6 +8,7 @@ from zipfile import ZipFile
 from build import ProjectBuilder
 from build.util import project_wheel_metadata
 from packaging.metadata import Metadata, parse_email
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 # PEP 643: from Metadata-Version 2.2 on, an sdist's PKG-INFO fields are
@@ -36,22 +37,51 @@ class Builder:
                 return Metadata.from_email(f.read())
 
 
-def wheel_metadata(path):
-    """Return the Metadata in a wheel's .dist-info/METADATA, or None."""
+def wheel_metadata(path, name):
+    """Return the Metadata in a wheel's .dist-info/METADATA, or None.
+
+    As pip does, requires exactly one top-level .dist-info directory and that
+    it belongs to the named project. Raises if Requires-Dist can't be decoded.
+    """
     with ZipFile(path) as zf:
-        for name in zf.namelist():
-            directory, _, filename = name.partition('/')
-            if directory.endswith('.dist-info') and filename == 'METADATA':
-                return Metadata.from_email(zf.read(name), validate=False)
-    return None
+        names = zf.namelist()
+        info_dirs = sorted(
+            {
+                n.partition('/')[0]
+                for n in names
+                if '/' in n and n.partition('/')[0].endswith('.dist-info')
+            }
+        )
+        if not info_dirs:
+            return None
+        if len(info_dirs) > 1:
+            raise ValueError(
+                f'multiple .dist-info directories found: {", ".join(info_dirs)}'
+            )
+        info_dir = info_dirs[0]
+        canonical_name = canonicalize_name(name)
+        if not canonicalize_name(info_dir).startswith(canonical_name):
+            raise ValueError(
+                f'.dist-info directory {info_dir!r} does not start with '
+                f'{canonical_name!r}'
+            )
+        metadata_path = f'{info_dir}/METADATA'
+        if metadata_path not in names:
+            return None
+        data = zf.read(metadata_path)
+
+    raw, unparsed = parse_email(data)
+    if 'requires-dist' in unparsed:
+        raise ValueError('Requires-Dist could not be decoded')
+    return Metadata.from_raw(raw, validate=False)
 
 
 def sdist_pkg_info_metadata(source_dir):
     """Return the Metadata in an unpacked sdist's PKG-INFO.
 
     Returns None when there's no PKG-INFO or when its Requires-Dist can't be
-    trusted under PEP 643: Metadata-Version is older than 2.2 or Requires-Dist
-    is listed in Dynamic.
+    trusted under PEP 643: Metadata-Version is older than 2.2, Requires-Dist
+    is listed in Dynamic, or either header can't be decoded.
     """
     path = join(source_dir, 'PKG-INFO')
     if not isfile(path):
@@ -59,7 +89,11 @@ def sdist_pkg_info_metadata(source_dir):
     with open(path, 'rb') as f:
         data = f.read()
 
-    raw, _ = parse_email(data)
+    raw, unparsed = parse_email(data)
+    # A header with an undecodable value is dropped from raw, so Requires-Dist
+    # or Dynamic can't be trusted
+    if 'requires-dist' in unparsed or 'dynamic' in unparsed:
+        return None
     metadata_version = raw.get('metadata_version', '0')
     dynamic = {d.lower() for d in raw.get('dynamic', [])}
     if (

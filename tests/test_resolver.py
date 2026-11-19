@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 from zipfile import ZipFile
 
 from build import BuildBackendException
-from packaging.metadata import Metadata
+from packaging.metadata import InvalidMetadata, Metadata
 from packaging.requirements import Requirement
 from packaging.version import Version
 from unearth import Link, PackageFinder
@@ -2009,7 +2009,9 @@ Requires-Dist: pytest; extra == "test"
         path = self.dir / 'foo-1.0.tar.gz'
         files = {'foo-1.0/setup.py': b''}
         if pkg_info is not None:
-            files['foo-1.0/PKG-INFO'] = pkg_info.encode()
+            files['foo-1.0/PKG-INFO'] = (
+                pkg_info.encode() if isinstance(pkg_info, str) else pkg_info
+            )
         with tarfile.open(path, 'w:gz') as tf:
             for name, data in files.items():
                 info = tarfile.TarInfo(name)
@@ -2048,6 +2050,116 @@ Requires-Dist: pytest; extra == "test"
         self.assertIn('no METADATA', str(ctx.exception))
         self.assertEqual('foo', ctx.exception.name)
         self.assertEqual(Version('1.0'), ctx.exception.version)
+
+    def _wheel_with(self, files):
+        path = self.dir / 'foo-1.0-py3-none-any.whl'
+        with ZipFile(path, 'w') as zf:
+            for name, data in files:
+                zf.writestr(name, data)
+        return path
+
+    def test_wheel_multiple_dist_infos(self):
+        path = self._wheel_with(
+            [
+                ('vendored-2.0.dist-info/METADATA', self._metadata('2.1')),
+                ('foo-1.0.dist-info/METADATA', self._metadata('2.1')),
+            ]
+        )
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path)
+        message = str(ctx.exception)
+        self.assertIn('foo==1.0', message)
+        self.assertIn('multiple .dist-info directories', message)
+        self.assertIn('foo-1.0.dist-info', message)
+        self.assertIn('vendored-2.0.dist-info', message)
+
+    def test_wheel_mismatched_dist_info(self):
+        path = self._wheel_with(
+            [('other-1.0.dist-info/METADATA', self._metadata('2.1'))]
+        )
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path)
+        message = str(ctx.exception)
+        self.assertIn('foo==1.0', message)
+        self.assertIn(
+            "'other-1.0.dist-info' does not start with 'foo'", message
+        )
+
+    def test_wheel_nested_dist_info_ignored(self):
+        path = self._wheel_with(
+            [
+                ('foo/vendor/other-2.0.dist-info/METADATA', 'Requires-Dist: x'),
+                ('foo-1.0.dist-info/METADATA', self._metadata('2.1')),
+            ]
+        )
+        self.assertEqual([Requirement('six')], self._dependencies(path))
+
+    def test_wheel_dist_info_without_metadata(self):
+        path = self._wheel_with([('foo-1.0.dist-info/WHEEL', 'x')])
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path)
+        self.assertIn('no METADATA', str(ctx.exception))
+
+    def test_wheel_undecodable_requires_dist(self):
+        data = self._metadata('2.1').encode() + b'Requires-Dist: attrs\xe9\n'
+        path = self._wheel_with([('foo-1.0.dist-info/METADATA', data)])
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path)
+        self.assertIn('foo==1.0', str(ctx.exception))
+        self.assertIn('could not be decoded', str(ctx.exception))
+
+    def test_wheel_invalid_requires_dist(self):
+        path = self._wheel(self._metadata('2.1', 'Requires-Dist: six>=1.*.3\n'))
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path)
+        self.assertIn('foo==1.0', str(ctx.exception))
+        self.assertIn("'six>=1.*.3' is invalid", str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, InvalidMetadata)
+
+    def test_sdist_invalid_requires_dist(self):
+        path = self._sdist(self._metadata('2.2', 'Requires-Dist: six>=1.*.3\n'))
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(path)
+        self.assertIn('foo==1.0', str(ctx.exception))
+        self.assertIn("'six>=1.*.3' is invalid", str(ctx.exception))
+        self.mock_build.assert_not_called()
+
+    def test_built_invalid_requires_dist(self):
+        self.mock_build.return_value = Metadata.from_raw(
+            {'requires_dist': ['six>=1.*.3']}, validate=False
+        )
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(self._sdist())
+        self.assertIn('foo==1.0', str(ctx.exception))
+        self.assertIn("'six>=1.*.3' is invalid", str(ctx.exception))
+        self.assertEqual({}, self._provider()._file_requires_dist_cache)
+
+    def test_sdist_undecodable_requires_dist_builds(self):
+        pkg_info = (
+            self._metadata('2.2').encode() + b'Requires-Dist: attrs\xe9\n'
+        )
+        path = self._sdist(pkg_info)
+        self.assertEqual([Requirement('built-dep')], self._dependencies(path))
+        self.mock_build.assert_called_once()
+
+    def test_sdist_undecodable_dynamic_builds(self):
+        pkg_info = (
+            self._metadata('2.4').encode()
+            + b'Dynamic: Requires-Dist\nDynamic: Summ\xe9ry\n'
+        )
+        path = self._sdist(pkg_info)
+        self.assertEqual([Requirement('built-dep')], self._dependencies(path))
+        self.mock_build.assert_called_once()
+
+    def test_sdist_undecodable_requires_dist_fails_without_build_sdists(self):
+        pkg_info = (
+            self._metadata('2.2').encode() + b'Requires-Dist: attrs\xe9\n'
+        )
+        with self.assertRaises(MetadataUnavailableError) as ctx:
+            self._dependencies(
+                self._sdist(pkg_info), self._provider(build_sdists=False)
+            )
+        self.assertIn('--build-sdists', str(ctx.exception))
 
     def test_wheel_unreadable(self):
         path = self._wheel(contents=b'not a zip file')
