@@ -11,7 +11,7 @@ changelet==0.6.1
 charset-normalizer==3.5.2
 click==8.5.1
 comrak==0.0.16
-coverage==7.17.2
+coverage==7.17.3
 cryptography==50.0.2
 docutils==0.23
 h11==0.16.0
