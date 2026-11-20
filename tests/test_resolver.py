@@ -1,10 +1,8 @@
 import math
 import tarfile
-from collections import namedtuple
+from collections import Counter, namedtuple
 from datetime import datetime, timedelta, timezone
-from functools import partial
 from io import BytesIO
-from os.path import join
 from pathlib import Path
 from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
@@ -40,7 +38,6 @@ from proviso.resolver import (
     redact_requirement,
     split_identifier,
 )
-from proviso.series import SeriesPackageFinder
 
 # Lightweight stand-in for resolvelib's RequirementInformation namedtuple.
 # resolvelib defines RequirementInformation(requirement, parent); we use the
@@ -71,17 +68,25 @@ class FakeIndex(httpx2.Client):
     """A PEP 691 JSON index serving files and their metadata.
 
     files maps a package name to its file entries, see index_file.
-    requires maps (name, version) to that release's Requires-Dist.
+    requires maps (name, version) to that release's Requires-Dist, or a
+    filename to that file's.
     Index pages on html_hosts use the HTML API, which has no upload times.
+    Every URL requested is added to requested.  A URL in failing gets a 500.
     """
 
     def __init__(self, files, requires=None, html_hosts=()):
         requires = requires or {}
+        self.requested = []
+        self.failing = set()
 
         def handler(request):
+            self.requested.append(str(request.url))
+            if str(request.url) in self.failing:
+                return httpx2.Response(500)
             path = request.url.path
             if path.endswith('.metadata'):
-                name, version = path.split('/')[-1].split('-')[:2]
+                filename = path.split('/')[-1].removesuffix('.metadata')
+                name, version = filename.split('-')[:2]
                 lines = [
                     'Metadata-Version: 2.1',
                     f'Name: {name}',
@@ -89,7 +94,9 @@ class FakeIndex(httpx2.Client):
                 ]
                 lines.extend(
                     f'Requires-Dist: {r}'
-                    for r in requires.get((name, version), ())
+                    for r in requires.get(
+                        filename, requires.get((name, version), ())
+                    )
                 )
                 return httpx2.Response(200, text='\n'.join(lines) + '\n')
             name = path.rstrip('/').split('/')[-1]
@@ -252,7 +259,10 @@ class TestPyPIProvider(TestCase):
 
             # Verify PackageFinder was created correctly
             mock_finder.assert_called_once_with(
-                session=session, index_urls=index_urls, target_python=None
+                session=session,
+                index_urls=index_urls,
+                target_python=None,
+                index_cache=None,
             )
 
             # No target series when no python_version specified
@@ -521,7 +531,7 @@ class TestPyPIProvider(TestCase):
             mock_package3.version = '2.26.0'
             mock_package3.link.is_yanked = False
 
-            mock_finder.find_matches.return_value = [
+            mock_finder.find_all.return_value = [
                 mock_package1,
                 mock_package2,
                 mock_package3,
@@ -557,10 +567,7 @@ class TestPyPIProvider(TestCase):
             mock_package2.version = '2.27.0'
             mock_package2.link.is_yanked = False
 
-            mock_finder.find_matches.return_value = [
-                mock_package1,
-                mock_package2,
-            ]
+            mock_finder.find_all.return_value = [mock_package1, mock_package2]
 
             requirements = {'requests': [Requirement('requests>=2.27.0')]}
             # Mark 2.28.0 as incompatible
@@ -595,10 +602,7 @@ class TestPyPIProvider(TestCase):
             mock_package2.version = '2.27.0'
             mock_package2.link.is_yanked = False
 
-            mock_finder.find_matches.return_value = [
-                mock_package1,
-                mock_package2,
-            ]
+            mock_finder.find_all.return_value = [mock_package1, mock_package2]
 
             requirements = {'requests': [Requirement('requests>=2.27.0')]}
             incompatibilities = {}
@@ -611,12 +615,80 @@ class TestPyPIProvider(TestCase):
             )
 
             # unearth should only be called once — the second call hits the cache
-            mock_finder.find_matches.assert_called_once()
+            mock_finder.find_all.assert_called_once()
             # Both calls return the same candidates
             self.assertEqual(
                 [str(c.version) for c in result1],
                 [str(c.version) for c in result2],
             )
+
+    def _find_files(self, files, requirements=None, **kwargs):
+        """Return (version, file) of each candidate found for foo."""
+        provider = PyPIProvider(
+            MagicMock(), ['https://pypi.org/simple/'], **kwargs
+        )
+        provider.finder = MagicMock()
+        provider.finder.find_all.return_value = [self._file(*f) for f in files]
+        result = provider.find_matches(
+            'foo', requirements or {'foo': [Requirement('foo')]}, {}
+        )
+        return [(str(c.version), c.package.name) for c in result]
+
+    @staticmethod
+    def _file(version, filename, yanked=False):
+        package = MagicMock()
+        package.version = version
+        package.name = filename
+        package.link.is_yanked = yanked
+        return package
+
+    def test_find_matches_one_candidate_per_version(self):
+        """A version with several files is one candidate, with the first."""
+        self.assertEqual(
+            [('2.0', '2.0-whl'), ('1.0', '1.0-whl-a')],
+            self._find_files(
+                [
+                    ('2.0', '2.0-whl'),
+                    ('2.0', '2.0-sdist'),
+                    ('1.0', '1.0-whl-a'),
+                    ('1.0', '1.0-whl-b'),
+                    ('1.0', '1.0-sdist'),
+                ]
+            ),
+        )
+
+    def test_find_matches_equal_versions_are_one_candidate(self):
+        self.assertEqual(
+            [('1.0', '1.0-whl')],
+            self._find_files([('1.0', '1.0-whl'), ('1.0.0', '1.0.0-whl')]),
+        )
+
+    def test_find_matches_yanked_and_unyanked_files(self):
+        """A version with a file that isn't yanked is not yanked."""
+        files = [
+            ('1.0', '1.0-yanked', True),
+            ('1.0', '1.0-whl'),
+            ('1.0', '1.0-yanked-too', True),
+            ('2.0', '2.0-whl'),
+            ('2.0', '2.0-yanked', True),
+        ]
+        expected = [('2.0', '2.0-whl'), ('1.0', '1.0-whl')]
+        self.assertEqual(expected, self._find_files(files))
+        pins = {'foo': [Requirement('foo==1.0')]}
+        self.assertEqual([('1.0', '1.0-whl')], self._find_files(files, pins))
+
+    def test_find_matches_yanked_versions(self):
+        """A version with only yanked files is a candidate if pinned."""
+        files = [
+            ('1.0', '1.0-yanked-a', True),
+            ('1.0', '1.0-yanked-b', True),
+            ('2.0', '2.0-whl'),
+        ]
+        self.assertEqual([('2.0', '2.0-whl')], self._find_files(files))
+        pins = {'foo': [Requirement('foo==1.0')]}
+        self.assertEqual(
+            [('1.0', '1.0-yanked-a')], self._find_files(files, pins)
+        )
 
     def test_find_matches_cache_keyed_by_name(self):
         """Test that find_matches queries unearth with the bare package name."""
@@ -628,16 +700,14 @@ class TestPyPIProvider(TestCase):
             mock_finder_class.return_value = mock_finder
 
             provider = PyPIProvider(session, index_urls)
-            mock_finder.find_matches.return_value = []
+            mock_finder.find_all.return_value = []
 
             provider.find_matches(
                 'requests', {'requests': [Requirement('requests>=2.27.0')]}, {}
             )
 
             # Should be called with the bare identifier, not a specifier string
-            mock_finder.find_matches.assert_called_once_with(
-                'requests', allow_yanked=True, allow_prereleases=True
-            )
+            mock_finder.find_all.assert_called_once_with('requests')
 
     def test_find_matches_incompatibility_filtering_applied_per_call(self):
         """Test that incompatibility filtering is applied on each call, not cached,
@@ -658,10 +728,7 @@ class TestPyPIProvider(TestCase):
             mock_package2.version = '2.27.0'
             mock_package2.link.is_yanked = False
 
-            mock_finder.find_matches.return_value = [
-                mock_package1,
-                mock_package2,
-            ]
+            mock_finder.find_all.return_value = [mock_package1, mock_package2]
 
             requirements = {'requests': [Requirement('requests>=2.27.0')]}
 
@@ -678,7 +745,7 @@ class TestPyPIProvider(TestCase):
             )
 
             # unearth was only called once (cache hit on second call)
-            mock_finder.find_matches.assert_called_once()
+            mock_finder.find_all.assert_called_once()
             # But the incompatibility filter still excluded 2.28.0
             self.assertEqual(1, len(result2))
             self.assertEqual('2.27.0', str(result2[0].version))
@@ -702,6 +769,25 @@ class TestPyPIProvider(TestCase):
             result = provider.get_dependencies(candidate)
 
             self.assertEqual(cached_deps, result)
+
+    def test_get_dependencies_environment_built_once(self):
+        """The marker environment is read once per provider, not per call."""
+        with patch('proviso.resolver.SeriesPackageFinder'):
+            with patch('proviso.resolver.default_environment') as de:
+                de.return_value = {'sys_platform': 'linux'}
+                provider = PyPIProvider(
+                    MagicMock(), ['https://pypi.org/simple/']
+                )
+                de.assert_called_once_with()
+                provider._get_requires_dist = MagicMock(
+                    return_value=[Requirement('six; sys_platform == "linux"')]
+                )
+                for name in ('a', 'b', 'c'):
+                    deps = provider.get_dependencies(
+                        Candidate(name, Version('1.0'))
+                    )
+                    self.assertEqual(['six'], [d.name for d in deps])
+                de.assert_called_once_with()
 
     def test_get_dependencies_no_package_found(self):
         """Test get_dependencies when no package is found."""
@@ -1476,7 +1562,7 @@ class TestFindMatchesPrerelease(TestCase):
                 pkg.link.is_yanked = False
                 packages.append(pkg)
 
-            mock_finder.find_matches.return_value = packages
+            mock_finder.find_all.return_value = packages
             return provider
 
     def test_prerelease_excluded_by_default(self):
@@ -1604,32 +1690,25 @@ class TestFindMatchesPrerelease(TestCase):
 class TestPrereleaseWithRealFinder(TestCase):
     """Pre-release handling with a real SeriesPackageFinder.
 
-    The finder reads a local find-links directory instead of being mocked, so
-    unearth's own filtering runs.  These tests catch unearth dropping
+    The finder reads a fake index instead of being mocked, so unearth's own
+    filtering runs.  These tests catch unearth dropping
     pre-releases before proviso's policy is applied, which happens with
     packaging < 26 if the finder isn't asked for every version.
     """
 
     VERSIONS = ('0.1', '1.0', '2.0b1')
 
-    def setUp(self):
-        self._tmp = TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        for version in self.VERSIONS:
-            filename = f'foo-{version}-py3-none-any.whl'
-            with ZipFile(join(self._tmp.name, filename), 'w') as zf:
-                zf.writestr(
-                    f'foo-{version}.dist-info/METADATA',
-                    f'Metadata-Version: 2.1\nName: foo\nVersion: {version}\n',
-                )
-        finder = partial(SeriesPackageFinder, find_links=[self._tmp.name])
-        patcher = patch('proviso.resolver.SeriesPackageFinder', finder)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+    def _session(self):
+        return FakeIndex(
+            {'foo': [index_file('foo', version) for version in self.VERSIONS]}
+        )
 
     def _versions(self, spec, allow_prereleases=False):
         provider = PyPIProvider(
-            None, [], python_version='3.12', allow_prereleases=allow_prereleases
+            self._session(),
+            ['https://pypi.org/simple/'],
+            python_version='3.12',
+            allow_prereleases=allow_prereleases,
         )
         result = provider.find_matches('foo', {'foo': [Requirement(spec)]}, {})
         return [str(c.version) for c in result]
@@ -1654,11 +1733,11 @@ class TestPrereleaseWithRealFinder(TestCase):
 
     def test_resolve_exact_prerelease_pin_without_pre(self):
         """Resolver.resolve pins a requested pre-release without --pre."""
-        resolver = Resolver(session=MagicMock())
+        resolver = Resolver(session=self._session())
         result = resolver.resolve(
             [Requirement('foo==2.0b1')], python_version='3.12'
         )
-        self.assertEqual({'foo': {'version': '2.0b1', 'extras': []}}, result)
+        self.assertEqual({'foo': {'version': '2.0b1'}}, result)
 
 
 class TestGetDependenciesPackageFastPath(TestCase):
@@ -1926,7 +2005,7 @@ class TestExtras(TestCase):
 
         with patch('proviso.resolver.SeriesPackageFinder') as mock_finder_class:
             mock_finder = MagicMock()
-            mock_finder.find_matches.side_effect = lambda name, **kwargs: [
+            mock_finder.find_all.side_effect = lambda name, **kwargs: [
                 self._make_package(name, v) for v in self.VERSIONS[name]
             ]
             mock_finder_class.return_value = mock_finder
@@ -2007,9 +2086,7 @@ class TestExtras(TestCase):
             {'hishel[httpx]': [Requirement('hishel[httpx]')]},
             {},
         )
-        provider.finder.find_matches.assert_called_once_with(
-            'hishel', allow_yanked=True, allow_prereleases=True
-        )
+        provider.finder.find_all.assert_called_once_with('hishel')
 
     def test_get_dependencies_extras_candidate(self):
         provider = self._make_provider()
@@ -2059,11 +2136,11 @@ class TestExtras(TestCase):
 
         self.assertEqual(
             {
-                'app': {'version': '1.0.0', 'extras': []},
-                'hishel': {'version': '2.0.0', 'extras': ['httpx']},
-                'httpx': {'version': '0.28.1', 'extras': []},
-                'anyio': {'version': '4.16.0', 'extras': []},
-                'msgpack': {'version': '1.2.4', 'extras': []},
+                'app': {'version': '1.0.0'},
+                'hishel': {'version': '2.0.0'},
+                'httpx': {'version': '0.28.1'},
+                'anyio': {'version': '4.16.0'},
+                'msgpack': {'version': '1.2.4'},
             },
             result,
         )
@@ -2076,9 +2153,7 @@ class TestExtras(TestCase):
                 [Requirement('hishel[httpx,async]'), Requirement('hishel<2')]
             )
 
-        self.assertEqual(
-            {'version': '1.0.0', 'extras': ['async', 'httpx']}, result['hishel']
-        )
+        self.assertEqual({'version': '1.0.0'}, result['hishel'])
         self.assertIn('anysqlite', result)
         self.assertIn('httpx', result)
 
@@ -2766,7 +2841,7 @@ class TestDirectReferences(TestCase):
         package.version = '1.0'
         package.link.dist_info_link.url = 'https://pypi/pkg/1.0'
         package.link.is_yanked = False
-        provider.finder.find_matches.return_value = [package]
+        provider.finder.find_all.return_value = [package]
         with patch('proviso.resolver.PyPIProvider', return_value=provider):
             resolver = Resolver(session=MagicMock())
             with self.assertRaises(UnsupportedRequirementError) as ctx:
@@ -2803,15 +2878,13 @@ class TestDirectReferences(TestCase):
         package.version = '1.0'
         package.link.dist_info_link.url = 'https://pypi/pkg/1.0'
         package.link.is_yanked = False
-        provider.finder.find_matches.return_value = [package]
+        provider.finder.find_all.return_value = [package]
         with patch('proviso.resolver.PyPIProvider', return_value=provider):
             resolver = Resolver(session=MagicMock())
             with self.assertRaises(UnsupportedRequirementError):
                 resolver.resolve([Requirement('pkg')], python_version='3.12')
         # The direct reference was never looked up by name
-        provider.finder.find_matches.assert_called_once_with(
-            'pkg', allow_yanked=True, allow_prereleases=True
-        )
+        provider.finder.find_all.assert_called_once_with('pkg')
 
 
 class TestSelfReferentialExtras(TestCase):
@@ -3209,7 +3282,7 @@ class TestYanked(TestCase):
                 [Requirement('foo[x]'), Requirement('foo==1.1')],
                 python_version='3.12',
             )
-        self.assertEqual({'foo': {'version': '1.1', 'extras': ['x']}}, result)
+        self.assertEqual({'foo': {'version': '1.1'}}, result)
         self.assertEqual(1, len(logs.output))
         self.assertIn('foo==1.1 is yanked', logs.output[0])
 
@@ -3228,11 +3301,7 @@ class TestYanked(TestCase):
                 [Requirement('app')], python_version='3.12'
             )
         self.assertEqual(
-            {
-                'app': {'version': '1.0', 'extras': []},
-                'foo': {'version': '1.0', 'extras': []},
-            },
-            result,
+            {'app': {'version': '1.0'}, 'foo': {'version': '1.0'}}, result
         )
 
     def test_no_warning_when_unyanked_file_selected(self):
@@ -3249,7 +3318,7 @@ class TestYanked(TestCase):
             result = resolver.resolve(
                 [Requirement('foo==1.1')], python_version='3.12'
             )
-        self.assertEqual({'foo': {'version': '1.1', 'extras': []}}, result)
+        self.assertEqual({'foo': {'version': '1.1'}}, result)
 
     def test_warning_when_yanked_file_selected(self):
         resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
@@ -3271,7 +3340,7 @@ class TestYanked(TestCase):
             rl.return_value.resolve.return_value = result
             with self.assertNoLogs('proviso.resolver', level='WARNING'):
                 self.assertEqual(
-                    {'foo': {'version': '1.0', 'extras': []}},
+                    {'foo': {'version': '1.0'}},
                     resolver.resolve(
                         [Requirement('foo')], python_version='3.12'
                     ),
@@ -3286,9 +3355,7 @@ class TestYanked(TestCase):
                 result = resolver.resolve(
                     [Requirement(r) for r in order], python_version='3.12'
                 )
-                self.assertEqual(
-                    {'foo': {'version': '1.1', 'extras': ['x']}}, result
-                )
+                self.assertEqual({'foo': {'version': '1.1'}}, result)
 
     def test_extras_requirements_ordered_last(self):
         resolver = Resolver(session=FakeIndex(self.FILES, self.REQUIRES))
@@ -3320,11 +3387,7 @@ class TestYanked(TestCase):
     def test_yanked_files_sorted_last(self):
         """Asking unearth for yanked files doesn't reorder the others."""
         finder = self._provider().finder
-        with_yanked = list(
-            finder.find_matches(
-                'foo', allow_yanked=True, allow_prereleases=True
-            )
-        )
+        with_yanked = finder.find_all('foo')
         without = list(finder.find_matches('foo', allow_prereleases=True))
         self.assertEqual(without, with_yanked[: len(without)])
         self.assertEqual(
@@ -3686,9 +3749,9 @@ class TestCooldown(TestCase):
         }
 
     def test_late_file_on_old_release(self):
-        self.assertEqual(
-            ['foo-1.0-py3-none-any.whl', 'foo-1.0.tar.gz'], self._files('foo')
-        )
+        # The release is dated by its sdist, uploaded 100 days ago, though
+        # the wheel that's kept for it is only 2 days old
+        self.assertEqual(['foo-1.0-py3-none-any.whl'], self._files('foo'))
 
     def test_first_upload_of_incompatible_file(self):
         """A file that isn't compatible with the target still dates it."""
@@ -3910,3 +3973,126 @@ class TestCooldownWithoutUploadTimes(TestCase):
         provider = self._provider(exclude_newer_than=None)
         with self.assertNoLogs('proviso.resolver', level='WARNING'):
             self.assertEqual(['2.0', '1.0'], self._versions(provider, 'foo'))
+
+
+class TestSharedAcrossPythonVersions(TestCase):
+    """One Resolver fetches and parses index data once for every target."""
+
+    INDEX = 'https://pypi.org/simple/'
+    FILES = {
+        'app': [index_file('app', '1.0')],
+        'foo': [
+            index_file('foo', '1.0', tag='cp311'),
+            index_file('foo', '1.0', tag='cp312'),
+        ],
+        'bar': [index_file('bar', '1.0')],
+        'baz': [index_file('baz', '1.0')],
+    }
+    REQUIRES = {
+        ('app', '1.0'): ['foo'],
+        # Each target Python gets its own wheel, with its own dependencies
+        'foo-1.0-cp311-none-any.whl': ['bar'],
+        'foo-1.0-cp312-none-any.whl': ['baz'],
+    }
+
+    def _resolve(self, resolver, python_version, **kwargs):
+        return {
+            name: info['version']
+            for name, info in resolver.resolve(
+                [Requirement('app')], python_version=python_version, **kwargs
+            ).items()
+        }
+
+    def test_fetched_once(self):
+        session = FakeIndex(self.FILES, self.REQUIRES)
+        resolver = Resolver(session=session)
+        self.assertEqual(
+            {'app': '1.0', 'foo': '1.0', 'bar': '1.0'},
+            self._resolve(resolver, '3.11'),
+        )
+        self.assertEqual(
+            {'app': '1.0', 'foo': '1.0', 'baz': '1.0'},
+            self._resolve(resolver, '3.12'),
+        )
+        files = 'https://files.example.com'
+        self.assertEqual(
+            {
+                f'{self.INDEX}app/': 1,
+                f'{self.INDEX}foo/': 1,
+                f'{self.INDEX}bar/': 1,
+                f'{self.INDEX}baz/': 1,
+                f'{files}/app-1.0-py3-none-any.whl.metadata': 1,
+                f'{files}/foo-1.0-cp311-none-any.whl.metadata': 1,
+                f'{files}/foo-1.0-cp312-none-any.whl.metadata': 1,
+                f'{files}/bar-1.0-py3-none-any.whl.metadata': 1,
+                f'{files}/baz-1.0-py3-none-any.whl.metadata': 1,
+            },
+            Counter(session.requested),
+        )
+
+    def test_failed_page_fetched_again(self):
+        session = FakeIndex(self.FILES, self.REQUIRES)
+        resolver = Resolver(session=session)
+        page = f'{self.INDEX}foo/'
+        session.failing.add(page)
+        with self.assertLogs('unearth.collector', level='WARNING') as logs:
+            with self.assertRaises(ResolutionImpossible):
+                self._resolve(resolver, '3.11')
+        self.assertIn(f'Failed to collect links from {page}', logs.output[0])
+        session.failing.clear()
+        self.assertEqual(
+            {'app': '1.0', 'foo': '1.0', 'baz': '1.0'},
+            self._resolve(resolver, '3.12'),
+        )
+        self.assertEqual(2, session.requested.count(page))
+
+    def test_failed_metadata_fetched_again(self):
+        session = FakeIndex(self.FILES, self.REQUIRES)
+        resolver = Resolver(session=session)
+        url = 'https://files.example.com/app-1.0-py3-none-any.whl.metadata'
+        session.failing.add(url)
+        for python_version in ('3.11', '3.12'):
+            with self.assertRaises(httpx2.HTTPStatusError):
+                self._resolve(resolver, python_version)
+        session.failing.clear()
+        self.assertEqual(
+            {'app': '1.0', 'foo': '1.0', 'baz': '1.0'},
+            self._resolve(resolver, '3.12'),
+        )
+        self.assertEqual(3, session.requested.count(url))
+
+    def test_invalid_metadata_raised_again(self):
+        resolver = Resolver(
+            session=FakeIndex(self.FILES, {('app', '1.0'): ['foo >= ~1']})
+        )
+        for python_version in ('3.11', '3.12'):
+            with self.assertRaises(MetadataUnavailableError) as ctx:
+                self._resolve(resolver, python_version)
+            self.assertIn(
+                'invalid Requires-Dist in the index metadata',
+                str(ctx.exception),
+            )
+
+    def test_cooldown_dates_by_first_upload(self):
+        """A release is dated by its first file for every target.
+
+        That file is for neither target Python and is only seen once.
+        """
+        files = dict(
+            self.FILES,
+            app=[
+                index_file('app', '1.0', days=1),
+                index_file('app', '1.0', days=30, tag='cp27'),
+            ],
+        )
+        session = FakeIndex(files, self.REQUIRES)
+        resolver = Resolver(session=session)
+        cutoff = NOW - timedelta(days=7)
+        for python_version in ('3.11', '3.12'):
+            self.assertEqual(
+                '1.0',
+                self._resolve(
+                    resolver, python_version, exclude_newer_than=cutoff
+                )['app'],
+            )
+        self.assertEqual(1, session.requested.count(f'{self.INDEX}app/'))
